@@ -156,6 +156,12 @@ describe("PolicyEngine spend limits (owner, limit permission)", () => {
     expect(engine.evaluate(principalOf("partner"), purchaseMeta, { amountUsd: 10, merchant: "Uber" }).outcome).toBe("ask");
     expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchant: "Uber" }).outcome).toBe("allow");
     expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchant: "Amazon" }).outcome).toBe("ask");
+    // payment_request names the merchant merchantName; the lists must still apply.
+    expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchantName: "Lucky Casino" }).outcome).toBe("deny");
+    expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchantName: "Uber" }).outcome).toBe("allow");
+    // Every merchant field counts: an allowed `merchant` cannot cover a blocked or unlisted `merchantName`.
+    expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchant: "Uber", merchantName: "Lucky Casino" }).outcome).toBe("deny");
+    expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchant: "Uber", merchantName: "Amazon" }).outcome).toBe("ask");
   });
 });
 

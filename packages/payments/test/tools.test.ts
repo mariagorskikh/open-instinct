@@ -118,6 +118,10 @@ describe("paymentsTools registry", () => {
     for (const name of ["payment_connect", "payment_status", "payment_list"]) {
       expect(byName.get(name)!.spec.meta.amountUsd?.({})).toBe(0);
     }
+    // payment_request is counted by the runtime when it runs (a hold within the daily limit);
+    // the other tools carry no amount and must not add empty spend entries of their own.
+    expect(byName.get("payment_request")!.spec.meta.recordsOwnSpend).toBeFalsy();
+    for (const name of ["payment_connect", "payment_status", "payment_list"]) expect(byName.get(name)!.spec.meta.recordsOwnSpend, name).toBe(true);
   });
 });
 
@@ -356,7 +360,7 @@ describe("payment_status", () => {
         kind: "spend",
         conversationKey: "imessage:t",
         principal: "owner",
-        detail: { spendRequestId: "lsrq_1", amountUsd: 25.99, merchantName: "Acme", currency: "usd", via: "link_agent_wallet" },
+        detail: { spendRequestId: "lsrq_1", deliveredUsd: 25.99, merchantName: "Acme", currency: "usd", via: "link_agent_wallet" },
       },
     ]);
     expect(JSON.stringify(entries)).not.toContain(CARD_NUMBER);
@@ -382,6 +386,24 @@ describe("payment_status", () => {
     link.retrieveAnswer = approvedWithCard;
     expect(textOf(await run("payment_status", { spendRequestId: "lsrq_1" }))).toContain(CARD_NUMBER);
     expect(link.calls.retrieve[1]).toEqual({ id: "lsrq_1", opts: { include: ["card"] } });
+  });
+
+  it("releases the request's hold on the daily total once when Link denies it, and never after delivery", async () => {
+    const { run, link, entries, records } = await requested();
+    link.retrieveAnswer = () => spendRequest({ status: "denied" });
+    await run("payment_status", { spendRequestId: "lsrq_1" });
+    await run("payment_status", { spendRequestId: "lsrq_1" });
+    expect(entries).toEqual([
+      { kind: "spend", conversationKey: "imessage:t", principal: "owner", detail: { spendRequestId: "lsrq_1", amountUsd: -25.99, merchantName: "Acme", released: "denied", via: "link_agent_wallet" } },
+    ]);
+    expect(records()[0]!.released).toBe(true);
+
+    const delivered = await requested();
+    delivered.link.retrieveAnswer = approvedWithCard;
+    await delivered.run("payment_status", { spendRequestId: "lsrq_1" });
+    delivered.link.retrieveAnswer = () => spendRequest({ status: "failed" });
+    await delivered.run("payment_status", { spendRequestId: "lsrq_1" });
+    expect(delivered.entries.every((e) => typeof e.detail.amountUsd !== "number")).toBe(true);
   });
 
   it("explains denied, expired and failed outcomes", async () => {

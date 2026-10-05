@@ -475,6 +475,25 @@ describe("policy guard", () => {
     expect(spend[0]!.detail.amountUsd).toBe(12);
     expect(h.deps.audit.spentTodayUsd("America/New_York")).toBe(12);
   });
+
+  it("leaves spend to tools that record their own, so a request is not counted before it completes", async () => {
+    const h = harness();
+    h.deps.registry.register(
+      defineTool({
+        name: "pay_request",
+        label: "Pay",
+        description: "asks for a card",
+        parameters: Type.Object({ merchant: Type.String(), amountUsd: Type.Number() }),
+        meta: { capabilities: ["purchase"], group: "apps", amountUsd: (a) => (a as { amountUsd: number }).amountUsd, recordsOwnSpend: true },
+        execute: async () => textResult("requested"),
+      }),
+    );
+    h.faux.setResponses([toolTurn("pay_request", { merchant: "Acme", amountUsd: 20 }), textTurn("Requested.")]);
+    await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "pay acme" }));
+    expect(h.deps.audit.read({ kinds: ["tool_call"] }).some((e) => e.detail.tool === "pay_request")).toBe(true);
+    expect(h.deps.audit.read({ kinds: ["spend"] })).toHaveLength(0);
+    expect(h.deps.audit.spentTodayUsd("America/New_York")).toBe(0);
+  });
 });
 
 describe("approval flow", () => {

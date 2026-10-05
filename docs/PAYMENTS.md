@@ -164,7 +164,7 @@ What gets written where:
 | File | Holds | Never holds |
 |---|---|---|
 | `payments.json` | request id, amount, merchant, status, who asked, whether the card was delivered | card data, approval URLs |
-| `audit.jsonl` | a `spend` entry with the amount and merchant | card data |
+| `audit.jsonl` | `spend` entries: the amount at request, the delivery, a negative release if Link says no | card data |
 | `secrets/link-tokens.json` | access token, refresh token, expiry | card data |
 
 ## Spend policy interplay
@@ -203,11 +203,17 @@ always asks the owner, whatever the policy says.
 the spend check never asks for them. `payment_request` reports `amountUsd`, so every
 limit applies to it.
 
-One gap to know about. Core's spend policy matches merchants on arguments named
-`merchant`, `vendor`, `store`, `restaurant`, `airline` and `hotel`. The payment tool's
-argument is `merchantName`. The `allowedMerchants` and `blockedMerchants` lists do not
-match it yet. The `neverWithoutAsk` words still match, because they are searched in the
-whole argument text.
+Core's spend policy reads every merchant field it finds (`merchant`, `merchantName`,
+`vendor`, `store`, `restaurant`, `airline`, `hotel`). Any blocked one denies the call and
+each one must be on `allowedMerchants` when that list is set, so `payment_request` cannot
+pass the check with one name and pay another.
+
+The daily total counts a purchase once. The runtime logs the amount when `payment_request`
+runs, so pending requests already count and several of them cannot pass the daily limit
+together. When `payment_status` sees the request denied, expired, canceled or failed, it logs
+the same amount negative, once and only on the day it was requested, giving the hold back.
+Card delivery is logged for the record without a second amount. The other payment tools set
+`meta.recordsOwnSpend` so the runtime does not log empty spend entries for them.
 
 ## What is not supported
 

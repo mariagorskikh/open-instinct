@@ -42,6 +42,8 @@ export interface PaymentRecord {
   conversationKey: string;
   cardDelivered: boolean;
   deliveredAt?: string;
+  /** Set once the request's hold on the daily total was released (denied, expired, failed). */
+  released?: boolean;
 }
 
 export interface PaymentsState {
@@ -66,7 +68,7 @@ function connectTool(deps: PaymentsToolDeps): RegisteredTool {
       "Start connecting the owner's Stripe Link wallet so the agent can request one-time cards. Sends the owner a sign-in link by iMessage. Owner only.",
     parameters: Type.Object({}),
     // Connecting spends nothing; the amount keeps the owner's spend check from asking for one.
-    meta: { capabilities: ["purchase"], group: "apps", amountUsd: () => 0, describe: () => "connect Link wallet" },
+    meta: { capabilities: ["purchase"], group: "apps", recordsOwnSpend: true, amountUsd: () => 0, describe: () => "connect Link wallet" },
     execute: async (_args, ctx) => {
       if (!isOwner(ctx.principal)) return errorResult("Only the owner can connect a wallet. Offer to tell the owner instead.");
       const already = wallet.isConnected();
@@ -105,6 +107,8 @@ function requestTool(deps: PaymentsToolDeps): RegisteredTool {
     meta: {
       capabilities: ["purchase"],
       group: "apps",
+      // No recordsOwnSpend: the runtime's spend entry for this call is the hold that keeps
+      // pending requests inside the daily limit. payment_status releases it if Link says no.
       amountUsd: (a) => argNumber(a, "amountUsd"),
       describe: (a) => `pay ${argText(a, "merchantName") || "a merchant"} ${fmtUsdMaybe(argNumber(a, "amountUsd"))}`.trim(),
     },
@@ -187,7 +191,7 @@ function statusTool(deps: PaymentsToolDeps): RegisteredTool {
       "Check a spend request made with payment_request. When the owner has approved it, this returns the one-time card details a single time so you can type them into the checkout. Other statuses return a short status line.",
     parameters: Type.Object({ spendRequestId: Type.String() }),
     // The amount was checked when the request was created; picking up the card adds no new spend.
-    meta: { capabilities: ["purchase"], group: "apps", amountUsd: () => 0, describe: (a) => `payment status ${argText(a, "spendRequestId")}` },
+    meta: { capabilities: ["purchase"], group: "apps", recordsOwnSpend: true, amountUsd: () => 0, describe: (a) => `payment status ${argText(a, "spendRequestId")}` },
     execute: async ({ spendRequestId }, ctx) => {
       const record = findRecord(deps.state, spendRequestId);
       if (!record) return errorResult(`Unknown spend request ${spendRequestId}. Only requests made with payment_request can be checked.`);
@@ -210,13 +214,28 @@ function statusTool(deps: PaymentsToolDeps): RegisteredTool {
         record.cardDelivered = true;
         record.deliveredAt = now.toISOString();
         upsertRecord(deps.state, record);
+        // A record of the delivery, not a second amount: the request was counted when it was made.
         audit.append({
           kind: "spend",
           conversationKey: ctx.conversationKey,
           principal: ctx.principal.id,
-          detail: { spendRequestId, amountUsd: record.amountUsd, merchantName: record.merchantName, currency: request.currency ?? "usd", via: "link_agent_wallet" },
+          detail: { spendRequestId, deliveredUsd: record.amountUsd, merchantName: record.merchantName, currency: request.currency ?? "usd", via: "link_agent_wallet" },
         });
         return cardResult(record, request.card, request);
+      }
+
+      if (RELEASED_STATUSES.has(request.status) && !record.cardDelivered && !record.released) {
+        record.released = true;
+        // The hold only sits in the daily total of the day the request was made.
+        const tz = deps.config.owner.timezone;
+        if (localDay(new Date(record.createdAt), tz) === localDay(now, tz)) {
+          audit.append({
+            kind: "spend",
+            conversationKey: ctx.conversationKey,
+            principal: ctx.principal.id,
+            detail: { spendRequestId, amountUsd: -record.amountUsd, merchantName: record.merchantName, released: request.status, via: "link_agent_wallet" },
+          });
+        }
       }
 
       upsertRecord(deps.state, record);
@@ -235,7 +254,7 @@ function listTool(deps: PaymentsToolDeps): RegisteredTool {
     label: "List payment requests",
     description: "Recent spend requests made through the Link wallet, newest first, without card data. Owner only.",
     parameters: Type.Object({}),
-    meta: { capabilities: ["purchase"], group: "apps", amountUsd: () => 0, describe: () => "list payment requests" },
+    meta: { capabilities: ["purchase"], group: "apps", recordsOwnSpend: true, amountUsd: () => 0, describe: () => "list payment requests" },
     execute: async (_args, ctx) => {
       if (!isOwner(ctx.principal)) return errorResult("Only the owner can list payments.");
       const rows = readPayments(deps.state).requests.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, LIST_LIMIT);
@@ -349,6 +368,17 @@ function describeStatus(request: SpendRequest, record: PaymentRecord): string {
     }
     default:
       return base;
+  }
+}
+
+/** Link outcomes in which no money moves, so the request's hold on the daily total is given back. */
+const RELEASED_STATUSES = new Set(["denied", "expired", "canceled", "failed"]);
+
+function localDay(d: Date, tz: string): string {
+  try {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+  } catch {
+    return d.toISOString().slice(0, 10);
   }
 }
 

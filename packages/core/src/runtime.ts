@@ -691,7 +691,7 @@ export class AgentRuntime {
     if (preview) detail.result = preview;
     audit.append({ kind: "tool_call", conversationKey: conv.key, principal: conv.principal.id, detail });
     if (toolName === REPLY_TOOL && !isError) conv.repliedViaTool = true;
-    if (isError) return;
+    if (isError || meta?.recordsOwnSpend) return;
     const amountUsd = meta?.amountUsd?.(args);
     const spends = meta?.capabilities.some((c) => SPEND_CAPABILITIES.has(c)) ?? false;
     if ((amountUsd !== undefined && amountUsd > 0) || spends) {

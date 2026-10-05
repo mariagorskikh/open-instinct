@@ -274,6 +274,12 @@ export interface ToolMeta {
   group: "messaging" | "owner" | "memory" | "contacts" | "network" | "schedule" | "files" | "computer" | "apps" | "web" | "system";
   /** Extract a USD amount from the args for spend checks, if applicable. */
   amountUsd?: (args: unknown) => number | undefined;
+  /**
+   * The tool writes any "spend" audit entries itself, so the runtime skips its generic one.
+   * Set it on tools that carry the purchase capability but move no money on their own call
+   * (status checks, listings), which would otherwise log empty spend entries.
+   */
+  recordsOwnSpend?: boolean;
   /** Short human description for the audit log. */
   describe?: (args: unknown) => string;
 }

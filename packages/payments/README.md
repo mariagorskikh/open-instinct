@@ -31,12 +31,13 @@ owner: "buy the socks in my Acme cart"
        Link: paymentMethods.list -> spendRequests.create -> requestApproval
        iMessage to owner: "Approve $25.99 to Acme? https://link.com/... Expires in 10 minutes."
        payments.json: { spendRequestId, amountUsd, merchantName, status: pending_approval }
+       audit.jsonl: { kind: "spend", amountUsd: 25.99 }  (the hold, logged by the runtime)
   -> model tells the requester it is waiting and ends its turn
 owner taps approve in Link, texts "approved"
   -> payment_status { spendRequestId }
        Link: spendRequests.retrieve(id, { include: ["card"] }) -> status approved + card
        tool result: card number, expiry, CVC, billing address, shown once
-       payments.json: cardDelivered true; audit.jsonl: { kind: "spend", amountUsd: 25.99 }
+       payments.json: cardDelivered true; audit.jsonl: { kind: "spend", deliveredUsd: 25.99 }
   -> model types the card into the checkout on its desktop
   -> payment_status again returns only "approved, already delivered"
 ```
@@ -126,7 +127,10 @@ Lower-level pieces are exported too: `buildAuthorizeUrl`, `challengeS256`, `gene
 
 ### Tools
 
-Every tool has `meta: { capabilities: ["purchase"], group: "apps" }`. The policy engine in core
+Every tool has `meta: { capabilities: ["purchase"], group: "apps" }`. The runtime logs
+`payment_request`'s amount as a spend when it runs, which holds it against the daily total.
+`payment_connect`, `payment_status` and `payment_list` set `recordsOwnSpend: true` so the
+runtime adds no empty spend entries for them. The policy engine in core
 gives the owner `limit` on `purchase` (per-action, per-day and ask-above thresholds), `ask` to
 partners, and `no` to everyone else unless a grant says otherwise.
 
@@ -134,7 +138,7 @@ partners, and `no` to everyone else unless a grant says otherwise.
 |---|---|---|
 | `payment_connect` | none | Owner only. Builds the authorize URL and texts it to `config.owner.phones[0]`. |
 | `payment_request` | `amountUsd`, `merchantName`, `merchantUrl?`, `context`, `idempotencyKey?` | `meta.amountUsd` is the dollar amount, so spend limits apply. Lists payment methods, picks the default (else the first), creates the spend request with `credential_type: "card"` in USD minor units, calls `requestApproval`, records the request in `payments.json`, texts the owner the approval URL. Returns the id and "waiting for approval". |
-| `payment_status` | `spendRequestId` | Only ids made by `payment_request`. Retrieves with `include: ["card"]` until the card has been delivered. On the first `approved` with a card: returns number, expiry, CVC and billing address once, marks the record delivered, appends a `spend` audit entry with `amountUsd`. Later calls return the status only. Other statuses return one line, including the owner action for `requires_action`. |
+| `payment_status` | `spendRequestId` | Only ids made by `payment_request`. Retrieves with `include: ["card"]` until the card has been delivered. On the first `approved` with a card: returns number, expiry, CVC and billing address once, marks the record delivered, appends a `spend` audit entry with `deliveredUsd` (no second amount). On the first `denied`, `expired`, `canceled` or `failed`, appends a negative `amountUsd` the same day to release the hold. Later calls return the status only. Other statuses return one line, including the owner action for `requires_action`. |
 | `payment_list` | none | Owner only. The 20 most recent records, newest first, no card data. |
 
 `context` is what the owner reads on the Link approval screen. Link requires at least 100

@@ -115,15 +115,21 @@ function textOf(args: unknown): string {
   }
 }
 
-/** Best-effort merchant name from common argument shapes (`merchant`, `vendor`, `store`). */
-function merchantOf(args: unknown): string | undefined {
-  if (!args || typeof args !== "object") return undefined;
+const MERCHANT_KEYS = ["merchant", "merchantName", "merchant_name", "vendor", "store", "restaurant", "airline", "hotel"];
+
+/**
+ * Every merchant name in the args, lowercased. All of them are checked, so a call cannot pass
+ * an allowed `merchant` while the tool actually pays the `merchantName` it was also given.
+ */
+function merchantsOf(args: unknown): string[] {
+  if (!args || typeof args !== "object") return [];
   const o = args as Record<string, unknown>;
-  for (const k of ["merchant", "vendor", "store", "restaurant", "airline", "hotel"]) {
+  const out: string[] = [];
+  for (const k of MERCHANT_KEYS) {
     const v = o[k];
-    if (typeof v === "string" && v.trim()) return v.trim().toLowerCase();
+    if (typeof v === "string" && v.trim()) out.push(v.trim().toLowerCase());
   }
-  return undefined;
+  return out;
 }
 
 function fmtUsd(n: number): string {
@@ -192,16 +198,16 @@ export class PolicyEngine {
       reason,
       approvalPrompt: `${asker}${label}${amount !== undefined ? ` (${fmtUsd(amount)})` : ""}? Reply YES or NO.`,
     });
-    const merchant = merchantOf(args);
-    if (merchant && s.blockedMerchants.some((m) => merchant.includes(m.toLowerCase()))) {
-      return { outcome: "deny", reason: `${merchant} is on the blocked merchant list` };
-    }
+    const merchants = merchantsOf(args);
+    const blocked = merchants.find((name) => s.blockedMerchants.some((m) => name.includes(m.toLowerCase())));
+    if (blocked) return { outcome: "deny", reason: `${blocked} is on the blocked merchant list` };
     if (amount === undefined) return ask(`${capability}: amount unknown, owner must confirm`);
     const haystack = textOf(args);
     const flagged = s.neverWithoutAsk.find((w) => haystack.includes(w.toLowerCase()));
     if (flagged) return ask(`${flagged} always needs the owner's confirmation`);
-    if (s.allowedMerchants.length > 0 && !(merchant && s.allowedMerchants.some((m) => merchant.includes(m.toLowerCase())))) {
-      return ask(`merchant${merchant ? ` ${merchant}` : ""} is not on the allowed list`);
+    if (s.allowedMerchants.length > 0) {
+      const off = merchants.length === 0 ? "" : merchants.find((name) => !s.allowedMerchants.some((m) => name.includes(m.toLowerCase())));
+      if (off !== undefined) return ask(`merchant${off ? ` ${off}` : ""} is not on the allowed list`);
     }
     if (amount > s.perActionUsd) return ask(`${fmtUsd(amount)} is above the per-action limit of ${fmtUsd(s.perActionUsd)}`);
     const askAbove = grantCapUsd ?? s.askAbove;
@@ -225,9 +231,9 @@ export class PolicyEngine {
 
     // A blocked merchant is blocked for everyone; no tier, grant or approval opens it.
     if (SPEND_CAPABILITIES.has(capability) && permission !== "no") {
-      const merchant = merchantOf(args);
-      if (merchant && this.policy.spend.blockedMerchants.some((m) => merchant.includes(m.toLowerCase()))) {
-        return { capability, permission, decision: { outcome: "deny", reason: `${merchant} is on the blocked merchant list` } };
+      const blocked = merchantsOf(args).find((name) => this.policy.spend.blockedMerchants.some((m) => name.includes(m.toLowerCase())));
+      if (blocked) {
+        return { capability, permission, decision: { outcome: "deny", reason: `${blocked} is on the blocked merchant list` } };
       }
     }
 
