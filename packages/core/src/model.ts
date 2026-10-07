@@ -5,7 +5,7 @@
  * env object it is handed.
  */
 import type { Model } from "@earendil-works/pi-ai";
-import { getModel, getModels, getProviders } from "@earendil-works/pi-ai/compat";
+import { getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 
 export const OPENAI_COMPATIBLE_PROVIDER = "openai-compatible";
 
@@ -29,14 +29,14 @@ export function resolveModel(spec: string, env: NodeJS.ProcessEnv = {}): Model<a
 
   if (provider === OPENAI_COMPATIBLE_PROVIDER) return openAiCompatibleModel(id, env);
 
-  const model = (getModel as (p: string, m: string) => Model<any> | undefined)(provider, id);
+  const model = (getBuiltinModel as (p: string, m: string) => Model<any> | undefined)(provider, id);
   if (model) return model;
 
-  const providers = getProviders() as string[];
+  const providers = getBuiltinProviders() as readonly string[];
   if (!providers.includes(provider)) {
     throw new Error(unknownSpec(trimmed, `unknown provider "${provider}"`));
   }
-  const known = (getModels as (p: string) => Model<any>[])(provider as never)
+  const known = (getBuiltinModels as (p: string) => Model<any>[])(provider)
     .map((m) => m.id)
     .slice(0, 12)
     .join(", ");
