@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@inkbox/sdk@0.7.13':
+    hash: d2cbc7120b5a1808aff1ca453d6bc5e6f3529755b63ce08ddacac64bcb416286
+    path: patches/@inkbox__sdk@0.7.13.patch
+
 importers:
 
   .:
@@ -50,7 +55,7 @@ importers:
     dependencies:
       '@inkbox/sdk':
         specifier: ^0.7.13
-        version: 0.7.13
+        version: 0.7.13(patch_hash=d2cbc7120b5a1808aff1ca453d6bc5e6f3529755b63ce08ddacac64bcb416286)
       '@open-instinct/core':
         specifier: workspace:*
         version: link:../core
@@ -137,7 +142,7 @@ importers:
     dependencies:
       '@inkbox/sdk':
         specifier: ^0.7.13
-        version: 0.7.13
+        version: 0.7.13(patch_hash=d2cbc7120b5a1808aff1ca453d6bc5e6f3529755b63ce08ddacac64bcb416286)
       '@open-instinct/core':
         specifier: workspace:*
         version: link:../core
@@ -162,7 +167,7 @@ importers:
     dependencies:
       '@inkbox/sdk':
         specifier: ^0.7.13
-        version: 0.7.13
+        version: 0.7.13(patch_hash=d2cbc7120b5a1808aff1ca453d6bc5e6f3529755b63ce08ddacac64bcb416286)
       '@open-instinct/core':
         specifier: workspace:*
         version: link:../core
@@ -237,7 +242,7 @@ importers:
         version: 1.0.1(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.6.5)
       '@inkbox/sdk':
         specifier: ^0.7.13
-        version: 0.7.13
+        version: 0.7.13(patch_hash=d2cbc7120b5a1808aff1ca453d6bc5e6f3529755b63ce08ddacac64bcb416286)
       '@open-instinct/apps':
         specifier: workspace:*
         version: link:../apps
@@ -1934,7 +1939,7 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@inkbox/sdk@0.7.13':
+  '@inkbox/sdk@0.7.13(patch_hash=d2cbc7120b5a1808aff1ca453d6bc5e6f3529755b63ce08ddacac64bcb416286)':
     dependencies:
       '@peculiar/x509': 2.1.0
       hash-wasm: 4.12.0

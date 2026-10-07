@@ -1,0 +1,13 @@
+diff --git a/dist/tunnels/client/_protocol.js b/dist/tunnels/client/_protocol.js
+index 01e5f799dce951a7ec8fdfb5f2e87458cb24c7ea..6f51c7adadba13c5cfbef0f1aadc8ba704947a33 100644
+--- a/dist/tunnels/client/_protocol.js
++++ b/dist/tunnels/client/_protocol.js
+@@ -59,6 +59,8 @@ export const ControlHeaders = {
+ /** Hop-by-hop request headers stripped before forwarding upstream. */
+ export const HOP_BY_HOP_REQUEST = new Set([
+     "host",
++    "content-length",
++    "expect",
+     "connection",
+     "upgrade",
+     "keep-alive",
