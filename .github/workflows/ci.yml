@@ -22,8 +22,8 @@ jobs:
           node-version: 22.20.0
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -r typecheck
       - run: pnpm build
+      - run: pnpm -r typecheck
       - run: pnpm -r test
       - run: pnpm smoke
       - name: No leftover secrets or personal identifiers
