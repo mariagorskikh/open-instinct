@@ -30,6 +30,7 @@ import { InkboxA2A, InkboxChannel, InkboxInboundHydrator, InkboxProvisioner, mes
 import { computerGuidance, detectComputer } from "@open-instinct/computer";
 import type { ComputerBackend } from "@open-instinct/computer";
 import { ComposioApps, DEFAULT_TOOLKITS, appsGuidance, appsTools } from "@open-instinct/apps";
+import { contextTools } from "@open-instinct/context";
 import { networkTools } from "@open-instinct/network";
 import { ChatAwareOutbox, ConsoleOutbox, type ChatReplyBuffer } from "./console-outbox.js";
 import { fileTools } from "./file-tools.js";
@@ -151,6 +152,15 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       ...(env.BRAVE_SEARCH_API_KEY ? { searchApiKey: env.BRAVE_SEARCH_API_KEY } : {}),
     }),
   );
+
+  if (env.CONTEXT_DEV_API_KEY) {
+    registry.registerMany(
+      contextTools({
+        apiKey: env.CONTEXT_DEV_API_KEY,
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      }),
+    );
+  }
 
   // Messaging needs Inkbox. send_file does not: without a wire it still hands files
   // to the dashboard chat, which is how `instinct chat` and the smoke test get them.

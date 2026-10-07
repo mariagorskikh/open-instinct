@@ -307,7 +307,11 @@ describe("deploy", () => {
 
   it("--dry-run prints the create body with secrets redacted", async () => {
     const dir = await seeded();
-    const r = await run(["deploy", "--image", "ghcr.io/maria/open-instinct-agent:v1", "--dry-run"], { INSTINCT_DATA_DIR: dir, ANTHROPIC_API_KEY: "sk-ant-x" });
+    const r = await run(["deploy", "--image", "ghcr.io/maria/open-instinct-agent:v1", "--dry-run"], {
+      INSTINCT_DATA_DIR: dir,
+      ANTHROPIC_API_KEY: "sk-ant-x",
+      CONTEXT_DEV_API_KEY: "ctxt_secret_test",
+    });
     expect(r.code, r.err).toBe(0);
     const body = JSON.parse(r.out);
     expect(body.name).toBe("instinct-maria-instinct");
@@ -323,6 +327,7 @@ describe("deploy", () => {
     expect(vars.PORT).toEqual({ key: "PORT", value: String(body.exposedPort), isSecret: false });
     expect(vars.INKBOX_API_KEY).toEqual({ key: "INKBOX_API_KEY", value: "<redacted>", isSecret: true });
     expect(vars.ANTHROPIC_API_KEY.value).toBe("<redacted>");
+    expect(vars.CONTEXT_DEV_API_KEY.value).toBe("<redacted>");
     expect(vars.INSTINCT_OWNER_PHONE).toEqual({ key: "INSTINCT_OWNER_PHONE", value: "+14155550100", isSecret: false });
     expect(vars.INSTINCT_DATA_DIR.value).toBe("/data");
     expect(vars.INSTINCT_MODEL.value).toBe("anthropic/claude-fable-5-1");

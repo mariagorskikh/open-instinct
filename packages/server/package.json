@@ -34,6 +34,7 @@
     "@inkbox/sdk": "^0.7.13",
     "@open-instinct/apps": "workspace:*",
     "@open-instinct/computer": "workspace:*",
+    "@open-instinct/context": "workspace:*",
     "@open-instinct/core": "workspace:*",
     "@open-instinct/inkbox": "workspace:*",
     "@open-instinct/network": "workspace:*",

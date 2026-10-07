@@ -117,6 +117,7 @@ the screen at checkout instead of paying.
 | Variable | What it unlocks | Where |
 |---|---|---|
 | `BRAVE_SEARCH_API_KEY` | Better web search than the DuckDuckGo fallback | [brave.com/search/api](https://brave.com/search/api/) |
+| `CONTEXT_DEV_API_KEY` | Sourced answers and public page research through `context_answers` | [context.dev](https://context.dev) |
 | `INSTINCT_CHAT_TOKEN` | A bearer token on the owner's HTTP surface; set it whenever the port is reachable beyond your machine | you choose it |
 | `GATEWAY_SIGNUP_SECRET` | The invite code the gateway's signup form requires | you choose it |
 

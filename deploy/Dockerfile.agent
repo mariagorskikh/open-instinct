@@ -25,6 +25,7 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc tsconfig.base.json .
 COPY packages/core/package.json packages/core/
 COPY packages/inkbox/package.json packages/inkbox/
 COPY packages/computer/package.json packages/computer/
+COPY packages/context/package.json packages/context/
 COPY packages/apps/package.json packages/apps/
 COPY packages/network/package.json packages/network/
 COPY packages/payments/package.json packages/payments/

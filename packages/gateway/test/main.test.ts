@@ -11,6 +11,7 @@ describe("readEnv", () => {
       GATEWAY_TRUST_PROXY: "true",
       COMPOSIO_API_KEY: "cmp",
       COMPOSIO_TOOLKITS: "gmail,slack",
+      CONTEXT_DEV_API_KEY: "ctxt_secret_test",
       INSTINCT_USE_MARITIME_LLM: "1",
       INSTINCT_MARITIME_MODEL: "gpt-5.5",
       LINK_CLIENT_ID: "lc_1",
@@ -21,6 +22,7 @@ describe("readEnv", () => {
     expect(cfg.allowOpenSignup).toBe(true);
     expect(cfg.trustProxy).toBe(true);
     expect(cfg.composioToolkits).toBe("gmail,slack");
+    expect(cfg.contextDevApiKey).toBe("ctxt_secret_test");
     expect(cfg.useMaritimeLlm).toBe(true);
     expect(cfg.maritimeModel).toBe("gpt-5.5");
     expect(cfg.link).toEqual({ clientId: "lc_1", clientSecret: "ls_1", stripePublishableKey: "pk_test_1" });

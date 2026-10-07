@@ -23,6 +23,7 @@ export interface GatewayEnv {
   anthropicApiKey?: string;
   composioApiKey?: string;
   composioToolkits?: string;
+  contextDevApiKey?: string;
   idleTtlSeconds?: number;
   useMaritimeLlm: boolean;
   maritimeModel?: string;
@@ -63,6 +64,7 @@ export function readEnv(env: NodeJS.ProcessEnv): GatewayEnv {
     anthropicApiKey: env["ANTHROPIC_API_KEY"] || undefined,
     composioApiKey: env["COMPOSIO_API_KEY"] || undefined,
     composioToolkits: env["COMPOSIO_TOOLKITS"] || env["INSTINCT_COMPOSIO_TOOLKITS"] || undefined,
+    contextDevApiKey: env["CONTEXT_DEV_API_KEY"] || undefined,
     idleTtlSeconds: idle !== undefined && Number.isFinite(idle) ? idle : undefined,
     useMaritimeLlm: truthy(env["INSTINCT_USE_MARITIME_LLM"]),
     maritimeModel: env["INSTINCT_MARITIME_MODEL"] || undefined,
@@ -116,6 +118,7 @@ export function startGateway(cfg: GatewayEnv): GatewayServer {
       idleTtlSeconds: cfg.idleTtlSeconds,
       useMaritimeLlm: cfg.useMaritimeLlm,
       maritimeModel: cfg.maritimeModel,
+      extraEnv: cfg.contextDevApiKey ? { CONTEXT_DEV_API_KEY: cfg.contextDevApiKey } : undefined,
     },
     signupSecret: cfg.signupSecret,
     anthropicApiKey: cfg.anthropicApiKey,

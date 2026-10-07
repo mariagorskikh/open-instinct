@@ -99,6 +99,25 @@ importers:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@22.20.5)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0)
 
+  packages/context:
+    dependencies:
+      '@open-instinct/core':
+        specifier: workspace:*
+        version: link:../core
+      typebox:
+        specifier: 1.3.27
+        version: 1.3.27
+    devDependencies:
+      '@types/node':
+        specifier: ^22.15.0
+        version: 22.20.5
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@22.20.5)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0)
+
   packages/core:
     dependencies:
       '@earendil-works/pi-agent-core':
@@ -244,6 +263,9 @@ importers:
       '@open-instinct/computer':
         specifier: workspace:*
         version: link:../computer
+      '@open-instinct/context':
+        specifier: workspace:*
+        version: link:../context
       '@open-instinct/core':
         specifier: workspace:*
         version: link:../core
