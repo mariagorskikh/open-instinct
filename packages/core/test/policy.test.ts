@@ -157,6 +157,31 @@ describe("PolicyEngine spend limits (owner, limit permission)", () => {
     expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchant: "Uber" }).outcome).toBe("allow");
     expect(engine.evaluate(owner, purchaseMeta, { amountUsd: 10, merchant: "Amazon" }).outcome).toBe("ask");
   });
+
+  it("blocks a blocked merchant wherever it appears in the arguments", () => {
+    const policy = defaultPolicy();
+    policy.spend.blockedMerchants = ["casino"];
+    const engine = new PolicyEngine(policy);
+    // The model writes the tool arguments, so the merchant name does not have to
+    // land on one of the keys merchantOf knows. A deny list that only reads those
+    // keys is weaker than neverWithoutAsk, which scans the whole payload.
+    const shapes: Array<[string, unknown]> = [
+      ["top-level", { amountUsd: 10, merchant: "Lucky Casino" }],
+      ["nested", { amountUsd: 10, order: { merchant: "Lucky Casino" } }],
+      ["unknown key", { amountUsd: 10, seller: "Lucky Casino" }],
+      ["inside a list", { amountUsd: 10, items: [{ merchant: "Lucky Casino" }] }],
+      ["free text", { amountUsd: 10, item: "chips at Lucky Casino" }],
+    ];
+    for (const [name, args] of shapes) {
+      expect(engine.evaluate(owner, purchaseMeta, args).outcome, name).toBe("deny");
+      // And a grant never opens it either.
+      expect(engine.evaluate(principalOf("partner"), purchaseMeta, args).outcome, `${name} (partner)`).toBe("deny");
+    }
+    // An empty or whitespace entry must not turn the list into a catch-all.
+    policy.spend.blockedMerchants = ["   "];
+    const loose = new PolicyEngine(policy);
+    expect(loose.evaluate(owner, purchaseMeta, { amountUsd: 10, merchant: "Uber" }).outcome).toBe("allow");
+  });
 });
 
 describe("PolicyEngine grants", () => {
