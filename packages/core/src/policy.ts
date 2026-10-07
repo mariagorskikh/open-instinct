@@ -126,6 +126,26 @@ function merchantOf(args: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * A blocked merchant must be unmissable, so this reads the whole argument
+ * payload and not just the six keys `merchantOf` knows. The model composes tool
+ * arguments, so the name can arrive nested (`order.merchant`), inside a list
+ * (`items[0].merchant`) or under a key this file has never heard of (`seller`,
+ * `payee`); `merchantOf` returns undefined for all three and the deny list then
+ * silently passes. `neverWithoutAsk` already scans the full payload via
+ * `textOf`, so the weaker control was wider than the stronger one. Matching on
+ * the serialised payload can over-block (an `item` string that mentions the name
+ * also trips it); for a deny list that is the correct direction to err in.
+ */
+function blockedMerchantIn(args: unknown, blocked: readonly string[]): string | undefined {
+  if (blocked.length === 0) return undefined;
+  const haystack = `${textOf(args)} ${merchantOf(args) ?? ""}`;
+  return blocked.find((m) => {
+    const needle = m.trim().toLowerCase();
+    return needle.length > 0 && haystack.includes(needle);
+  });
+}
+
 function fmtUsd(n: number): string {
   return `$${n.toFixed(n % 1 === 0 ? 0 : 2)}`;
 }
@@ -193,8 +213,9 @@ export class PolicyEngine {
       approvalPrompt: `${asker}${label}${amount !== undefined ? ` (${fmtUsd(amount)})` : ""}? Reply YES or NO.`,
     });
     const merchant = merchantOf(args);
-    if (merchant && s.blockedMerchants.some((m) => merchant.includes(m.toLowerCase()))) {
-      return { outcome: "deny", reason: `${merchant} is on the blocked merchant list` };
+    const blocked = blockedMerchantIn(args, s.blockedMerchants);
+    if (blocked) {
+      return { outcome: "deny", reason: `${blocked} is on the blocked merchant list` };
     }
     if (amount === undefined) return ask(`${capability}: amount unknown, owner must confirm`);
     const haystack = textOf(args);
@@ -225,9 +246,9 @@ export class PolicyEngine {
 
     // A blocked merchant is blocked for everyone; no tier, grant or approval opens it.
     if (SPEND_CAPABILITIES.has(capability) && permission !== "no") {
-      const merchant = merchantOf(args);
-      if (merchant && this.policy.spend.blockedMerchants.some((m) => merchant.includes(m.toLowerCase()))) {
-        return { capability, permission, decision: { outcome: "deny", reason: `${merchant} is on the blocked merchant list` } };
+      const blocked = blockedMerchantIn(args, this.policy.spend.blockedMerchants);
+      if (blocked) {
+        return { capability, permission, decision: { outcome: "deny", reason: `${blocked} is on the blocked merchant list` } };
       }
     }
 
