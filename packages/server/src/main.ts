@@ -81,6 +81,8 @@ async function startTunnel(port: number, state: Awaited<ReturnType<typeof boot>>
     installSignalHandlers: false,
     onStatus: (status) => log(`tunnel ${status}`),
   });
+  // connect() only registers the tunnel; serveForever() opens the data plane.
+  void listener.serveForever().catch((err: unknown) => log(`tunnel stopped: ${(err as Error).message}`));
   log(`tunnel up: ${listener.publicUrl} (serves /health and /webhooks/inkbox only)`);
 
   if (env.INKBOX_ADMIN_API_KEY) {

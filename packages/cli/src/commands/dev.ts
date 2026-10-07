@@ -73,6 +73,9 @@ const defaultConnectTunnel: TunnelConnector = async ({ apiKey, handle, baseUrl, 
     installSignalHandlers: false,
     onStatus: (status: unknown) => log(`tunnel ${String(status)}`),
   });
+  // connect() only registers the tunnel; serveForever() opens the data plane. Without it
+  // the public URL exists but every request times out at the edge (504).
+  void listener.serveForever().catch((err: unknown) => log(`tunnel stopped: ${(err as Error).message}`));
   return { publicUrl: listener.publicUrl, close: () => listener.close() };
 };
 

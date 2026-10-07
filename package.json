@@ -21,9 +21,14 @@
     "check": "pnpm run build && pnpm run test && pnpm run smoke"
   },
   "devDependencies": {
+    "@open-instinct/cli": "workspace:*",
     "@types/node": "^22.15.0",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4",
-    "@open-instinct/cli": "workspace:*"
+    "vitest": "^3.2.4"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@inkbox/sdk@0.7.13": "patches/@inkbox__sdk@0.7.13.patch"
+    }
   }
 }
