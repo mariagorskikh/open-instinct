@@ -38,8 +38,9 @@ Ample is configured; without them, say the agent's operator needs to set
    `start` script. Python: `requirements.txt` and an `app.py` or a framework
    Ample recognises (Flask, FastAPI, Django).
 4. Data that must survive a restart goes in a database. An app that reads
-   `DATABASE_URL` gets a Postgres database from Ample automatically. Do not
-   keep sign-ups in a JSON file on disk.
+   `DATABASE_URL` gets a Postgres database from Ample automatically; connect
+   with the URL exactly as given and no SSL option (Ample's database is
+   reached privately, without SSL). Do not keep sign-ups in a JSON file.
 5. Secrets the owner gives you (API keys) go in `ample_deploy`'s `env`, never
    in the code.
 
@@ -48,7 +49,11 @@ Ample is configured; without them, say the agent's operator needs to set
 1. `ample_deploy` with `path: "apps/<name>"`. It takes from a few seconds to a
    few minutes and returns when the app is live or has failed. Call it once
    and wait; do not call it again to check on it.
-2. Live: send the URL in one line.
+2. Live means the page loads, not that the app works. Before you tell the
+   owner, try its main action once from `bash` (for example
+   `curl -X POST <url>/api/rsvp -H 'content-type: application/json' -d '{"name":"Test"}'`,
+   then remove the test entry if you can). If it fails, read `ample_logs`
+   with `kind: "runtime"`, fix, and deploy again. Then send the URL in one line.
 
 Agent: It's live: https://maya-birthday-acc-1a2b.apps.ample.computer. The RSVP
 form saves names and you can see the list at /guests.

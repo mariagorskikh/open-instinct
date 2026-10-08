@@ -177,7 +177,7 @@ function deployTool({ ample: run, retired, workspaceDir, resolvePath }: Runner):
             // Ample adds a claim link while nobody owns the account; the account notice already carries one.
             const claim = typeof json?.["claim_url"] === "string" && !result.notice ? json["claim_url"] : undefined;
             return claim
-              ? `${lead}\nThe owner has not claimed this Ample account yet; it is deleted two days after signup unless they do. If they have not had the link, send it: ${claim}`
+              ? `${lead}\nThe owner has not claimed this Ample account yet; it is deleted two days after signup unless they do. Send this link only if they have not had one today: ${claim}`
               : lead;
           }
           if (result.exitCode === 2) return "Ample needs a decision before it can deploy. The result says what to answer or change.";
