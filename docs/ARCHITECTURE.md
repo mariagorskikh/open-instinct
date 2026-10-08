@@ -89,10 +89,11 @@ open-instinct/
     apps/      @open-instinct/apps      Composio Tool Router: per-user session, MCP tools, connect links
     network/   @open-instinct/network   trusted network: contacts, tiers, grants, invitations, OIP envelope, A2A tools
     payments/  @open-instinct/payments  Stripe Link agent wallet: OAuth, spend requests, one-time cards, payment_* tools
+    ample/     @open-instinct/ample     web app deploys through the Ample CLI: ample_deploy, ample_logs, ample_apps, ample_app_delete
     server/    @open-instinct/server    the agent process: /health, /chat, /schedules, webhook intake, Link callback, smoke test
     gateway/   @open-instinct/gateway   multi-user relay + signup: Inkbox webhooks → Maritime agent; connect page with QR
     cli/       @open-instinct/cli       `instinct` command: init, connect, dev, chat, status, deploy, invite, trust, schedules, payments
-  skills/      SKILL.md playbooks the agent loads (onboarding, scheduling, dining, travel, rides, email-triage, research, purchases, files, daily-brief, trusted-network, maritime-computer)
+  skills/      SKILL.md playbooks the agent loads (onboarding, scheduling, dining, travel, rides, email-triage, research, purchases, files, daily-brief, trusted-network, maritime-computer, web-apps)
   examples/    local-chat.mjs, fake-inkbox-webhook.mjs, dinner-a2a.mjs (see examples/README.md)
   deploy/      Dockerfile.agent, Dockerfile.gateway, docker-compose.yml, entrypoint.sh, .env.example
   .github/workflows/build-images.yml   builds and pushes both images to GHCR
@@ -208,6 +209,7 @@ policy engine checks. Groups:
 | computer (in the VM) | `computer`, `computer_batch`, `request_takeover`, `takeover_status`, `computer_read_file`, `computer_write_file` | `@open-instinct/computer` over desktopd REST | `INSTINCT_COMPUTER` is `auto` or `desktopd` and desktopd answers |
 | computer (hosted) | the server's own names: `get_computer`, `computer`, `computer_batch`, `run_shell`, `read_file`, `write_file`, `request_takeover`, `takeover_status`, `close_computer` | `@open-instinct/computer` over MCP | `MARITIME_API_KEY` and no in-VM desktop |
 | apps | one `app_<slug>` tool per Composio tool (for example `app_googlecalendar_events_list`) | `@open-instinct/apps` over MCP | `COMPOSIO_API_KEY` is set |
+| files | `ample_deploy` (a workspace folder to a public URL), `ample_logs`, `ample_apps`, `ample_app_delete` | `@open-instinct/ample`, driving the `ample` CLI | `AMPLE_CLIENT_ID` and `AMPLE_CLIENT_SECRET` (or `AMPLE_TOKEN`) are set; owner only |
 | payments | `payment_connect`, `payment_request`, `payment_status`, `payment_list` | `@open-instinct/payments` | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET` and `STRIPE_PUBLISHABLE_KEY` are set |
 
 MCP results are converted with `pi-mcp`'s `toLlmContent()`. Composio tool names get the `app_` prefix

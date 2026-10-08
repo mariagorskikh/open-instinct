@@ -25,6 +25,7 @@ skills/
   daily-brief/SKILL.md
   trusted-network/SKILL.md
   maritime-computer/SKILL.md
+  web-apps/SKILL.md
 ```
 
 One directory per skill, named like the skill. The file is always `SKILL.md`.

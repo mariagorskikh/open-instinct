@@ -32,6 +32,7 @@
     "@earendil-works/pi-ai": "^1.0.1",
     "@earendil-works/pi-coding-agent": "^1.0.1",
     "@inkbox/sdk": "^0.7.13",
+    "@open-instinct/ample": "workspace:*",
     "@open-instinct/apps": "workspace:*",
     "@open-instinct/computer": "workspace:*",
     "@open-instinct/context": "workspace:*",

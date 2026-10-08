@@ -311,6 +311,8 @@ describe("deploy", () => {
       INSTINCT_DATA_DIR: dir,
       ANTHROPIC_API_KEY: "sk-ant-x",
       CONTEXT_DEV_API_KEY: "ctxt_secret_test",
+      AMPLE_CLIENT_ID: "agent_test",
+      AMPLE_CLIENT_SECRET: "ample_agent_secret_test",
     });
     expect(r.code, r.err).toBe(0);
     const body = JSON.parse(r.out);
@@ -328,11 +330,15 @@ describe("deploy", () => {
     expect(vars.INKBOX_API_KEY).toEqual({ key: "INKBOX_API_KEY", value: "<redacted>", isSecret: true });
     expect(vars.ANTHROPIC_API_KEY.value).toBe("<redacted>");
     expect(vars.CONTEXT_DEV_API_KEY.value).toBe("<redacted>");
+    expect(vars.AMPLE_CLIENT_ID).toEqual({ key: "AMPLE_CLIENT_ID", value: "agent_test", isSecret: false });
+    expect(vars.AMPLE_CLIENT_SECRET.value).toBe("<redacted>");
+    expect(vars.AMPLE_TOKEN).toBeUndefined();
     expect(vars.INSTINCT_OWNER_PHONE).toEqual({ key: "INSTINCT_OWNER_PHONE", value: "+14155550100", isSecret: false });
     expect(vars.INSTINCT_DATA_DIR.value).toBe("/data");
     expect(vars.INSTINCT_MODEL.value).toBe("anthropic/claude-fable-5-1");
     expect(vars.LINK_CLIENT_ID).toBeUndefined();
     expect(r.out).not.toContain("ik_secret");
+    expect(r.out).not.toContain("ample_agent_secret_test");
   });
 
   it("keeps the Inkbox endpoint with the deployed identity credentials", async () => {

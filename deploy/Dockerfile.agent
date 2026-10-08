@@ -29,6 +29,7 @@ COPY packages/context/package.json packages/context/
 COPY packages/apps/package.json packages/apps/
 COPY packages/network/package.json packages/network/
 COPY packages/payments/package.json packages/payments/
+COPY packages/ample/package.json packages/ample/
 COPY packages/server/package.json packages/server/
 COPY packages/gateway/package.json packages/gateway/
 COPY packages/cli/package.json packages/cli/
@@ -49,6 +50,21 @@ RUN groupadd --system instinct \
   && mkdir -p /data \
   && chown instinct:instinct /data \
   && chmod 0750 /data
+# The Ample CLI, for ample_deploy (packages/ample). A static binary, pinned and checksummed.
+# dpkg names the image's own architecture, so this is right for any builder and platform.
+ARG AMPLE_VERSION=0.1.29
+ARG AMPLE_SHA256_AMD64=12d2fd750cf19e135c898fe77dd19c6e6392556b22455fd6a492a9d9664928c6
+ARG AMPLE_SHA256_ARM64=978b4f6b8f1fb02823286012ec75a91179465c3f5e75213f0a70abf29a41ab3e
+RUN arch="$(dpkg --print-architecture)" \
+  && case "$arch" in \
+      amd64) sha="$AMPLE_SHA256_AMD64" ;; \
+      arm64) sha="$AMPLE_SHA256_ARM64" ;; \
+      *) echo "no Ample CLI for $arch" >&2; exit 1 ;; \
+    esac \
+  && curl -fsSL -o /usr/local/bin/ample "https://get.ample.computer/releases/${AMPLE_VERSION}/ample-linux-${arch}" \
+  && echo "$sha  /usr/local/bin/ample" | sha256sum -c - \
+  && chmod 0755 /usr/local/bin/ample \
+  && ample --version
 COPY --from=build --chown=instinct:instinct /app /app
 COPY --chown=instinct:instinct deploy/entrypoint.sh /app/deploy/entrypoint.sh
 RUN chmod 0755 /app/deploy/entrypoint.sh

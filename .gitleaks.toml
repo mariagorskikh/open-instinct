@@ -20,6 +20,11 @@ description = "Maritime API key"
 regex = '''mk_[A-Za-z0-9_-]{30,}'''
 
 [[rules]]
+id = "ample-agent-secret"
+description = "Ample agent credential secret"
+regex = '''ample_agent_[0-9a-f]{64}'''
+
+[[rules]]
 id = "link-token"
 description = "Stripe Link agent wallet token"
 regex = '''liwl(token|refresh)_[A-Za-z0-9_-]{10,}'''
