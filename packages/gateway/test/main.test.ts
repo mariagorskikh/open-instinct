@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_AGENT_IMAGE, checkSignupPolicy, readEnv } from "../src/main.js";
+import { DEFAULT_AGENT_IMAGE, agentExtraEnv, checkSignupPolicy, readEnv } from "../src/main.js";
 
 describe("readEnv", () => {
   it("requires MARITIME_API_KEY and reads the signup, Composio, Maritime LLM and Link settings", () => {
@@ -31,6 +31,31 @@ describe("readEnv", () => {
     expect(plain.allowOpenSignup).toBe(false);
     expect(plain.useMaritimeLlm).toBe(false);
     expect(plain.link).toBeUndefined();
+  });
+});
+
+describe("Ample for every agent", () => {
+  it("forwards AMPLE_SIGNUP so each person's agent gets its own account, and never a shared credential", () => {
+    const cfg = readEnv({
+      MARITIME_API_KEY: "mk",
+      AMPLE_SIGNUP: "1",
+      AMPLE_CLIENT_ID: "agent_shared",
+      AMPLE_CLIENT_SECRET: "ample_agent_shared_secret",
+      CONTEXT_DEV_API_KEY: "ctxt_secret_test",
+    });
+    expect(cfg.ampleSignup).toBe(true);
+    expect(cfg.ampleSharedCredential).toBe(true);
+    const env = agentExtraEnv(cfg);
+    expect(env).toEqual({ CONTEXT_DEV_API_KEY: "ctxt_secret_test", AMPLE_SIGNUP: "1" });
+    expect(JSON.stringify(env)).not.toContain("ample_agent_shared_secret");
+    expect(JSON.stringify(env)).not.toContain("agent_shared");
+  });
+
+  it("sends nothing extra when neither Context.dev nor Ample is on", () => {
+    const cfg = readEnv({ MARITIME_API_KEY: "mk" });
+    expect(cfg.ampleSignup).toBe(false);
+    expect(cfg.ampleSharedCredential).toBe(false);
+    expect(agentExtraEnv(cfg)).toBeUndefined();
   });
 });
 

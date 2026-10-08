@@ -175,13 +175,25 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
 
   registry.registerMany(fileTools(state.path("workspace"), { env }));
 
-  // Web app deploys through Ample, when the deployer gave us a credential.
+  // Web app deploys through Ample: with the deployer's credential, or with an
+  // account this agent signs up for itself on the first deploy (AMPLE_SIGNUP=1),
+  // which is how every person behind a shared gateway gets an account of their own.
   const ample = ampleCredentials(env);
-  if (ample) {
+  const ampleSignup = !ample && env.AMPLE_SIGNUP === "1";
+  if (ample || ampleSignup) {
     const workspace = state.path("workspace");
+    const ownerEmail = config.owner.emails[0];
     registry.registerMany(
       ampleTools({
-        credentials: ample,
+        ...(ample
+          ? { credentials: ample }
+          : {
+              signup: {
+                file: state.path("secrets", "ample.json"),
+                name: `open-instinct-${config.agent.handle ?? "agent"}`,
+                ...(ownerEmail ? { ownerEmail } : {}),
+              },
+            }),
         workspaceDir: workspace,
         resolvePath: (requested) => resolveInsideWorkspace(workspace, requested),
         env,
@@ -190,7 +202,7 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       }),
     );
-    log("ample: web app deploys on");
+    log(`ample: web app deploys on (${ample ? "shared credential" : "own account on first deploy"})`);
   }
 
   // Computer: in-VM desktopd, hosted Maritime Computers MCP, or nothing.

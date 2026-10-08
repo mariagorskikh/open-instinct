@@ -24,6 +24,10 @@ export interface GatewayEnv {
   composioApiKey?: string;
   composioToolkits?: string;
   contextDevApiKey?: string;
+  /** AMPLE_SIGNUP=1: each person's agent signs up for an Ample account of its own on its first deploy. */
+  ampleSignup: boolean;
+  /** An Ample credential set on the gateway. Never forwarded: every agent would share one account. */
+  ampleSharedCredential: boolean;
   idleTtlSeconds?: number;
   useMaritimeLlm: boolean;
   maritimeModel?: string;
@@ -65,6 +69,8 @@ export function readEnv(env: NodeJS.ProcessEnv): GatewayEnv {
     composioApiKey: env["COMPOSIO_API_KEY"] || undefined,
     composioToolkits: env["COMPOSIO_TOOLKITS"] || env["INSTINCT_COMPOSIO_TOOLKITS"] || undefined,
     contextDevApiKey: env["CONTEXT_DEV_API_KEY"] || undefined,
+    ampleSignup: truthy(env["AMPLE_SIGNUP"]),
+    ampleSharedCredential: Boolean(env["AMPLE_CLIENT_ID"] || env["AMPLE_CLIENT_SECRET"] || env["AMPLE_TOKEN"]),
     idleTtlSeconds: idle !== undefined && Number.isFinite(idle) ? idle : undefined,
     useMaritimeLlm: truthy(env["INSTINCT_USE_MARITIME_LLM"]),
     maritimeModel: env["INSTINCT_MARITIME_MODEL"] || undefined,
@@ -89,6 +95,14 @@ export function checkSignupPolicy(cfg: Pick<GatewayEnv, "inkboxAdminApiKey" | "s
   };
 }
 
+/** Settings every agent gets. Only keys safe to share across people belong here. */
+export function agentExtraEnv(cfg: Pick<GatewayEnv, "contextDevApiKey" | "ampleSignup">): Record<string, string> | undefined {
+  const env: Record<string, string> = {};
+  if (cfg.contextDevApiKey) env["CONTEXT_DEV_API_KEY"] = cfg.contextDevApiKey;
+  if (cfg.ampleSignup) env["AMPLE_SIGNUP"] = "1";
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
 export function startGateway(cfg: GatewayEnv): GatewayServer {
   const log = consoleLogger;
   const policy = checkSignupPolicy(cfg);
@@ -105,6 +119,11 @@ export function startGateway(cfg: GatewayEnv): GatewayServer {
     : undefined;
   if (!inkbox) log.warn("gateway.relay_only", { reason: "INKBOX_ADMIN_API_KEY not set; signup disabled" });
   if (!cfg.publicUrl.startsWith("https://")) log.warn("gateway.public_url_not_https", { publicUrl: cfg.publicUrl });
+  if (cfg.ampleSharedCredential) {
+    log.warn("gateway.ample_credential_ignored", {
+      reason: "An Ample credential is not forwarded to agents: they would all deploy into one account. Set AMPLE_SIGNUP=1 to give each person an account of their own.",
+    });
+  }
 
   const server = createGateway({
     store,
@@ -118,7 +137,7 @@ export function startGateway(cfg: GatewayEnv): GatewayServer {
       idleTtlSeconds: cfg.idleTtlSeconds,
       useMaritimeLlm: cfg.useMaritimeLlm,
       maritimeModel: cfg.maritimeModel,
-      extraEnv: cfg.contextDevApiKey ? { CONTEXT_DEV_API_KEY: cfg.contextDevApiKey } : undefined,
+      extraEnv: agentExtraEnv(cfg),
     },
     signupSecret: cfg.signupSecret,
     anthropicApiKey: cfg.anthropicApiKey,

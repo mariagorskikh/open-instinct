@@ -97,6 +97,7 @@ export function buildCreateBody(input: DeployInput): CreateAgentBody {
   pushVar(vars, "AMPLE_CLIENT_ID", env.AMPLE_CLIENT_ID, false);
   pushVar(vars, "AMPLE_CLIENT_SECRET", env.AMPLE_CLIENT_SECRET, true);
   pushVar(vars, "AMPLE_TOKEN", env.AMPLE_TOKEN, true);
+  pushVar(vars, "AMPLE_SIGNUP", env.AMPLE_SIGNUP, false);
   if (env.LINK_CLIENT_ID) {
     pushVar(vars, "LINK_CLIENT_ID", env.LINK_CLIENT_ID, false);
     pushVar(vars, "LINK_CLIENT_SECRET", env.LINK_CLIENT_SECRET, true);

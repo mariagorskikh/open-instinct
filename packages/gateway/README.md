@@ -44,6 +44,7 @@ Validation: phone must normalize to E.164 (`+14155550123`; a bare 10-digit US nu
 | `INSTINCT_USE_MARITIME_LLM` | no | `1` sets `useMaritimeLlm: true` on each agent so Maritime injects its metered `OPENAI_API_KEY` and `OPENAI_BASE_URL`, and sets `INSTINCT_MODEL=openai-compatible/<model>` so the agent uses them. For deployments without a model key of their own |
 | `INSTINCT_MARITIME_MODEL` | no | Model id behind the Maritime proxy. Default `gpt-5.4` |
 | `COMPOSIO_API_KEY` | no | Passed to every new agent as a secret env var; enables Gmail, Calendar and the other Composio toolkits |
+| `AMPLE_SIGNUP` | no | `1` lets each person's agent put the sites it builds online, in an Ample account of its own that it signs up for on its first deploy (see docs/AMPLE.md). Only the switch is passed on; an Ample credential set on the gateway is never forwarded |
 | `COMPOSIO_TOOLKITS` | no | Comma-separated toolkit slugs sent with the key. Default `gmail,googlecalendar,googlecontacts`. The agent only enables apps when this is non-empty, so the gateway always sends it alongside the key |
 | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY` | no | Stripe Link Agent Wallet credentials. When `LINK_CLIENT_ID` is set, all three are copied into each agent's env (the secret marked secret) together with `LINK_REDIRECT_URI=<GATEWAY_PUBLIC_URL>/oauth/link/callback/<userId>` |
 | `GATEWAY_DATA_DIR` | no | Where `users.json` lives. Default `./.instinct-gateway`. Mount a volume here |

@@ -1,8 +1,9 @@
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defineTool, textResult, wrapUntrusted, type RegisteredTool, type ToolResultLike } from "@open-instinct/core";
 import { Type } from "typebox";
+import { SignupAccount } from "./account.js";
 import { AmpleAuth, DEFAULT_API_URL, type AmpleCredentials } from "./auth.js";
 import { CliMissingError, cliEnv, spawnCli, type CliResult, type RunCli } from "./cli.js";
 
@@ -21,7 +22,13 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const ANSWER_PATH = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 
 export interface AmpleToolDeps {
-  credentials: AmpleCredentials;
+  /** A shared credential from the operator (one person, or a team that shares an account). */
+  credentials?: AmpleCredentials;
+  /**
+   * Without `credentials`: the agent signs up for an Ample account of its own on
+   * the first deploy and keeps it in `file`. One account per agent, so per person.
+   */
+  signup?: { file: string; ownerEmail?: string; name?: string };
   /** The agent's workspace. Deploys only package folders inside it. */
   workspaceDir: string;
   /** Maps a model-supplied path to an absolute path inside the workspace, or undefined to refuse. */
@@ -38,25 +45,46 @@ export interface AmpleToolDeps {
 
 export function ampleTools(deps: AmpleToolDeps): RegisteredTool[] {
   const apiUrl = (deps.apiUrl ?? DEFAULT_API_URL).replace(/\/+$/, "");
-  const auth = new AmpleAuth(deps.credentials, apiUrl, deps.fetchImpl);
+  let source: ConstructorParameters<typeof AmpleAuth>[0];
+  if (deps.credentials) source = { credentials: deps.credentials };
+  else if (deps.signup) source = { signup: new SignupAccount({ ...deps.signup, apiUrl, ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}) }) };
+  else throw new Error("ampleTools needs credentials or signup");
+  const auth = new AmpleAuth(source, apiUrl, deps.fetchImpl);
   const run = deps.run ?? spawnCli(deps.bin ?? "ample");
   const baseEnv = deps.env ?? process.env;
 
-  const ample = async (args: string[], timeoutMs: number, signal?: AbortSignal): Promise<CliResult> => {
-    const token = await auth.token(signal);
-    return run(["--format", "json", ...args], { env: cliEnv(baseEnv, token, apiUrl), timeoutMs, ...(signal ? { signal } : {}) });
+  const once = async (args: string[], timeoutMs: number, signal?: AbortSignal): Promise<AmpleResult> => {
+    const { token, notice } = await auth.token(signal);
+    const result = await run(["--format", "json", ...args], { env: cliEnv(baseEnv, token, apiUrl), timeoutMs, ...(signal ? { signal } : {}) });
+    return notice ? { ...result, notice } : result;
   };
-  const runner: Runner = { ample, workspaceDir: deps.workspaceDir, resolvePath: deps.resolvePath };
+  const ample = async (args: string[], timeoutMs: number, signal?: AbortSignal): Promise<AmpleResult> => {
+    const result = await once(args, timeoutMs, signal);
+    if (!refusedToken(result)) return result;
+    // A cached token outlives its account by up to 15 minutes. Ample refuses it on
+    // the first request, before anything changes, so one retry with a fresh token
+    // is safe; signing in again finds out whether the account is gone.
+    auth.dropToken();
+    return once(args, timeoutMs, signal);
+  };
+  const runner: Runner = { ample, hasAccount: () => auth.hasAccount(), retired: (id) => auth.retired(id), workspaceDir: deps.workspaceDir, resolvePath: deps.resolvePath };
   return [deployTool(runner), logsTool(runner), appsTool(runner), deleteTool(runner)];
 }
 
+/** A CLI result, plus anything about the account the owner should hear. */
+type AmpleResult = CliResult & { notice?: string };
+
 interface Runner {
-  ample: (args: string[], timeoutMs: number, signal?: AbortSignal) => Promise<CliResult>;
+  ample: (args: string[], timeoutMs: number, signal?: AbortSignal) => Promise<AmpleResult>;
+  /** False only for an agent with its own account mode that has not deployed yet. */
+  hasAccount: () => boolean;
+  /** An account this agent lost (Ample deleted it unclaimed) and replaced. */
+  retired: (accountId: string) => boolean;
   workspaceDir: string;
   resolvePath: (requested: string) => string | undefined;
 }
 
-function deployTool({ ample, workspaceDir, resolvePath }: Runner): RegisteredTool {
+function deployTool({ ample: run, retired, workspaceDir, resolvePath }: Runner): RegisteredTool {
   return defineTool({
     name: "ample_deploy",
     label: "Deploy a web app",
@@ -86,6 +114,14 @@ function deployTool({ ample, workspaceDir, resolvePath }: Runner): RegisteredToo
       describe: (args) => `deploy ${str(args, "path") ?? "an app"} with Ample`,
     },
     execute: async ({ path: requested, env, answers, force }, _ctx, signal) => {
+      // A deploy runs several CLI commands; an account notice from the first (a
+      // signup, say) must reach the result the agent reads.
+      let notice: string | undefined;
+      const ample: Runner["ample"] = async (args, timeoutMs, signal) => {
+        const result = await run(args, timeoutMs, signal);
+        notice ??= result.notice;
+        return notice ? { ...result, notice } : result;
+      };
       const dir = resolvePath(requested);
       if (!dir) return failed(`Refused: "${requested}" is outside the workspace.`);
       if (isWorkspaceRoot(dir, workspaceDir)) {
@@ -102,32 +138,47 @@ function deployTool({ ample, workspaceDir, resolvePath }: Runner): RegisteredToo
         if (!ANSWER_PATH.test(key)) return failed(`"${key}" is not a plan question path.`);
       }
 
-      // One app at the folder's root deploys under the folder's name, which keeps its
-      // URL short. Anything else (several services, or one in a subfolder) is a
-      // project: write the plan and let `ample deploy` bring up every service in
-      // order. ample deploy only plans by itself when no per-service flag is given,
-      // so the plan is written here.
-      const shape = await deployShape(ample, dir, answers !== undefined && Object.keys(answers).length > 0, signal);
-      if ("error" in shape) return shape.error;
-      if (shape.project) {
-        const planned = await writePlan(ample, dir, answers ?? {}, signal);
-        if (planned) return planned;
-      }
-
       const envFile = env && Object.keys(env).length > 0 ? writeEnvFile(env) : undefined;
       try {
-        const args = ["deploy", dir, ...(shape.project ? [] : ["--name", path.basename(dir)]), "--wait-secs", String(DEPLOY_WAIT_SECS)];
-        if (envFile) args.push("--env-file", envFile.file);
-        if (force) args.push("--force");
-        const run = await attempt(() => ample(args, DEPLOY_TIMEOUT_MS, signal), "deploy");
-        if ("error" in run) return run.error;
+        let run: Awaited<ReturnType<typeof attempt>> | undefined;
+        for (let pass = 0; pass < 2; pass += 1) {
+          // One app at the folder's root deploys under the folder's name, which keeps
+          // its URL short. Anything else (several services, or one in a subfolder) is
+          // a project: write the plan and let `ample deploy` bring up every service in
+          // order. ample deploy only plans by itself when no per-service flag is
+          // given, so the plan is written here.
+          const shape = await deployShape(ample, dir, answers !== undefined && Object.keys(answers).length > 0, signal);
+          if ("error" in shape) return shape.error;
+          if (shape.project) {
+            const planned = await writePlan(ample, dir, answers ?? {}, signal);
+            if (planned) return planned;
+          }
+          const args = ["deploy", dir, ...(shape.project ? [] : ["--name", path.basename(dir)]), "--wait-secs", String(DEPLOY_WAIT_SECS)];
+          if (envFile) args.push("--env-file", envFile.file);
+          if (force) args.push("--force");
+          run = await attempt(() => ample(args, DEPLOY_TIMEOUT_MS, signal), "deploy");
+          if ("error" in run) return run.error;
+          // The folder's deploy records point at an account this agent lost (Ample
+          // deleted it unclaimed, with its apps). They describe nothing that still
+          // exists, so drop them and deploy the folder into the current account.
+          if (pass === 0 && boundToRetiredAccount(run.result, dir, retired)) {
+            rmSync(path.join(dir, ".ample"), { recursive: true, force: true });
+            continue;
+          }
+          break;
+        }
+        if (!run || "error" in run) return failed("Ample deploy did not run.");
         return report(run.result, "deploy", (result) => {
           const json = parseJson(result.stdout);
           if (result.exitCode === 0) {
             const urls = liveUrls(json);
             const where = urls.length > 0 ? `Live at ${urls.join(", ")}` : "";
-            if (json?.["unchanged"] === true) return `No changes since the last deploy. ${where || "Still live."}`;
-            return where ? `Deployed. ${where}` : "Deployed.";
+            const lead = json?.["unchanged"] === true ? `No changes since the last deploy. ${where || "Still live."}` : where ? `Deployed. ${where}` : "Deployed.";
+            // Ample adds a claim link while nobody owns the account; the account notice already carries one.
+            const claim = typeof json?.["claim_url"] === "string" && !result.notice ? json["claim_url"] : undefined;
+            return claim
+              ? `${lead}\nThe owner has not claimed this Ample account yet; it is deleted two days after signup unless they do. If they have not had the link, send it: ${claim}`
+              : lead;
           }
           if (result.exitCode === 2) return "Ample needs a decision before it can deploy. The result says what to answer or change.";
           return "The deploy failed. The result says who needs to act and how to fix it.";
@@ -137,6 +188,18 @@ function deployTool({ ample, workspaceDir, resolvePath }: Runner): RegisteredToo
       }
     },
   });
+}
+
+/** A deploy refused because the folder belongs to an account this agent no longer has. */
+function boundToRetiredAccount(result: CliResult, dir: string, retired: (accountId: string) => boolean): boolean {
+  const code = (parseJson(result.stdout)?.["error"] as Record<string, unknown> | undefined)?.["code"];
+  if (code !== "project_account_mismatch") return false;
+  try {
+    const bound = JSON.parse(readFileSync(path.join(dir, ".ample", "account.json"), "utf8")) as { account_id?: unknown };
+    return typeof bound.account_id === "string" && retired(bound.account_id);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -184,7 +247,7 @@ async function writePlan(ample: Runner["ample"], dir: string, answers: Record<st
   return undefined;
 }
 
-function logsTool({ ample }: Runner): RegisteredTool {
+function logsTool({ ample, hasAccount }: Runner): RegisteredTool {
   return defineTool({
     name: "ample_logs",
     label: "Read app logs",
@@ -197,13 +260,14 @@ function logsTool({ ample }: Runner): RegisteredTool {
     meta: { capabilities: ["files.read"], group: "files", describe: (args) => `read Ample logs for ${str(args, "deployment_id") ?? "an app"}` },
     execute: async ({ deployment_id, kind, tail }, _ctx, signal) => {
       if (!DEPLOYMENT_ID.test(deployment_id)) return failed(`"${deployment_id}" is not a deployment ID.`);
+      if (!hasAccount()) return failed("Nothing has been deployed with Ample yet, so there are no logs.");
       const args = ["logs", deployment_id, "--kind", kind ?? "all", "--tail", String(tail ?? 100)];
       return runAndReport(() => ample(args, QUICK_TIMEOUT_MS, signal), "logs", (r) => (r.exitCode === 0 ? "Logs:" : "Could not read the logs."));
     },
   });
 }
 
-function appsTool({ ample }: Runner): RegisteredTool {
+function appsTool({ ample, hasAccount }: Runner): RegisteredTool {
   return defineTool({
     name: "ample_apps",
     label: "List deployed apps",
@@ -211,11 +275,13 @@ function appsTool({ ample }: Runner): RegisteredTool {
     parameters: Type.Object({}),
     meta: { capabilities: ["files.read"], group: "files", describe: () => "list Ample apps" },
     execute: async (_args, _ctx, signal) =>
-      runAndReport(() => ample(["app", "list"], QUICK_TIMEOUT_MS, signal), "apps", (r) => (r.exitCode === 0 ? "Apps:" : "Could not list the apps.")),
+      !hasAccount()
+        ? textResult("No apps yet: nothing has been deployed with Ample.")
+        : runAndReport(() => ample(["app", "list"], QUICK_TIMEOUT_MS, signal), "apps", (r) => (r.exitCode === 0 ? "Apps:" : "Could not list the apps.")),
   });
 }
 
-function deleteTool({ ample }: Runner): RegisteredTool {
+function deleteTool({ ample, hasAccount }: Runner): RegisteredTool {
   return defineTool({
     name: "ample_app_delete",
     label: "Delete a deployed app",
@@ -224,6 +290,7 @@ function deleteTool({ ample }: Runner): RegisteredTool {
     meta: { capabilities: ["files.read", "files.write"], group: "files", describe: (args) => `delete Ample app ${str(args, "deployment_id") ?? ""}`.trim() },
     execute: async ({ deployment_id }, _ctx, signal) => {
       if (!DEPLOYMENT_ID.test(deployment_id)) return failed(`"${deployment_id}" is not a deployment ID.`);
+      if (!hasAccount()) return failed("Nothing has been deployed with Ample yet, so there is nothing to delete.");
       return runAndReport(() => ample(["app", "delete", deployment_id, "--yes"], QUICK_TIMEOUT_MS, signal), "delete", (r) =>
         r.exitCode === 0 ? "Deleted. The URL no longer serves the app." : "Could not delete the app.",
       );
@@ -231,9 +298,16 @@ function deleteTool({ ample }: Runner): RegisteredTool {
   });
 }
 
+/** The CLI's report of a token Ample would not accept: revoked, or its account deleted or expired. */
+function refusedToken(result: CliResult): boolean {
+  if (result.exitCode === 0) return false;
+  if (parseJson(result.stdout)?.["http_status"] === 401) return true;
+  return /\b(authentication_failed|credential_revoked|token_revoked|account_inactive)\b/.test(`${result.stdout}\n${result.stderr}`);
+}
+
 /** Run the CLI, turning a missing binary, a failed sign-in or a timeout into a tool error. */
-async function attempt(call: () => Promise<CliResult>, what: string): Promise<{ result: CliResult } | { error: ToolResultLike }> {
-  let result: CliResult;
+async function attempt(call: () => Promise<AmpleResult>, what: string): Promise<{ result: AmpleResult } | { error: ToolResultLike }> {
+  let result: AmpleResult;
   try {
     result = await call();
   } catch (error) {
@@ -251,13 +325,14 @@ async function attempt(call: () => Promise<CliResult>, what: string): Promise<{ 
  * CLI's own output as data. Output can quote build logs and app output, so it is
  * wrapped as untrusted.
  */
-function report(result: CliResult, what: string, lead: (result: CliResult) => string): ToolResultLike {
+function report(result: AmpleResult, what: string, lead: (result: AmpleResult) => string): ToolResultLike {
   const output = clip(result.stdout.trim() || result.stderr.trim() || "(no output)");
-  const text = `${lead(result)}\n${wrapUntrusted(output, `Ample ${what} result`)}`;
+  const notice = result.notice ? `\n${result.notice}` : "";
+  const text = `${lead(result)}${notice}\n${wrapUntrusted(output, `Ample ${what} result`)}`;
   return result.exitCode === 0 ? textResult(text) : { content: [{ type: "text", text }], isError: true };
 }
 
-async function runAndReport(call: () => Promise<CliResult>, what: string, lead: (result: CliResult) => string): Promise<ToolResultLike> {
+async function runAndReport(call: () => Promise<AmpleResult>, what: string, lead: (result: AmpleResult) => string): Promise<ToolResultLike> {
   const run = await attempt(call, what);
   return "error" in run ? run.error : report(run.result, what, lead);
 }
