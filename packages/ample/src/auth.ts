@@ -15,6 +15,9 @@ const RENEW_MARGIN_MS = 60_000;
 /** Ample no longer knows the client: its account was deleted or the credential revoked. */
 class InvalidClient extends Error {}
 
+/** Ample suspended the account. Signing up again would work around it, so the agent stops here. */
+class AccountSuspended extends Error {}
+
 export interface IssuedToken {
   token: string;
   /** Something the owner should hear about, such as a new account and its claim link. */
@@ -86,8 +89,13 @@ export class AmpleAuth {
     });
     // Never echo the response body: an auth error is not worth risking the secret.
     if (!response.ok) {
-      const code = response.status === 401 ? await errorCode(response) : undefined;
+      const code = response.status === 401 || response.status === 403 ? await errorCode(response) : undefined;
       if (code === "invalid_client") throw new InvalidClient(`Ample sign-in failed with HTTP ${response.status}.`);
+      if (code === "account_suspended") {
+        throw new AccountSuspended(
+          "Ample has suspended this account, so nothing can be deployed or changed. Tell the owner to contact Ample at https://ample.computer/contact. Do not sign up for another account.",
+        );
+      }
       throw new Error(`Ample sign-in failed with HTTP ${response.status}.`);
     }
     const value = (await response.json().catch(() => undefined)) as { access_token?: unknown; expires_in?: unknown } | undefined;

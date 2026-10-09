@@ -39,7 +39,9 @@ Ample deletes an unclaimed account, with its sites, two days after signup.
 Until the owner claims it, every deploy result reminds the agent of the claim
 link. If the account was deleted, the next deploy signs up again, tells the
 owner the old sites are gone, and redeploys from the workspace, where the
-app's files still are. The account's credential lives in
+app's files still are. A suspended account is different: Ample answers
+`account_suspended`, and the agent stops and tells the owner to contact Ample
+instead of signing up again. The account's credential lives in
 `<data>/secrets/ample.json` (0600), next to the Link wallet's tokens.
 
 This is the mode for the gateway: set `AMPLE_SIGNUP=1` on the gateway and it

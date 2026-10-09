@@ -20,7 +20,7 @@ function text(result: Awaited<ReturnType<Tool["spec"]["execute"]>>): string {
 const ONE_APP = JSON.stringify({ status: "ready", services: [{ name: "party", path: "." }] });
 
 /** A fake Ample API: signup, claim email and token exchange, counting calls. */
-function fakeAmple(opts: { signupStatus?: number; deletedClients?: Set<string> } = {}) {
+function fakeAmple(opts: { signupStatus?: number; deletedClients?: Set<string>; suspendedClients?: Set<string> } = {}) {
   let accounts = 0;
   const calls: Array<{ url: string; body: string; auth?: string }> = [];
   const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -45,6 +45,9 @@ function fakeAmple(opts: { signupStatus?: number; deletedClients?: Set<string> }
       if (opts.deletedClients?.has(clientId)) {
         return new Response(JSON.stringify({ error: "invalid_client", error_description: "Invalid client credentials" }), { status: 401 });
       }
+      if (opts.suspendedClients?.has(clientId)) {
+        return new Response(JSON.stringify({ error: "account_suspended", error_description: "Ample suspended this account." }), { status: 403 });
+      }
       return Response.json({ access_token: `access-for-${clientId}`, expires_in: 900 });
     }
     return new Response("not found", { status: 404 });
@@ -52,11 +55,11 @@ function fakeAmple(opts: { signupStatus?: number; deletedClients?: Set<string> }
   return { fetchImpl, calls, count: (suffix: string) => calls.filter((c) => c.url.endsWith(suffix)).length };
 }
 
-function setup(api: ReturnType<typeof fakeAmple>, run?: RunCli, ownerEmail = "maya@example.com") {
+function setup(api: ReturnType<typeof fakeAmple>, run?: RunCli, ownerEmail = "maya@example.com", saved?: string) {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ample-signup-")));
   const workspace = path.join(root, "workspace");
   mkdirSync(path.join(workspace, "apps", "party"), { recursive: true });
-  const file = path.join(root, "secrets", "ample.json");
+  const file = saved ?? path.join(root, "secrets", "ample.json");
   const runner =
     run ??
     vi.fn<RunCli>(async (args) => {
@@ -147,6 +150,35 @@ describe("an Ample account of the agent's own", () => {
     expect(out).toContain("ample_claim_2");
     expect(api.count("/v1/auth/signup")).toBe(2);
     expect(JSON.parse(readFileSync(file, "utf8")).account.clientId).toBe("agent_2");
+  });
+
+  it("stops when Ample suspended the account, instead of signing up again", async () => {
+    const suspended = new Set<string>();
+    const api = fakeAmple({ suspendedClients: suspended });
+    // A token issued before the suspension is refused with the same code.
+    const run = vi.fn<RunCli>(async (args, opts) => {
+      const ok: CliResult = { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      if (opts.env.AMPLE_TOKEN === "access-for-agent_1" && suspended.has("agent_1")) {
+        return { ...ok, exitCode: 1, stderr: "Error: account_suspended: Ample suspended this account." };
+      }
+      if (args[2] === "plan") return { ...ok, stdout: ONE_APP };
+      return { ...ok, stdout: JSON.stringify({ status: "live", url: "https://party-acc-1.apps.ample.computer" }) };
+    });
+    const { file, deploy } = setup(api, run);
+    await deploy.spec.execute({ path: "apps/party" }, ctx);
+    suspended.add("agent_1");
+
+    const cached = text(await deploy.spec.execute({ path: "apps/party" }, ctx));
+    expect(cached).toContain("account_suspended");
+
+    // After a restart there is no cached token, so the agent asks Ample for one.
+    const restarted = setup(api, run, "maya@example.com", file);
+    const out = text(await restarted.deploy.spec.execute({ path: "apps/party" }, ctx));
+
+    expect(out).toContain("suspended");
+    expect(out).toContain("Do not sign up for another account");
+    expect(api.count("/v1/auth/signup")).toBe(1);
+    expect(JSON.parse(readFileSync(file, "utf8")).account.clientId).toBe("agent_1");
   });
 
   it("retries a failed signup with the same request key, so Ample returns one account", async () => {
