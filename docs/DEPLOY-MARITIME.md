@@ -151,6 +151,7 @@ Any other host works the same way: run the gateway image, give it a persistent d
 | `INSTINCT_USE_MARITIME_LLM` | no | `1` uses Maritime's metered proxy instead of your key. |
 | `INSTINCT_MARITIME_MODEL` | no | Model id behind the proxy. Default `gpt-5.4`. |
 | `COMPOSIO_API_KEY`, `COMPOSIO_TOOLKITS` | no | Apps for each new agent. |
+| `AMPLE_SIGNUP` | no | `1`: each new agent can put the sites it builds online, in an Ample account of its own ([AMPLE.md](AMPLE.md)). |
 | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY` | no | Stripe Link wallet for each new agent. The gateway also sets each agent's `LINK_REDIRECT_URI` to its own callback. |
 | `PORT` | no | Default `8787`. Railway injects its own. |
 | `MARITIME_API_URL`, `INKBOX_BASE_URL` | no | Override the API hosts for staging. |

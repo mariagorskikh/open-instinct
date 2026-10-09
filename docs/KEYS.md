@@ -118,6 +118,7 @@ the screen at checkout instead of paying.
 |---|---|---|
 | `BRAVE_SEARCH_API_KEY` | Better web search than the DuckDuckGo fallback | [brave.com/search/api](https://brave.com/search/api/) |
 | `CONTEXT_DEV_API_KEY` | Sourced answers and public page research through `context_answers` | [context.dev](https://context.dev) |
+| `AMPLE_SIGNUP=1`, or `AMPLE_CLIENT_ID` and `AMPLE_CLIENT_SECRET` | Web apps the agent builds, deployed to public URLs through `ample_deploy`. `AMPLE_SIGNUP=1` needs no key: each agent signs up for its own account ([AMPLE.md](AMPLE.md)) | [ample.computer](https://ample.computer), `ample auth signup` |
 | `INSTINCT_CHAT_TOKEN` | A bearer token on the owner's HTTP surface; set it whenever the port is reachable beyond your machine | you choose it |
 | `GATEWAY_SIGNUP_SECRET` | The invite code the gateway's signup form requires | you choose it |
 

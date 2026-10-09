@@ -30,10 +30,11 @@ import { InkboxA2A, InkboxChannel, InkboxInboundHydrator, InkboxProvisioner, mes
 import { computerGuidance, detectComputer } from "@open-instinct/computer";
 import type { ComputerBackend } from "@open-instinct/computer";
 import { ComposioApps, DEFAULT_TOOLKITS, appsGuidance, appsTools } from "@open-instinct/apps";
+import { ampleTools, type AmpleCredentials } from "@open-instinct/ample";
 import { contextTools } from "@open-instinct/context";
 import { networkTools } from "@open-instinct/network";
 import { ChatAwareOutbox, ConsoleOutbox, type ChatReplyBuffer } from "./console-outbox.js";
-import { fileTools } from "./file-tools.js";
+import { fileTools, resolveInsideWorkspace } from "./file-tools.js";
 import { describeDataPart, promptExtraFor } from "./hooks.js";
 import { appsNotConfiguredTool, setupSummaryFor } from "./setup-summary.js";
 import { createScheduleSync, type ScheduleSync } from "./maritime-schedules.js";
@@ -173,6 +174,36 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   }) : undefined;
 
   registry.registerMany(fileTools(state.path("workspace"), { env }));
+
+  // Web app deploys through Ample: with the deployer's credential, or with an
+  // account this agent signs up for itself on the first deploy (AMPLE_SIGNUP=1),
+  // which is how every person behind a shared gateway gets an account of their own.
+  const ample = ampleCredentials(env);
+  const ampleSignup = !ample && env.AMPLE_SIGNUP === "1";
+  if (ample || ampleSignup) {
+    const workspace = state.path("workspace");
+    const ownerEmail = config.owner.emails[0];
+    registry.registerMany(
+      ampleTools({
+        ...(ample
+          ? { credentials: ample }
+          : {
+              signup: {
+                file: state.path("secrets", "ample.json"),
+                name: `open-instinct-${config.agent.handle ?? "agent"}`,
+                ...(ownerEmail ? { ownerEmail } : {}),
+              },
+            }),
+        workspaceDir: workspace,
+        resolvePath: (requested) => resolveInsideWorkspace(workspace, requested),
+        env,
+        ...(env.AMPLE_API_URL ? { apiUrl: env.AMPLE_API_URL } : {}),
+        ...(env.AMPLE_BIN ? { bin: env.AMPLE_BIN } : {}),
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      }),
+    );
+    log(`ample: web app deploys on (${ample ? "shared credential" : "own account on first deploy"})`);
+  }
 
   // Computer: in-VM desktopd, hosted Maritime Computers MCP, or nothing.
   const computer = await safely(log, "computer", () =>
@@ -405,6 +436,15 @@ function inkboxSettings(env: NodeJS.ProcessEnv, config: InstinctConfig): InkboxS
   const handle = env.INKBOX_AGENT_HANDLE ?? config.agent.handle;
   if (!apiKey || !handle) return undefined;
   return { apiKey, handle, identityId: env.INKBOX_IDENTITY_ID };
+}
+
+/** An Ample agent credential (preferred: it never expires) or a plain token. */
+export function ampleCredentials(env: NodeJS.ProcessEnv): AmpleCredentials | undefined {
+  const clientId = env.AMPLE_CLIENT_ID?.trim();
+  const clientSecret = env.AMPLE_CLIENT_SECRET?.trim();
+  if (clientId && clientSecret) return { clientId, clientSecret };
+  const token = env.AMPLE_TOKEN?.trim();
+  return token ? { token } : undefined;
 }
 
 /** Optional pieces must never stop the agent from booting. Log and go on. */

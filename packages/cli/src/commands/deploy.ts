@@ -94,6 +94,10 @@ export function buildCreateBody(input: DeployInput): CreateAgentBody {
   pushVar(vars, "COMPOSIO_TOOLKITS", env.COMPOSIO_TOOLKITS ?? (config.apps.toolkits.length ? config.apps.toolkits.join(",") : undefined), false);
   pushVar(vars, "BRAVE_SEARCH_API_KEY", env.BRAVE_SEARCH_API_KEY, true);
   pushVar(vars, "CONTEXT_DEV_API_KEY", env.CONTEXT_DEV_API_KEY, true);
+  pushVar(vars, "AMPLE_CLIENT_ID", env.AMPLE_CLIENT_ID, false);
+  pushVar(vars, "AMPLE_CLIENT_SECRET", env.AMPLE_CLIENT_SECRET, true);
+  pushVar(vars, "AMPLE_TOKEN", env.AMPLE_TOKEN, true);
+  pushVar(vars, "AMPLE_SIGNUP", env.AMPLE_SIGNUP, false);
   if (env.LINK_CLIENT_ID) {
     pushVar(vars, "LINK_CLIENT_ID", env.LINK_CLIENT_ID, false);
     pushVar(vars, "LINK_CLIENT_SECRET", env.LINK_CLIENT_SECRET, true);
