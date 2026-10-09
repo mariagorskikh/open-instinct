@@ -5,8 +5,8 @@ it builds online. The owner texts "make a page for Maya's birthday with an RSVP
 form", the agent writes it in its workspace, deploys it and texts back a public
 HTTPS link. Ask for a change and it redeploys to the same link.
 
-`@open-instinct/ample` adds four tools, present only when an Ample credential
-is set:
+`@open-instinct/ample` adds four tools, present only when `AMPLE_SIGNUP=1` or
+an Ample credential is set:
 
 | Tool | What it does |
 |---|---|
@@ -120,8 +120,8 @@ at [ample.computer/pricing](https://ample.computer/pricing).
   skips symlinks, so a link in the folder cannot pull in files from outside.
 - The credential never reaches the model. The agent exchanges it for a
   15-minute access token and hands that only to the `ample`
-  process it spawns, whose environment is otherwise empty apart from `PATH`
-  and `HOME`. The CLI is pointed at an empty config file, so a config written
+  process it spawns, whose environment is otherwise empty apart from `PATH`,
+  `HOME`, `LANG`, `TZ` and `TMPDIR`. The CLI is pointed at an empty config file, so a config written
   from the shell cannot redirect it.
 - One account per person. With `AMPLE_SIGNUP=1` every agent has its own
   account, so no agent can see or change another person's sites. A shared

@@ -209,7 +209,7 @@ policy engine checks. Groups:
 | computer (in the VM) | `computer`, `computer_batch`, `request_takeover`, `takeover_status`, `computer_read_file`, `computer_write_file` | `@open-instinct/computer` over desktopd REST | `INSTINCT_COMPUTER` is `auto` or `desktopd` and desktopd answers |
 | computer (hosted) | the server's own names: `get_computer`, `computer`, `computer_batch`, `run_shell`, `read_file`, `write_file`, `request_takeover`, `takeover_status`, `close_computer` | `@open-instinct/computer` over MCP | `MARITIME_API_KEY` and no in-VM desktop |
 | apps | one `app_<slug>` tool per Composio tool (for example `app_googlecalendar_events_list`) | `@open-instinct/apps` over MCP | `COMPOSIO_API_KEY` is set |
-| files | `ample_deploy` (a workspace folder to a public URL), `ample_logs`, `ample_apps`, `ample_app_delete` | `@open-instinct/ample`, driving the `ample` CLI | `AMPLE_CLIENT_ID` and `AMPLE_CLIENT_SECRET` (or `AMPLE_TOKEN`) are set; owner only |
+| files | `ample_deploy` (a workspace folder to a public URL), `ample_logs`, `ample_apps`, `ample_app_delete` | `@open-instinct/ample`, driving the `ample` CLI | `AMPLE_SIGNUP=1`, or `AMPLE_CLIENT_ID` and `AMPLE_CLIENT_SECRET` (or `AMPLE_TOKEN`) are set; owner only |
 | payments | `payment_connect`, `payment_request`, `payment_status`, `payment_list` | `@open-instinct/payments` | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET` and `STRIPE_PUBLISHABLE_KEY` are set |
 
 MCP results are converted with `pi-mcp`'s `toLlmContent()`. Composio tool names get the `app_` prefix
