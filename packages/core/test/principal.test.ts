@@ -44,6 +44,7 @@ describe("resolvePrincipal", () => {
       expect(p.displayName).toBe("Maria");
       expect(p.phone).toBe("+16175550100");
     }
+    expect(resolvePrincipal(inbound({ channel: "whatsapp", from: "+16175550100" }), config, c).kind).toBe("owner");
     for (const channel of ["chat", "scheduled", "system"] as const) {
       expect(resolvePrincipal(inbound({ channel, from: "anything" }), config, c).kind).toBe("owner");
     }

@@ -213,6 +213,7 @@ function channelSection(channel: Channel): string {
   switch (channel) {
     case "imessage":
     case "sms":
+    case "whatsapp":
       lines.push(
         "This is a text thread. Keep replies short, like a capable friend texting. No markdown, no headings, no bullet lists, no bold. One idea per message. Use plain line breaks when you must list things. Ask one question at a time.",
       );
@@ -301,7 +302,7 @@ function longTaskSection(channel: Channel): string {
     "# Long tasks",
     "If a task will take more than a few seconds, first send one short acknowledgement saying what you are doing, then do the work, then send the result. Do not narrate every step.",
   ];
-  if (channel === "imessage" || channel === "sms") {
+  if (channel === "imessage" || channel === "sms" || channel === "whatsapp") {
     lines.push("Results go in the same thread as short messages. Long results: give the summary, offer details on request.");
   }
   return lines.join("\n");

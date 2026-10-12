@@ -1,0 +1,241 @@
+/**
+ * WhatsApp as a channel: the agent's own WhatsApp account, joined as a linked device through
+ * Baileys (WhatsApp Web's multi-device protocol, over a WebSocket; no browser).
+ *
+ * Analogy: the agent's WhatsApp Business app on the owner's phone is the account; this process
+ * is one more "linked device", like WhatsApp Web on a laptop. The phone holding the account
+ * must open WhatsApp at least every 14 days or WhatsApp logs linked devices out.
+ *
+ * Inbound: one-to-one chats only. Media is downloaded into the inbound folder under a hashed
+ * name so open_attachment can read it. Outbound: text, a typing indicator, read receipts.
+ * Baileys is unofficial; keep the account for the agent alone and never bulk-message from it.
+ */
+import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import {
+  Browsers,
+  DisconnectReason,
+  downloadMediaMessage,
+  makeWASocket,
+  normalizeMessageContent,
+  useMultiFileAuthState,
+  type WAMessage,
+  type WASocket,
+} from "@whiskeysockets/baileys";
+import type { InboundMessage, Outbox, OutboundMessage } from "@open-instinct/core";
+import { conversationKeyFor, extensionFor, isDirectChat, jidFromConversationKey, jidFromPhone, mediaInfo, messageText, phoneFromJid } from "./parse.js";
+
+export const WHATSAPP_MEDIA_MAX_BYTES = 16 * 1024 * 1024;
+const OPEN_WAIT_MS = 30_000;
+const RECONNECT_MIN_MS = 2_000;
+const RECONNECT_MAX_MS = 5 * 60_000;
+
+export type WhatsAppState = "idle" | "connecting" | "pairing" | "open" | "closed" | "logged_out";
+
+export interface WhatsAppChannelOptions {
+  /** Where the linked-device credentials live. Treat it like a password. */
+  authDir: string;
+  /** Where inbound media is saved (workspace/inbound). */
+  mediaDir: string;
+  /** The agent's own WhatsApp number (E.164). Needed once, to print a pairing code. */
+  phone?: string;
+  /** Called for every message from a person. The caller persists it before acting. */
+  onInbound: (msg: InboundMessage) => void | Promise<void>;
+  logger?: (m: string) => void;
+  maxMediaBytes?: number;
+}
+
+export class WhatsAppChannel implements Outbox {
+  private sock?: WASocket;
+  private state: WhatsAppState = "idle";
+  private stopped = false;
+  private retryMs = RECONNECT_MIN_MS;
+  private retryTimer?: NodeJS.Timeout;
+  private openWaiters: Array<() => void> = [];
+  private readonly log: (m: string) => void;
+
+  constructor(private readonly opts: WhatsAppChannelOptions) {
+    this.log = opts.logger ?? (() => {});
+  }
+
+  status(): WhatsAppState {
+    return this.state;
+  }
+
+  async start(): Promise<void> {
+    this.stopped = false;
+    mkdirSync(this.opts.authDir, { recursive: true, mode: 0o700 });
+    await this.connect();
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.sock?.end(undefined);
+    this.sock = undefined;
+    this.state = "closed";
+  }
+
+  async send(msg: OutboundMessage): Promise<void> {
+    const jid = jidFromConversationKey(msg.conversationKey) ?? (typeof msg.to === "string" ? jidFromPhone(msg.to) : undefined);
+    if (!jid) throw new Error("WhatsApp send needs a whatsapp: conversation or a phone number");
+    const sock = await this.openSocket();
+    const text = msg.text.trim();
+    if (text) await sock.sendMessage(jid, { text });
+    for (const url of msg.mediaUrls ?? []) await sock.sendMessage(jid, { text: url });
+    await sock.sendPresenceUpdate("paused", jid).catch(() => undefined);
+  }
+
+  async typing(conversationKey: string): Promise<void> {
+    const jid = jidFromConversationKey(conversationKey);
+    if (!jid || this.state !== "open" || !this.sock) return;
+    await this.sock.sendPresenceUpdate("composing", jid).catch(() => undefined);
+  }
+
+  private async connect(): Promise<void> {
+    const { state: auth, saveCreds } = await useMultiFileAuthState(this.opts.authDir);
+    const sock = makeWASocket({
+      auth,
+      logger: baileysLogger(this.log),
+      browser: Browsers.ubuntu("Open Instinct"),
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: false,
+    });
+    this.sock = sock;
+    this.state = "connecting";
+    let pairingRequested = false;
+
+    sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("connection.update", (update) => {
+      if (update.qr && !auth.creds.registered && !pairingRequested) {
+        pairingRequested = true;
+        this.state = "pairing";
+        void this.requestPairing(sock);
+      }
+      if (update.connection === "open") {
+        this.state = "open";
+        this.retryMs = RECONNECT_MIN_MS;
+        this.log(`whatsapp: connected as ${phoneFromJid(sock.user?.id) ?? sock.user?.id ?? "unknown"}`);
+        for (const wake of this.openWaiters.splice(0)) wake();
+      }
+      if (update.connection === "close") this.onClose(sock, update.lastDisconnect?.error);
+    });
+    sock.ev.on("messages.upsert", ({ messages, type }) => {
+      if (type !== "notify") return;
+      for (const m of messages) void this.receive(sock, m).catch((err: Error) => this.log(`whatsapp: dropped a message: ${err.message}`));
+    });
+  }
+
+  private async requestPairing(sock: WASocket): Promise<void> {
+    if (!this.opts.phone) {
+      this.log("whatsapp: not linked yet. Set WHATSAPP_PHONE to the agent's WhatsApp number and restart to get a pairing code.");
+      return;
+    }
+    try {
+      const code = await sock.requestPairingCode(this.opts.phone.replace(/\D/g, ""));
+      const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+      this.log(`whatsapp: pairing code ${pretty}. On the phone with the agent's WhatsApp: Settings > Linked devices > Link a device > Link with phone number instead.`);
+    } catch (err) {
+      this.log(`whatsapp: could not get a pairing code: ${(err as Error).message}`);
+    }
+  }
+
+  private onClose(sock: WASocket, error: unknown): void {
+    if (this.sock !== sock) return;
+    const code = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
+    if (code === DisconnectReason.loggedOut) {
+      this.state = "logged_out";
+      this.log(`whatsapp: logged out by WhatsApp. Delete ${this.opts.authDir} and restart to link again.`);
+      return;
+    }
+    this.state = "closed";
+    if (this.stopped) return;
+    // After pairing WhatsApp asks for a fresh connection (515); that one should be immediate.
+    const delay = code === DisconnectReason.restartRequired ? 0 : this.retryMs;
+    this.retryMs = Math.min(this.retryMs * 2, RECONNECT_MAX_MS);
+    if (delay > 0) this.log(`whatsapp: connection closed (${code ?? "no code"}); retrying in ${Math.round(delay / 1000)}s`);
+    this.retryTimer = setTimeout(() => void this.connect().catch((err: Error) => this.log(`whatsapp: reconnect failed: ${err.message}`)), delay);
+  }
+
+  private async openSocket(): Promise<WASocket> {
+    if (this.state === "open" && this.sock) return this.sock;
+    if (this.state === "logged_out" || this.stopped) throw new Error(`WhatsApp is ${this.state === "logged_out" ? "logged out" : "stopped"}`);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("WhatsApp is not connected")), OPEN_WAIT_MS);
+      this.openWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    return this.sock!;
+  }
+
+  private async receive(sock: WASocket, m: WAMessage): Promise<void> {
+    const key = m.key;
+    if (!key?.id || key.fromMe || !isDirectChat(key.remoteJid)) return;
+    const content = normalizeMessageContent(m.message);
+    let text = messageText(content);
+    const media = mediaInfo(content);
+    if (!text && !media) return; // reactions, receipts, protocol messages
+
+    const chat = key.remoteJid;
+    // Chats addressed by LID (WhatsApp's privacy id) carry the phone number alongside, or in the LID map.
+    const from =
+      phoneFromJid(chat) ??
+      phoneFromJid(key.remoteJidAlt) ??
+      phoneFromJid(await sock.signalRepository.lidMapping.getPNForLID(chat).catch(() => null));
+    if (!from) {
+      this.log(`whatsapp: ignored a message from ${chat}: no phone number for this sender`);
+      return;
+    }
+
+    const attachments: NonNullable<InboundMessage["attachments"]> = [];
+    if (media) {
+      const cap = this.opts.maxMediaBytes ?? WHATSAPP_MEDIA_MAX_BYTES;
+      try {
+        if (media.size !== undefined && media.size > cap) throw new Error("too large");
+        const bytes = await downloadMediaMessage(m, "buffer", {}, { logger: baileysLogger(this.log), reuploadRequest: sock.updateMediaMessage });
+        if (bytes.length > cap) throw new Error("too large");
+        mkdirSync(this.opts.mediaDir, { recursive: true, mode: 0o700 });
+        // The same naming as the Inkbox hydrator: open_attachment only opens 64-hex names it could have written.
+        const hash = createHash("sha256").update(`whatsapp\n${chat}\n${key.id}`).digest("hex");
+        const file = path.join(this.opts.mediaDir, `${hash}${extensionFor(media.mimeType, media.name)}`);
+        writeFileSync(file, bytes, { mode: 0o600 });
+        attachments.push({ path: file, ...(media.mimeType ? { mimeType: media.mimeType } : {}), ...(media.name ? { name: media.name } : {}) });
+        if (media.voiceNote && !text) text = "[voice note]";
+      } catch (err) {
+        text += `${text ? "\n" : ""}[A ${media.voiceNote ? "voice note" : media.kind} could not be downloaded: ${(err as Error).message}]`;
+      }
+    }
+
+    const sentAt = Number(m.messageTimestamp ?? 0);
+    const msg: InboundMessage = {
+      id: `whatsapp:${key.id}`,
+      channel: "whatsapp",
+      conversationKey: conversationKeyFor(chat),
+      from,
+      text: text || "[attachment]",
+      ...(attachments.length ? { attachments } : {}),
+      replyRef: { chatJid: chat, messageId: key.id },
+      receivedAt: (sentAt > 0 ? new Date(sentAt * 1000) : new Date()).toISOString(),
+      source: "whatsapp",
+      meta: { isGroup: false, participants: [from], conversationScopeKnown: true, ...(m.pushName ? { pushName: m.pushName } : {}) },
+    };
+    await this.opts.onInbound(msg);
+    await sock.readMessages([key]).catch(() => undefined);
+  }
+}
+
+/** Baileys logs a great deal at info; keep warnings and errors, prefixed, and drop the rest. */
+function baileysLogger(log: (m: string) => void) {
+  const emit = (level: string) => (obj: unknown, msg?: string) => {
+    const text = msg ?? (typeof obj === "string" ? obj : (obj as { msg?: string; err?: { message?: string } })?.msg ?? (obj as { err?: { message?: string } })?.err?.message);
+    if (text) log(`whatsapp ${level}: ${text}`);
+  };
+  const quiet = () => {};
+  const logger = { level: "warn", child: () => logger, trace: quiet, debug: quiet, info: quiet, warn: emit("warn"), error: emit("error") };
+  return logger;
+}

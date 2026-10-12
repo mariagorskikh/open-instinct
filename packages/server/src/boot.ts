@@ -29,8 +29,9 @@ import {
   resolveModel,
 } from "@open-instinct/core";
 import type { InboundMessage, InstinctConfig, Outbox, Principal, RegisteredTool } from "@open-instinct/core";
-import { CALL_ORIGINATIONS, InkboxA2A, InkboxChannel, InkboxInboundHydrator, InkboxProvisioner, handleCallEnded, messagingTools, sendFileTool, voiceInstructions } from "@open-instinct/inkbox";
+import { CALL_ORIGINATIONS, DurableInbox, InkboxA2A, InkboxChannel, InkboxInboundHydrator, InkboxProvisioner, handleCallEnded, messagingTools, sendFileTool, voiceInstructions } from "@open-instinct/inkbox";
 import type { CallEndedEvent, CallOrigination } from "@open-instinct/inkbox";
+import { WhatsAppChannel } from "@open-instinct/whatsapp";
 import { computerGuidance, detectComputer } from "@open-instinct/computer";
 import type { ComputerBackend } from "@open-instinct/computer";
 import { ComposioApps, DEFAULT_TOOLKITS, OPENAI_COMPLETIONS_TOOL_LIMIT, appsGuidance, appsTools, composioModeFor } from "@open-instinct/apps";
@@ -48,6 +49,7 @@ import { createSkillCatalog, formatSkillsIndex, loadSkillTool, ownerSkillsDir, r
 
 /** How often the skill folders are re-read; an owner-installed skill shows up within this. */
 const SKILLS_REFRESH_MS = 30_000;
+import { ChannelRouter, whatsappEnabled } from "./whatsapp.js";
 
 export interface BootOptions {
   streamFn?: StreamFn;
@@ -156,6 +158,20 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     chatBuffer = console_.chat;
     log("Inkbox not configured: replies go to the console outbox");
   }
+
+  // WhatsApp: the agent's own account as a linked device. Replies on the whatsapp channel go
+  // through it; everything else keeps the transport above. It starts once the runtime exists.
+  let whatsappInbox: DurableInbox<InboundMessage> | undefined;
+  const whatsapp = whatsappEnabled(env)
+    ? new WhatsAppChannel({
+        authDir: state.path("secrets", "whatsapp"),
+        mediaDir: state.path("workspace", "inbound"),
+        ...(env.WHATSAPP_PHONE?.trim() ? { phone: env.WHATSAPP_PHONE.trim() } : {}),
+        onInbound: (message) => void whatsappInbox?.enqueue(message.id, message),
+        logger: log,
+      })
+    : undefined;
+  if (whatsapp) outbox = new ChannelRouter(outbox, { whatsapp });
 
   const registry = new ToolRegistry();
   const promptSections: string[] = [];
@@ -430,6 +446,18 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
 
   const stopScheduler = scheduler.start((entry) => runtime.runScheduled(entry));
 
+  if (whatsapp) {
+    // Persisted before handling, like Inkbox webhooks, so a restart mid-reply does not lose a message.
+    whatsappInbox = new DurableInbox<InboundMessage>({
+      file: state.path("whatsapp-inbox.json"),
+      handle: async (message) => {
+        await runtime.handleInbound(message, { waitForCompletion: true });
+      },
+      onError: (id, status) => log(`WhatsApp message ${id}: ${status}`),
+    });
+    await safely(log, "whatsapp", () => whatsapp.start());
+  }
+
   let sync: ScheduleSync | undefined;
   if (env.MARITIME_BACKEND_URL && env.MARITIME_INTERNAL_TOKEN && env.MARITIME_AGENT_ID) {
     sync = createScheduleSync({
@@ -470,6 +498,10 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     ...(channel ? { onCallEnded: callReporter(channel, (text, key) => runtime.relayToOwner(text, key), log) } : {}),
     async close() {
       stopScheduler();
+      await safely(log, "whatsapp close", async () => {
+        await whatsapp?.stop();
+        await whatsappInbox?.close();
+      });
       sync?.stop();
       await safely(log, "computer close", () => computer?.close());
       await safely(log, "apps close", () => apps?.close());

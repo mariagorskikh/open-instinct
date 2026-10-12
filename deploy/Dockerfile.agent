@@ -34,6 +34,7 @@ COPY packages/payments/package.json packages/payments/
 COPY packages/ample/package.json packages/ample/
 COPY packages/atomicmail/package.json packages/atomicmail/
 COPY packages/server/package.json packages/server/
+COPY packages/whatsapp/package.json packages/whatsapp/
 COPY packages/gateway/package.json packages/gateway/
 COPY packages/cli/package.json packages/cli/
 RUN pnpm install --frozen-lockfile
