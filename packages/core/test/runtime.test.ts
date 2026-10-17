@@ -1589,6 +1589,15 @@ describe("restoreMessages", () => {
       expect(unmatchedResults(restored)).toEqual([]);
       expect(restored.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
     });
+
+    it("does not let a dropped orphan result answer a later call with the same id", () => {
+      // Results are pruned before calls are judged, or the orphan "answers" the trailing call
+      // and a tool_use with no tool_result reaches the API.
+      const call: AgentMessage = { ...assistant(3), content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }], stopReason: "toolUse" } as AgentMessage;
+      const summary = { ...user(0), content: [{ type: "text", text: "[Conversation summary] earlier" }] } as AgentMessage;
+      expect(restoreMessages([summary, result("t1"), user(2), call], new Date()).map((m) => m.role)).toEqual(["user", "user"]);
+      expect(restoreMessages([user(1), result("t1"), call], new Date()).map((m) => m.role)).toEqual(["user"]);
+    });
   });
 
   it("drops an assistant tool call that never got its result", () => {
