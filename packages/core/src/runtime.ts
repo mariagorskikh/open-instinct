@@ -1260,7 +1260,7 @@ export function writeSession(file: string, messages: AgentMessage[]): void {
  * summary message. Idempotent on an already folded transcript.
  */
 export function restoreMessages(stored: AgentMessage[], now: Date, keep = SESSION_KEEP_MESSAGES, maxChars = SESSION_KEEP_CHARS, keepImages = KEEP_RECENT_IMAGES): AgentMessage[] {
-  const messages = dropOldImages(dropOrphanToolCalls(stored.filter((m) => m.role !== "system")), keepImages);
+  const messages = dropOldImages(dropOrphanToolResults(dropOrphanToolCalls(stored.filter((m) => m.role !== "system"))), keepImages);
   let start = messages.length <= keep ? 0 : nextUserTurn(messages, messages.length - keep);
   // Large tool results can blow the context long before the message count does. The slice
   // only ever moves to a user or assistant turn; when none is left it stays where it is,
@@ -1337,6 +1337,22 @@ function charSize(messages: AgentMessage[]): number {
     }
   }
   return total;
+}
+
+/**
+ * Drop tool results whose call is not earlier in the transcript. A session saved by a fold
+ * that cut inside a turn (before the fold learned to land only on a turn) starts like that,
+ * and every later run of that conversation is rejected until it is repaired.
+ */
+function dropOrphanToolResults(messages: AgentMessage[]): AgentMessage[] {
+  const calls = new Set<string>();
+  const out: AgentMessage[] = [];
+  for (const m of messages) {
+    if (m.role === "assistant") for (const c of m.content) if (c.type === "toolCall") calls.add(c.id);
+    if (m.role === "toolResult" && !calls.has(m.toolCallId)) continue;
+    out.push(m);
+  }
+  return out;
 }
 
 function dropOrphanToolCalls(messages: AgentMessage[]): AgentMessage[] {

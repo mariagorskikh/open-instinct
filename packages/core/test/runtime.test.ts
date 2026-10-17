@@ -1568,6 +1568,29 @@ describe("restoreMessages", () => {
     expect(JSON.stringify(restored.at(-1)!.content)).toContain("answer 44");
   });
 
+  describe("a transcript saved by an older fold", () => {
+    // One owner turn read two big images; an older fold cut inside it and kept only the results.
+    const result = (id: string): AgentMessage => ({ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "x".repeat(5000) }], isError: false, timestamp: 2 }) as AgentMessage;
+
+    function unmatchedResults(messages: AgentMessage[]): string[] {
+      const calls = new Set<string>();
+      const out: string[] = [];
+      for (const m of messages) {
+        if (m.role === "assistant") for (const c of m.content) if (c.type === "toolCall") calls.add(c.id);
+        if (m.role === "toolResult" && !calls.has(m.toolCallId)) out.push(m.toolCallId);
+      }
+      return out;
+    }
+
+    it("heals a transcript that an earlier trim already broke", () => {
+      // What the bug left on disk: a summary, then results whose call was folded away.
+      const broken = [{ ...user(0), content: [{ type: "text", text: "[Conversation summary] earlier" }] } as AgentMessage, result("t1"), result("t2"), assistant(3), user(4), assistant(4)];
+      const restored = restoreMessages(broken, new Date());
+      expect(unmatchedResults(restored)).toEqual([]);
+      expect(restored.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    });
+  });
+
   it("drops an assistant tool call that never got its result", () => {
     const orphan: AgentMessage = { ...assistant(9), content: [{ type: "toolCall", id: "t1", name: "echo", arguments: {} }] } as AgentMessage;
     const restored = restoreMessages([user(1), assistant(1), user(2), orphan], new Date());
