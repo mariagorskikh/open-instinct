@@ -16,6 +16,8 @@ export interface UserRecord {
   webhookSubscriptionId?: string;
   maritimeAgentId?: string;
   maritimeProjectId?: string;
+  /** Deploy template applied at provision time (registry id). Absent on pre-template records. */
+  templateId?: string;
   createdAt: string;
   updatedAt?: string;
   status: "provisioning" | "ready" | "error";
@@ -122,6 +124,7 @@ export function publicUser(u: UserRecord): Record<string, unknown> {
     status: u.status,
     hasError: u.status === "error",
     hasAgent: Boolean(u.maritimeAgentId),
+    templateId: u.templateId ?? "default",
     createdAt: u.createdAt,
     updatedAt: u.updatedAt,
   };

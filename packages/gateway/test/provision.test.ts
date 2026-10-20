@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { InkboxProvisioner } from "@open-instinct/inkbox";
 import { DEFAULT_MARITIME_LLM_MODEL, MARITIME_AGENT_PORT, agentEnvFor, linkRedirectUriFor, maritimeCreateBody, provisionUser, webhookUrlFor } from "../src/provision.js";
 import { UserStore } from "../src/store.js";
+import { loadTemplateRegistry } from "../src/templates.js";
 import { fakeInkbox, fakeMaritime, readyUser, tempDir } from "./helpers.js";
 
 const input = { name: "Maria", phone: "+14155550123", email: "maria@example.com", handle: "maria" };
+const shipped = loadTemplateRegistry();
 
 function deps(ink = fakeInkbox(), mar = fakeMaritime(), store = new UserStore(tempDir())) {
   return {
@@ -234,5 +236,63 @@ describe("provisionUser", () => {
     d.mar.queue.push({ body: [] }, 402);
     await expect(provisionUser(input, d.deps)).rejects.toThrow("Maritime 402: status 402");
     expect(d.store.byHandle("maria")?.status).toBe("error");
+  });
+});
+
+describe("templates in provisioning", () => {
+  it("applies a template's persona, instructions, model, env and desktop-less sizing", () => {
+    const body = maritimeCreateBody(readyUser(), {
+      maritime: { apiKey: "k", agentImage: "img", useMaritimeLlm: true, maritimeModel: "gpt-9.9" },
+      template: shipped.resolve("gtm-ai"),
+    });
+    expect(body["desktop"]).toBe(false);
+    expect(body["memMb"]).toBe(4096);
+    expect(body["vcpus"]).toBe(2);
+    const byKey = Object.fromEntries((body["initialEnvVars"] as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
+    expect(byKey["TEMPLATE_ID"]).toBe("gtm-ai");
+    expect(byKey["INSTINCT_PERSONA"]).toContain("# Role — AI-native GTM Operator");
+    expect(byKey["INSTINCT_INSTRUCTIONS"]).toContain("explicit approval");
+    // The template's model wins over the fleet maritime-llm model.
+    expect(byKey["INSTINCT_MODEL"]).toBe("openai-compatible/gpt-5.4");
+    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar");
+  });
+
+  it("default template provisions desktop-less with TEMPLATE_ID but no persona", async () => {
+    const d = deps();
+    const user = await provisionUser(input, { ...d.deps, template: shipped.resolve("default") });
+    expect(user.status).toBe("ready");
+    expect(d.mar.calls.map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual(["GET /api/agents", "POST /api/agents"]);
+    const body = d.mar.calls[1]?.body as Record<string, unknown>;
+    expect(body["desktop"]).toBe(false);
+    expect(body["memMb"]).toBe(4096);
+    expect(body["vcpus"]).toBe(1);
+    const byKey = Object.fromEntries((body["initialEnvVars"] as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
+    expect(byKey["TEMPLATE_ID"]).toBe("default");
+    expect(byKey["INSTINCT_PERSONA"]).toBeUndefined();
+  });
+
+  it("pushes template skills into /data/skills after the agent exists", async () => {
+    const d = deps();
+    await provisionUser(input, { ...d.deps, template: shipped.resolve("gtm-ai") });
+    const write = d.mar.calls.find((c) => c.method === "PUT" && c.url.includes("/files/write"));
+    expect(write).toBeDefined();
+    expect(new URL(write!.url).pathname).toBe(`/api/agents/${d.store.byHandle("maria")?.maritimeAgentId}/files/write`);
+    expect(write!.body).toMatchObject({ path: "/data/skills/gtm-playbook/SKILL.md" });
+    expect(String((write!.body as { content: string }).content)).toContain("Pain-Qualified");
+  });
+
+  it("a skills push failure never fails provisioning", async () => {
+    const mar = fakeMaritime();
+    const inner = mar.fetch;
+    mar.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "PUT" && String(input).includes("/files/write")) {
+        return new Response(JSON.stringify({ detail: "vm still deploying" }), { status: 503 });
+      }
+      return inner(input, init);
+    }) as typeof fetch;
+    const d = deps(fakeInkbox(), mar);
+    const user = await provisionUser(input, { ...d.deps, template: shipped.resolve("gtm-ai") });
+    expect(user.status).toBe("ready");
+    expect(d.store.get(user.id)?.status).toBe("ready");
   });
 });

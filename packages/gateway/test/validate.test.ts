@@ -5,7 +5,22 @@ describe("validateSignup", () => {
   it("normalizes and accepts a good signup", () => {
     const r = validateSignup({ name: " Maria ", phone: "(415) 555-0123", email: "Maria@Example.com", handle: "@Maria-1" });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.value).toEqual({ name: "Maria", phone: "+14155550123", email: "maria@example.com", handle: "maria-1" });
+    if (r.ok) expect(r.value).toEqual({ name: "Maria", phone: "+14155550123", email: "maria@example.com", handle: "maria-1", templateId: "default" });
+  });
+
+  it("accepts a known template id and rejects unknown or malformed ones", () => {
+    const known = ["default", "gtm-ai"];
+    const ok = validateSignup({ name: "S", phone: "+14155550123", handle: "sam", templateId: "gtm-ai" }, { knownTemplates: known });
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(ok.value.templateId).toBe("gtm-ai");
+
+    const unknown = validateSignup({ name: "S", phone: "+14155550123", handle: "sam", templateId: "nope" }, { knownTemplates: known });
+    expect(unknown.ok).toBe(false);
+    if (!unknown.ok) expect(unknown.errors["templateId"]).toMatch(/not available/);
+
+    const traversal = validateSignup({ name: "S", phone: "+14155550123", handle: "sam", template_id: "../etc/passwd" }, { knownTemplates: known });
+    expect(traversal.ok).toBe(false);
+    if (!traversal.ok) expect(traversal.errors["templateId"]).toMatch(/short lowercase/);
   });
 
   it("rejects bad phones, handles and emails with field errors", () => {

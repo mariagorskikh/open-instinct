@@ -34,6 +34,8 @@ export interface GatewayEnv {
   useMaritimeLlm: boolean;
   maritimeModel?: string;
   link?: LinkPassthrough;
+  /** Directory holding registry/, personas/ and skills/. Default: the templates shipped with the package. */
+  templatesDir?: string;
 }
 
 function truthy(v: string | undefined): boolean {
@@ -78,6 +80,7 @@ export function readEnv(env: NodeJS.ProcessEnv): GatewayEnv {
     useMaritimeLlm: truthy(env["INSTINCT_USE_MARITIME_LLM"]),
     maritimeModel: env["INSTINCT_MARITIME_MODEL"] || undefined,
     link,
+    templatesDir: env["GATEWAY_TEMPLATES_DIR"] || undefined,
   };
 }
 
@@ -149,6 +152,7 @@ export function startGateway(cfg: GatewayEnv): GatewayServer {
     composioToolkits: cfg.composioToolkits,
     link: cfg.link,
     trustProxy: cfg.trustProxy,
+    templateDir: cfg.templatesDir,
     logger: log,
     // The triage endpoint called with an identity-scoped key answers for that identity, so its QR fits the user.
     routerInfoFor: (user) => new InkboxProvisioner({ adminApiKey: user.identityApiKey, baseUrl: cfg.inkboxBaseUrl }).routerInfo(),

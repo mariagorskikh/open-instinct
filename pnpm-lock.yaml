@@ -212,6 +212,9 @@ importers:
       maritime-sdk:
         specifier: ^0.9.0
         version: 0.9.0
+      yaml:
+        specifier: ^2.8.0
+        version: 2.9.0
     devDependencies:
       '@types/node':
         specifier: ^22.15.0

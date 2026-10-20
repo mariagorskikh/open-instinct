@@ -1,0 +1,12 @@
+api_version: instinct/v1
+template:
+  name: default
+  title: Personal Instinct
+  version: 1.0.0
+  description: General-purpose personal agent reached over iMessage.
+hardware:
+  cpu: 1
+  ram_gb: 4
+  desktop: false
+skills: []
+env: {}

@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { isReservedHandle } from "@open-instinct/core";
+import { DEFAULT_TEMPLATE_ID, TEMPLATE_ID_RE } from "./templates.js";
 
 export const HANDLE_RE = /^[a-z0-9-]{3,40}$/;
 export const E164_RE = /^\+[1-9]\d{6,14}$/;
@@ -9,6 +10,7 @@ export interface SignupValue {
   phone: string;
   email?: string;
   handle: string;
+  templateId: string;
 }
 
 export type SignupValidation =
@@ -44,13 +46,14 @@ function str(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
-export function validateSignup(input: Record<string, unknown>, opts: { signupSecret?: string } = {}): SignupValidation {
+export function validateSignup(input: Record<string, unknown>, opts: { signupSecret?: string; knownTemplates?: string[] } = {}): SignupValidation {
   const errors: Record<string, string> = {};
   const name = str(input["name"]);
   const phone = normalizePhone(str(input["phone"]));
   const emailRaw = str(input["email"]).toLowerCase();
   const handle = normalizeHandle(str(input["handle"]));
   const inviteCode = str(input["inviteCode"] ?? input["invite_code"] ?? input["invite"]);
+  const templateId = str(input["templateId"] ?? input["template_id"]) || DEFAULT_TEMPLATE_ID;
 
   if (name.length < 1 || name.length > 80) errors["name"] = "Name is required (1 to 80 characters).";
   if (!E164_RE.test(phone)) errors["phone"] = "Phone must be a full number with country code, like +14155550123.";
@@ -59,9 +62,11 @@ export function validateSignup(input: Record<string, unknown>, opts: { signupSec
   // `owner` names the person behind every agent; core refuses it as a contact handle too.
   else if (isReservedHandle(handle)) errors["handle"] = `"${handle}" is reserved. Pick another handle.`;
   if (opts.signupSecret && !secretMatches(inviteCode, opts.signupSecret)) errors["inviteCode"] = "Invite code is not valid.";
+  if (!TEMPLATE_ID_RE.test(templateId)) errors["templateId"] = "Template must be a short lowercase id.";
+  else if (opts.knownTemplates && !opts.knownTemplates.includes(templateId)) errors["templateId"] = "That template is not available on this gateway.";
 
   if (Object.keys(errors).length > 0) return { ok: false, errors };
-  const value: SignupValue = { name, phone, handle };
+  const value: SignupValue = { name, phone, handle, templateId };
   if (emailRaw) value.email = emailRaw;
   return { ok: true, value };
 }

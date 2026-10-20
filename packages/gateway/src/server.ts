@@ -8,6 +8,7 @@ import { GITHUB_URL, type RouterInfo, connectRouterFor, renderConnect, renderLan
 import { type LinkPassthrough, type MaritimeProvisionOptions, newUserId, provisionUser } from "./provision.js";
 import { EventDeduper, type HeaderMap, relayVerifiedEvent, relayGatewayEvent, verifyForUser } from "./relay.js";
 import { type UserRecord, type UserStore, publicUser } from "./store.js";
+import { loadTemplateRegistry } from "./templates.js";
 import { validateSignup } from "./validate.js";
 
 export interface GatewayOptions {
@@ -35,6 +36,8 @@ export interface GatewayOptions {
   signupLimits?: Partial<SignupLimits>;
   /** Count signups by X-Forwarded-For instead of the socket address. Only behind a proxy you control. */
   trustProxy?: boolean;
+  /** Directory holding registry/, personas/ and skills/. Default: the templates shipped with the package. */
+  templateDir?: string;
   /**
    * Router info scoped to one user (an identity-key call to Inkbox's triage
    * endpoint). Its QR is shown only when it names the user's handle. Without
@@ -139,6 +142,7 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
   const maxBody = opts.maxBodyBytes ?? 1024 * 1024;
   const limits = signupLimits(opts.signupLimits);
   const ipLimiter = new SlidingWindowLimiter(limits.perIp, limits.windowMs, now);
+  const templates = loadTemplateRegistry(opts.templateDir);
   let routerCache: { at: number; value: RouterInfo } | undefined;
   const perUserRouter = new Map<string, { at: number; value: RouterInfo }>();
   const inFlight = new Set<string>();
@@ -207,6 +211,7 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       composioApiKey: opts.composioApiKey,
       composioToolkits: opts.composioToolkits,
       link: opts.link,
+      template: templates.get(user.templateId),
       fetchImpl: opts.fetchImpl,
       logger: log,
       userId: user.id,
@@ -263,7 +268,7 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       return html(res, 503, renderMessage("Signups are closed", "This gateway only relays messages.", "error"));
     }
     const body = parseBody(await readBody(req, 64 * 1024), req.headers["content-type"]);
-    const check = validateSignup(body, { signupSecret: opts.signupSecret });
+    const check = validateSignup(body, { signupSecret: opts.signupSecret, knownTemplates: templates.ids() });
     if (!check.ok) {
       if (asJson) return json(res, 400, { error: "invalid signup", errors: check.errors });
       const values = Object.fromEntries(Object.entries(body).filter(([k, v]) => k !== "inviteCode" && typeof v === "string")) as Record<string, string>;
@@ -313,16 +318,25 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       phone: value.phone,
       ...(value.email ? { email: value.email } : {}),
       handle: value.handle,
+      templateId: value.templateId,
       identityId: "",
       identityApiKey: "",
       signingKey: "",
       createdAt: new Date(now()).toISOString(),
       status: "provisioning",
     });
-    log.info("signup.created", { userId: user.id, handle: user.handle });
+    log.info("signup.created", { userId: user.id, handle: user.handle, templateId: user.templateId });
     startProvisioning(user);
 
-    if (asJson) return json(res, 202, { userId: user.id, connectUrl: connectUrl(user.id), status: user.status });
+    if (asJson) {
+      return json(res, 202, {
+        userId: user.id,
+        connectUrl: connectUrl(user.id),
+        status: user.status,
+        templateId: user.templateId,
+        templateName: templates.get(user.templateId)?.title ?? null,
+      });
+    }
     res.writeHead(303, { Location: `/connect/${encodeURIComponent(user.id)}` });
     res.end();
   }
@@ -390,7 +404,14 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       return html(res, 200, renderLanding({ signupEnabled: Boolean(opts.inkbox), requireInvite: Boolean(opts.signupSecret) }));
     }
     if (parts[0] === "health" && parts.length === 1) {
-      return json(res, 200, { ok: true, users: opts.store.all().length, signup: Boolean(opts.inkbox), github: GITHUB_URL, inbox: inbox.summary() });
+      return json(res, 200, {
+        ok: true,
+        users: opts.store.all().length,
+        signup: Boolean(opts.inkbox),
+        github: GITHUB_URL,
+        inbox: inbox.summary(),
+        templates: templates.ids(),
+      });
     }
     if (parts[0] === "api" && parts[1] === "signup" && parts.length === 2) {
       if (method !== "POST") throw new HttpError(405, "method not allowed");
