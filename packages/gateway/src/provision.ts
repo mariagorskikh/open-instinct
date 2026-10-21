@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { InkboxProvisioner } from "@open-instinct/inkbox";
+import { type BrainPushResult, pushBrain } from "./brain.js";
+import { EXECUTOR_TOOLKIT_NAME, type ComposioPlatform } from "./composio.js";
 import { type Logger, silentLogger } from "./logger.js";
 import { type UserRecord, type UserStore } from "./store.js";
 import type { GatewayTemplate } from "./templates.js";
@@ -23,6 +25,10 @@ export interface ProvisionInput {
   phone: string;
   email?: string;
   handle: string;
+  /** Company brain from signup: canonical owner/repo (already normalized by validate). */
+  brainRepo?: string;
+  /** Private-repo token from signup (already normalized by validate). */
+  brainToken?: string;
 }
 
 export interface MaritimeProvisionOptions {
@@ -37,6 +43,12 @@ export interface MaritimeProvisionOptions {
   useMaritimeLlm?: boolean;
   /** Model id behind `openai-compatible/`. Default DEFAULT_MARITIME_LLM_MODEL. */
   maritimeModel?: string;
+  /**
+   * A narrow `scopes:["computers"]` API key handed to agents as their own
+   * MARITIME_API_KEY, so the fleet key never reaches an agent. Absent means
+   * agents run without a hosted computer (the in-VM desktop still works).
+   */
+  computersKey?: string;
   /** Give each VM a Linux desktop (4 GiB, 2 vCPU). Default true when no template sets hardware. Templates control their own `hardware.desktop`. */
   desktop?: boolean;
 }
@@ -59,6 +71,10 @@ export interface ProvisionDeps {
   composioApiKey?: string;
   /** Comma-separated Composio toolkit slugs. Only sent with composioApiKey. Default DEFAULT_COMPOSIO_TOOLKITS. */
   composioToolkits?: string;
+  /** Built executor toolkit client. Its presence marks the executor as configured (per-user connected accounts, toolkit filtering). */
+  composio?: ComposioPlatform;
+  /** Fleet-wide GitHub token: fallback for brain pushes when the person supplied none. */
+  githubToken?: string;
   link?: LinkPassthrough;
   /** Deploy template from the registry. Persona/instructions ride as env seeds; skills are pushed to /data/skills. */
   template?: GatewayTemplate;
@@ -69,9 +85,24 @@ export interface ProvisionDeps {
 }
 
 /** What agentEnvFor and maritimeCreateBody need from the deps. */
-export type AgentEnvDeps = Pick<ProvisionDeps, "anthropicApiKey" | "composioApiKey" | "composioToolkits" | "maritime" | "link" | "inkboxBaseUrl" | "template"> & {
+export type AgentEnvDeps = Pick<ProvisionDeps, "anthropicApiKey" | "composioApiKey" | "composioToolkits" | "composio" | "maritime" | "link" | "inkboxBaseUrl" | "template"> & {
   publicUrl?: string;
 };
+
+/**
+ * The effective Composio toolkit list for one provision: the template's list
+ * wins over the fleet default (the same rule applyTemplateEnv applies later).
+ */
+export function effectiveToolkits(deps: Pick<AgentEnvDeps, "composioToolkits" | "template">): string {
+  return (deps.template?.env["COMPOSIO_TOOLKITS"] ?? deps.composioToolkits ?? "").trim() || DEFAULT_COMPOSIO_TOOLKITS;
+}
+
+/** True when the effective toolkit list asks for the executor (and therefore needs a connected account). */
+export function executorRequested(deps: Pick<AgentEnvDeps, "composioToolkits" | "template">): boolean {
+  return effectiveToolkits(deps)
+    .split(",")
+    .some((slug) => slug.trim().toLowerCase() === EXECUTOR_TOOLKIT_NAME);
+}
 
 export interface EnvVarInput {
   key: string;
@@ -160,11 +191,28 @@ export function agentEnvFor(user: UserRecord, deps: AgentEnvDeps): EnvVarInput[]
     if (deps.publicUrl) env.push({ key: "LINK_REDIRECT_URI", value: linkRedirectUriFor(deps.publicUrl, user.id), isSecret: false });
   }
   env.push({ key: "INSTINCT_COMPUTER", value: "auto", isSecret: false });
+  // Fleet isolation: a narrow computers-scoped key, never the fleet key.
+  if (deps.maritime.computersKey) upsertEnv(env, "MARITIME_API_KEY", deps.maritime.computersKey);
   for (const [key, value] of Object.entries(deps.maritime.extraEnv ?? {})) {
     if (env.some((e) => e.key === key)) continue;
     env.push({ key, value, isSecret: SECRET_KEY_RE.test(key) });
   }
   if (deps.template) applyTemplateEnv(env, deps.template);
+  // The executor toolkit needs a per-user connected account the gateway manages;
+  // without a configured composio platform, drop it so the agent never sees a
+  // toolkit it cannot authenticate (and router-mode search would dead-end on).
+  if (!deps.composio) {
+    const entry = env.find((e) => e.key === "COMPOSIO_TOOLKITS");
+    const hasExecutor = entry?.value.split(",").some((s) => s.trim().toLowerCase() === EXECUTOR_TOOLKIT_NAME) ?? false;
+    if (entry && hasExecutor) {
+      entry.value =
+        entry.value
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s && s.toLowerCase() !== EXECUTOR_TOOLKIT_NAME)
+          .join(",") || DEFAULT_COMPOSIO_TOOLKITS;
+    }
+  }
   return env;
 }
 
@@ -202,7 +250,7 @@ interface MaritimeAgentJson {
   externalId?: string | null;
 }
 
-async function maritimeRequest(
+export async function maritimeRequest(
   deps: Pick<ProvisionDeps, "maritime" | "fetchImpl">,
   method: string,
   path: string,
@@ -309,6 +357,8 @@ function blankRecord(input: ProvisionInput, id: string): UserRecord {
     status: "provisioning",
   };
   if (input.email) rec.email = input.email;
+  if (input.brainRepo) rec.brainRepo = input.brainRepo;
+  if (input.brainToken) rec.brainToken = input.brainToken;
   return rec;
 }
 
@@ -366,6 +416,47 @@ export async function provisionUser(input: ProvisionInput, deps: ProvisionDeps):
     }
     if (deps.template?.skills.length) {
       await pushTemplateSkills(user, deps.template, deps, log);
+    }
+    // Executor: one connected account per person, keyed by the Composio session
+    // user_id (= the handle the agent signs its sessions with). Reused while it
+    // is still active; a stale id is replaced. A Composio hiccup never fails
+    // provisioning — the gateway logs it and the next retry heals it.
+    if (deps.composio && executorRequested(deps)) {
+      try {
+        let accountId = user.composioAccountId;
+        if (accountId && !(await deps.composio.accountActive(accountId))) accountId = undefined;
+        if (!accountId) accountId = await deps.composio.ensureAccount(user.handle);
+        if (accountId !== user.composioAccountId) user = store.save({ ...user, composioAccountId: accountId });
+        log.info("provision.composio_account", { userId: user.id, accountId });
+      } catch (err) {
+        log.warn("provision.composio_account_failed", {
+          userId: user.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // Company brain: push the person's repo into /data/brain so first boot has
+    // their context on disk. Best effort — a bad token or a private repo must
+    // not fail provisioning; the connect page can retry.
+    const agentId = user.maritimeAgentId;
+    if (user.brainRepo && agentId) {
+      try {
+        const pushed: BrainPushResult = await pushBrain(user.brainRepo, user.brainToken, {
+          fetchImpl: deps.fetchImpl,
+          githubToken: deps.githubToken,
+          logger: log,
+          write: async (path, content) => {
+            await maritimeRequest(deps, "PUT", `/api/agents/${encodeURIComponent(agentId)}/files/write`, { path, content });
+          },
+        });
+        log.info("provision.brain_pushed", { userId: user.id, repo: user.brainRepo, ...pushed });
+      } catch (err) {
+        log.warn("provision.brain_failed", {
+          userId: user.id,
+          repo: user.brainRepo,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
     user = store.save({ ...user, status: "ready", error: undefined });
     log.info("provision.ready", { userId: user.id, handle: user.handle });

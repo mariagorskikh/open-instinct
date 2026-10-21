@@ -116,6 +116,12 @@ export function renderLanding(opts: LandingOptions): string {
   ${err("inviteCode")}`
       : ""
   }
+  <label for="brainRepo">Company brain <small>optional: a GitHub repo your Instinct reads at setup (handbook, notes, code)</small></label>
+  <input id="brainRepo" name="brainRepo" placeholder="acme/handbook" autocapitalize="off" autocorrect="off" spellcheck="false" value="${v("brainRepo")}">
+  ${err("brainRepo")}
+  <label for="brainToken">GitHub token <small>only for private repos</small></label>
+  <input id="brainToken" name="brainToken" type="password" autocomplete="off" value="">
+  ${err("brainToken")}
   <button class="btn" type="submit">Create my Instinct</button>
   <p class="hint">Setup takes about a minute. You will get a number to text and a short connect command.</p>
 </form>`
@@ -223,6 +229,21 @@ ${qr ? `<p class="hint" style="text-align:center;margin-top:22px">Or scan from a
   <div style="display:flex;justify-content:space-between;align-items:center;gap:12px"><b>Status</b>${statusPill(user)}</div>
   ${statusBlock}
   ${routerBlock}
+</div>
+<div class="card">
+  <b>Company brain</b>
+  ${
+    user.brainRepo
+      ? `<p class="hint">Saved: <code>${escapeHtml(user.brainRepo)}</code>${user.brainToken ? " (private)" : ""}. Its files are pushed into your Instinct's machine.</p>`
+      : `<p class="hint">Hand your Instinct a GitHub repo (public or private) — your handbook, notes or code — and it reads the files at setup.</p>`
+  }
+  <form method="post" action="/connect/${encodeURIComponent(user.id)}">
+    <label for="brainRepo">Repo <small>owner/repo or a github.com URL; empty saves nothing</small></label>
+    <input id="brainRepo" name="brainRepo" placeholder="acme/handbook" autocapitalize="off" autocorrect="off" spellcheck="false" value="${escapeHtml(user.brainRepo ?? "")}">
+    <label for="brainToken">GitHub token <small>private repos only; leave empty to keep the saved one</small></label>
+    <input id="brainToken" name="brainToken" type="password" autocomplete="off" value="">
+    <button class="btn" type="submit">Save brain</button>
+  </form>
 </div>
 <h2>What happens next</h2>
 <ol class="steps">

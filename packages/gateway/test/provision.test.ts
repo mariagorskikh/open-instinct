@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { InkboxProvisioner } from "@open-instinct/inkbox";
-import { DEFAULT_MARITIME_LLM_MODEL, MARITIME_AGENT_PORT, agentEnvFor, linkRedirectUriFor, maritimeCreateBody, provisionUser, webhookUrlFor } from "../src/provision.js";
+import { DEFAULT_MARITIME_LLM_MODEL, MARITIME_AGENT_PORT, agentEnvFor, effectiveToolkits, executorRequested, linkRedirectUriFor, maritimeCreateBody, provisionUser, webhookUrlFor } from "../src/provision.js";
+import type { ComposioPlatform } from "../src/composio.js";
 import { UserStore } from "../src/store.js";
 import { loadTemplateRegistry } from "../src/templates.js";
 import { fakeInkbox, fakeMaritime, readyUser, tempDir } from "./helpers.js";
@@ -294,5 +295,131 @@ describe("templates in provisioning", () => {
     const user = await provisionUser(input, { ...d.deps, template: shipped.resolve("gtm-ai") });
     expect(user.status).toBe("ready");
     expect(d.store.get(user.id)?.status).toBe("ready");
+  });
+});
+
+describe("executor wiring", () => {
+  it("hands agents a narrow computers-scoped key instead of the fleet key", () => {
+    const env = agentEnvFor(readyUser(), { maritime: { apiKey: "mk_fleet", agentImage: "img", computersKey: "mk_narrow" } });
+    const entry = env.find((e) => e.key === "MARITIME_API_KEY");
+    expect(entry).toEqual({ key: "MARITIME_API_KEY", value: "mk_narrow", isSecret: true });
+    expect(env.some((e) => e.value === "mk_fleet")).toBe(false);
+
+    const without = agentEnvFor(readyUser(), { maritime: { apiKey: "mk_fleet", agentImage: "img" } });
+    expect(without.some((e) => e.key === "MARITIME_API_KEY")).toBe(false);
+  });
+
+  it("computes the effective toolkit list and detects an executor request", () => {
+    const gtm = shipped.resolve("gtm-ai");
+    expect(executorRequested({ template: gtm })).toBe(true);
+    expect(effectiveToolkits({ template: gtm })).toBe("gmail,googlecalendar,custom_executor");
+    expect(executorRequested({ template: shipped.resolve("default") })).toBe(false);
+    expect(executorRequested({ composioToolkits: "custom_executor,gmail" })).toBe(true);
+    expect(executorRequested({ composioToolkits: "gmail,googlecalendar" })).toBe(false);
+    expect(effectiveToolkits({ composioToolkits: "gmail, slack" })).toBe("gmail, slack");
+    expect(effectiveToolkits({})).toBe("gmail,googlecalendar,googlecontacts");
+  });
+
+  it("strips custom_executor from the agent env when no composio platform is configured", async () => {
+    const d = deps();
+    await provisionUser(input, { ...d.deps, template: shipped.resolve("gtm-ai") });
+    const body = d.mar.calls.find((c) => c.method === "POST" && c.url.endsWith("/api/agents"))?.body as Record<string, unknown>;
+    const byKey = Object.fromEntries((body["initialEnvVars"] as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
+    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar");
+    expect(byKey["COMPOSIO_MODE"]).toBe("router");
+  });
+
+  it("keeps custom_executor when the composio platform is present", async () => {
+    const d = deps();
+    const composio = {} as unknown as ComposioPlatform;
+    await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai") });
+    const body = d.mar.calls.find((c) => c.method === "POST" && c.url.endsWith("/api/agents"))?.body as Record<string, unknown>;
+    const byKey = Object.fromEntries((body["initialEnvVars"] as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
+    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,custom_executor");
+  });
+
+  it("connects an executor account under the handle, reuses it while active, replaces it when dead", async () => {
+    const d = deps();
+    const created: string[] = [];
+    const live = { value: true };
+    const composio = {
+      accountActive: async () => live.value,
+      ensureAccount: async (handle: string) => {
+        created.push(handle);
+        return `ca_${created.length}`;
+      },
+    } as unknown as ComposioPlatform;
+
+    const user = await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai") });
+    expect(created).toEqual(["maria"]);
+    expect(user.composioAccountId).toBe("ca_1");
+    expect(d.store.get(user.id)?.composioAccountId).toBe("ca_1");
+
+    // Stored id still active: the next run reuses it, no second account.
+    d.store.save({ ...user, status: "provisioning" });
+    const again = await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai"), userId: user.id });
+    expect(again.composioAccountId).toBe("ca_1");
+    expect(created).toEqual(["maria"]);
+
+    // Stored id went dead: a fresh one replaces it.
+    live.value = false;
+    d.store.save({ ...again, status: "provisioning" });
+    const third = await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai"), userId: user.id });
+    expect(third.composioAccountId).toBe("ca_2");
+    expect(created).toEqual(["maria", "maria"]);
+  });
+
+  it("a composio failure never fails provisioning", async () => {
+    const d = deps();
+    const composio = {
+      accountActive: async () => false,
+      ensureAccount: async () => {
+        throw new Error("composio down");
+      },
+    } as unknown as ComposioPlatform;
+    const user = await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai") });
+    expect(user.status).toBe("ready");
+    expect(user.composioAccountId).toBeUndefined();
+  });
+
+  it("pushes the person's brain repo into the agent's files", async () => {
+    const d = deps();
+    const github: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("api.github.com")) {
+        github.push(url);
+        if (/https:\/\/api\.github\.com\/repos\/[^/]+\/[^/]+$/.test(url)) return Response.json({ default_branch: "main" }, { status: 200 });
+        if (url.includes("/git/trees/")) return Response.json({ tree: [{ path: "NOTES.md", type: "blob", sha: "s1", size: 7 }] }, { status: 200 });
+        if (url.includes("/git/blobs/")) return new Response("# notes", { status: 200 });
+        return Response.json({ detail: "not found" }, { status: 404 });
+      }
+      return d.mar.fetch(input as string, init);
+    }) as typeof fetch;
+
+    const user = await provisionUser(
+      { ...input, brainRepo: "acme/handbook", brainToken: "ghp_abcdefgh123456" },
+      { ...d.deps, fetchImpl, template: shipped.resolve("gtm-ai") },
+    );
+    expect(user.status).toBe("ready");
+    expect(github.some((u) => u.endsWith("/repos/acme/handbook"))).toBe(true);
+    const writes = d.mar.calls.filter((c) => c.method === "PUT" && c.url.includes("/files/write"));
+    expect(writes.some((c) => (c.body as { path: string }).path === "/data/brain/NOTES.md")).toBe(true);
+    const skillWrite = writes.find((c) => (c.body as { path: string }).path.startsWith("/data/skills/"));
+    expect(skillWrite).toBeDefined();
+  });
+
+  it("a brain failure never fails provisioning", async () => {
+    const d = deps();
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("api.github.com")) return Response.json({ message: "Not Found" }, { status: 404 });
+      return d.mar.fetch(input as string, init);
+    }) as typeof fetch;
+    const user = await provisionUser(
+      { ...input, brainRepo: "acme/handbook" },
+      { ...d.deps, fetchImpl, template: shipped.resolve("gtm-ai") },
+    );
+    expect(user.status).toBe("ready");
   });
 });

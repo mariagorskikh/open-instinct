@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeHandle, normalizePhone, secretMatches, validateSignup } from "../src/validate.js";
+import { normalizeHandle, normalizePhone, parseBrainUpdate, secretMatches, validateSignup } from "../src/validate.js";
 
 describe("validateSignup", () => {
   it("normalizes and accepts a good signup", () => {
@@ -61,5 +61,65 @@ describe("validateSignup", () => {
   it("treats non-string fields as empty", () => {
     const r = validateSignup({ name: 42, phone: null, handle: ["x"] });
     expect(r.ok).toBe(false);
+  });
+});
+
+describe("signup brain fields", () => {
+  it("normalizes a repo URL and trims the token", () => {
+    const r = validateSignup({
+      name: "S",
+      phone: "+14155550123",
+      handle: "sam",
+      brainRepo: " https://github.com/acme/handbook/tree/main/docs ",
+      brainToken: " ghp_abcdefgh123456 ",
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value).toMatchObject({ brainRepo: "acme/handbook", brainToken: "ghp_abcdefgh123456" });
+  });
+
+  it("reports brain problems as field errors", () => {
+    const badRepo = validateSignup({ name: "S", phone: "+14155550123", handle: "sam", brainRepo: "just-a-name" });
+    expect(badRepo.ok).toBe(false);
+    if (!badRepo.ok) expect(badRepo.errors["brainRepo"]).toMatch(/owner\/repo/);
+
+    const badToken = validateSignup({ name: "S", phone: "+14155550123", handle: "sam", brainRepo: "acme/handbook", brainToken: "short" });
+    expect(badToken.ok).toBe(false);
+    if (!badToken.ok) expect(badToken.errors["brainToken"]).toBeDefined();
+  });
+
+  it("leaves the brain off when the fields are blank", () => {
+    const r = validateSignup({ name: "S", phone: "+14155550123", handle: "sam", brainRepo: "", brainToken: "" });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.brainRepo).toBeUndefined();
+      expect(r.value.brainToken).toBeUndefined();
+    }
+  });
+});
+
+describe("parseBrainUpdate", () => {
+  it("reads an empty repo as a clear", () => {
+    expect(parseBrainUpdate({ brainRepo: "" })).toEqual({ ok: true, value: { repo: "" } });
+    expect(parseBrainUpdate({})).toEqual({ ok: true, value: { repo: "" } });
+  });
+
+  it("keeps the saved token when the token box is left empty", () => {
+    const r = parseBrainUpdate({ brainRepo: "acme/notes" });
+    expect(r).toEqual({ ok: true, value: { repo: "acme/notes" } });
+  });
+
+  it("takes a new token alongside the repo", () => {
+    const r = parseBrainUpdate({ brain_repo: "acme/notes", brain_token: "ghp_abcdefgh123456" });
+    expect(r).toEqual({ ok: true, value: { repo: "acme/notes", token: "ghp_abcdefgh123456" } });
+  });
+
+  it("rejects a broken repo or token", () => {
+    const repo = parseBrainUpdate({ brainRepo: "not-a-repo" });
+    expect(repo.ok).toBe(false);
+    if (!repo.ok) expect(repo.errors["brainRepo"]).toBeDefined();
+
+    const token = parseBrainUpdate({ brainRepo: "acme/notes", brainToken: "no" });
+    expect(token.ok).toBe(false);
+    if (!token.ok) expect(token.errors["brainToken"]).toBeDefined();
   });
 });

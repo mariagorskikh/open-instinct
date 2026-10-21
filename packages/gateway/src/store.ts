@@ -18,6 +18,12 @@ export interface UserRecord {
   maritimeProjectId?: string;
   /** Deploy template applied at provision time (registry id). Absent on pre-template records. */
   templateId?: string;
+  /** Company brain: GitHub repo (owner/repo) whose text files are pushed to /data/brain at provision. */
+  brainRepo?: string;
+  /** GitHub token for a private brain repo. Kept like other secrets: never logged, never echoed back. */
+  brainToken?: string;
+  /** Composio connected account id for the executor toolkit (session user = handle). Reused while active. */
+  composioAccountId?: string;
   createdAt: string;
   updatedAt?: string;
   status: "provisioning" | "ready" | "error";
@@ -125,6 +131,7 @@ export function publicUser(u: UserRecord): Record<string, unknown> {
     hasError: u.status === "error",
     hasAgent: Boolean(u.maritimeAgentId),
     templateId: u.templateId ?? "default",
+    hasBrain: Boolean(u.brainRepo),
     createdAt: u.createdAt,
     updatedAt: u.updatedAt,
   };

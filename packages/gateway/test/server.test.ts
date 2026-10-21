@@ -22,6 +22,8 @@ interface BootOpts {
   notifyExisting?: GatewayOptions["notifyExisting"];
   seed?: UserRecord[];
   now?: () => number;
+  adminToken?: string;
+  githubToken?: string;
 }
 
 async function boot(opts: BootOpts = {}) {
@@ -43,6 +45,8 @@ async function boot(opts: BootOpts = {}) {
     link: opts.link,
     notifyExisting: opts.notifyExisting,
     now: opts.now,
+    adminToken: opts.adminToken,
+    githubToken: opts.githubToken,
   });
   servers.push(server);
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
@@ -438,5 +442,162 @@ describe("gateway http", () => {
     const connect = await fetch(`${base}/connect/usr_missing`);
     expect(connect.status).toBe(404);
     expect(await connect.text()).toContain("No Instinct with that id");
+  });
+});
+
+describe("admin desktop api", () => {
+  function patch(base: string, token: string | undefined, userId: string, body: unknown = { enabled: true }) {
+    return fetch(`${base}/api/admin/desktop/${userId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("answers 503 while the admin token is not configured", async () => {
+    const { base } = await boot({ seed: [readyUser()] });
+    const res = await patch(base, "whatever", "usr_test");
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toMatch(/not configured/);
+  });
+
+  it("rejects a bad bearer token with 401 before touching anything", async () => {
+    const { base, mar } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    const res = await patch(base, "wrong", "usr_test");
+    expect(res.status).toBe(401);
+    expect(mar.calls).toHaveLength(0);
+  });
+
+  it("patches the agent's desktop-config and returns Maritime's answer", async () => {
+    const { base, mar } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    mar.queue.push({ body: { enabled: true, status: "ok" } });
+    const res = await patch(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, desktop: { enabled: true, status: "ok" } });
+    const call = mar.calls.find((c) => c.method === "PATCH");
+    expect(call?.url).toBe("https://maritime.test/api/agents/agt_42/desktop-config");
+    expect(call?.body).toEqual({ enabled: true });
+  });
+
+  it("maps unknown users, unready agents and bad bodies", async () => {
+    const { base } = await boot({ seed: [readyUser({ maritimeAgentId: undefined })], adminToken: "adm_secret" });
+    expect((await patch(base, "adm_secret", "usr_missing")).status).toBe(404);
+    expect((await patch(base, "adm_secret", "usr_test")).status).toBe(409);
+
+    const ready = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    expect((await patch(ready.base, "adm_secret", "usr_test", { enabled: "yes" })).status).toBe(400);
+    expect((await patch(ready.base, "adm_secret", "usr_test", {})).status).toBe(400);
+  });
+
+  it("passes Maritime's own constraint errors through", async () => {
+    const { base, mar } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    mar.queue.push(402);
+    const res = await patch(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(402);
+  });
+});
+
+describe("connect brain form", () => {
+  function saveBrain(base: string, userId: string, fields: Record<string, string>) {
+    return fetch(`${base}/connect/${userId}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(fields).toString(),
+      redirect: "manual",
+    });
+  }
+
+  it("saves a repo with a token, keeps the token on re-save, and clears on empty", async () => {
+    const { base, store } = await boot({ seed: [readyUser()] });
+    const id = "usr_test";
+
+    const first = await saveBrain(base, id, { brainRepo: "https://github.com/acme/handbook", brainToken: "ghp_abcdefgh123456" });
+    expect(first.status).toBe(303);
+    expect(first.headers.get("location")).toBe(`/connect/${id}`);
+    expect(store.get(id)).toMatchObject({ brainRepo: "acme/handbook", brainToken: "ghp_abcdefgh123456" });
+
+    // Re-saving the repo with an empty token box must not lose the saved token.
+    const second = await saveBrain(base, id, { brainRepo: "acme/notes" });
+    expect(second.status).toBe(303);
+    expect(store.get(id)).toMatchObject({ brainRepo: "acme/notes", brainToken: "ghp_abcdefgh123456" });
+
+    const page = await (await fetch(`${base}/connect/${id}`)).text();
+    expect(page).toContain("acme/notes");
+    expect(page).not.toContain("ghp_abcdefgh123456");
+
+    const invalid = await saveBrain(base, id, { brainRepo: "not-a-repo" });
+    expect(invalid.status).toBe(400);
+    expect(store.get(id)?.brainRepo).toBe("acme/notes");
+
+    const cleared = await saveBrain(base, id, { brainRepo: "" });
+    expect(cleared.status).toBe(303);
+    expect(store.get(id)?.brainRepo).toBeUndefined();
+    expect(store.get(id)?.brainToken).toBeUndefined();
+  });
+
+  it("answers JSON clients with JSON", async () => {
+    const { base, store } = await boot({ seed: [readyUser()] });
+    const res = await fetch(`${base}/connect/usr_test`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ brainRepo: "acme/handbook" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, hasBrain: true });
+    expect(store.get("usr_test")?.brainRepo).toBe("acme/handbook");
+  });
+
+  it("404s an unknown connect id", async () => {
+    const { base } = await boot();
+    expect((await saveBrain(base, "usr_missing", { brainRepo: "acme/handbook" })).status).toBe(404);
+  });
+
+  it("kicks off a GitHub push in the background without holding the response", async () => {
+    const { base, mar } = await boot({ seed: [readyUser()] });
+    const res = await saveBrain(base, "usr_test", { brainRepo: "acme/handbook" });
+    expect(res.status).toBe(303);
+    const until = Date.now() + 2000;
+    while (Date.now() < until && !mar.calls.some((c) => c.url.includes("api.github.com/repos/acme/handbook"))) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(mar.calls.some((c) => c.url.includes("api.github.com/repos/acme/handbook"))).toBe(true);
+  });
+
+  it("stores a brain from signup and exposes hasBrain without leaking the token", async () => {
+    const { base, store } = await boot();
+    const res = await signup(base, {
+      name: "Maria",
+      phone: "415 555 0123",
+      handle: "maria",
+      brainRepo: "acme/handbook",
+      brainToken: "ghp_abcdefgh123456",
+    });
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { userId: string };
+    expect(store.get(body.userId)).toMatchObject({ brainRepo: "acme/handbook", brainToken: "ghp_abcdefgh123456" });
+    const pub = (await (await fetch(`${base}/api/users/${body.userId}`)).json()) as Record<string, unknown>;
+    expect(pub["hasBrain"]).toBe(true);
+    expect(pub["brainToken"]).toBeUndefined();
+    expect(pub["brainRepo"]).toBeUndefined();
+    expect(JSON.stringify(pub)).not.toContain("ghp_");
+  });
+
+  it("never echoes the GitHub token back into a failed signup form", async () => {
+    const { base } = await boot();
+    const res = await fetch(`${base}/api/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: "Maria",
+        phone: "415 555 0123",
+        handle: "maria",
+        brainRepo: "not-a-repo",
+        brainToken: "ghp_abcdefgh123456",
+      }).toString(),
+    });
+    expect(res.status).toBe(400);
+    const page = await res.text();
+    expect(page).toContain("owner/repo");
+    expect(page).not.toContain("ghp_abcdefgh123456");
   });
 });

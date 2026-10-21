@@ -5,11 +5,13 @@ import { join } from "node:path";
 import { type SignupLimits, SlidingWindowLimiter, clientAddress, pendingCount, signupLimits } from "./limits.js";
 import { type Logger, consoleLogger } from "./logger.js";
 import { GITHUB_URL, type RouterInfo, connectRouterFor, renderConnect, renderLanding, renderLinkDone, renderMessage, renderPending } from "./pages.js";
-import { type LinkPassthrough, type MaritimeProvisionOptions, newUserId, provisionUser } from "./provision.js";
+import { MaritimeApiError, type LinkPassthrough, type MaritimeProvisionOptions, maritimeRequest, newUserId, provisionUser } from "./provision.js";
+import { type ComposioPlatform } from "./composio.js";
+import { pushBrain } from "./brain.js";
 import { EventDeduper, type HeaderMap, relayVerifiedEvent, relayGatewayEvent, verifyForUser } from "./relay.js";
 import { type UserRecord, type UserStore, publicUser } from "./store.js";
 import { loadTemplateRegistry } from "./templates.js";
-import { validateSignup } from "./validate.js";
+import { parseBrainUpdate, secretMatches, validateSignup } from "./validate.js";
 
 export interface GatewayOptions {
   store: UserStore;
@@ -23,6 +25,19 @@ export interface GatewayOptions {
   composioApiKey?: string;
   /** Comma-separated Composio toolkits sent with the key. Default gmail,googlecalendar,googlecontacts. */
   composioToolkits?: string;
+  /**
+   * Built executor toolkit platform. Its presence marks the executor as
+   * configured: provisioning connects one account per person (user_id = handle)
+   * and only configured gateways keep `custom_executor` in a template's list.
+   */
+  composio?: ComposioPlatform;
+  /** Fleet-wide GitHub token: fallback for brain pushes when the person supplied none. */
+  githubToken?: string;
+  /**
+   * Bearer token for the admin API (POST /api/admin/desktop/<userId>).
+   * Unset disables the endpoint with 503 — the desktop toggle never ships open.
+   */
+  adminToken?: string;
   /** Stripe Link credentials copied into every agent, with the redirect URI pointing at this gateway. */
   link?: LinkPassthrough;
   logger?: Logger;
@@ -210,6 +225,8 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       anthropicApiKey: opts.anthropicApiKey,
       composioApiKey: opts.composioApiKey,
       composioToolkits: opts.composioToolkits,
+      composio: opts.composio,
+      githubToken: opts.githubToken,
       link: opts.link,
       template: templates.get(user.templateId),
       fetchImpl: opts.fetchImpl,
@@ -269,10 +286,17 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     }
     const body = parseBody(await readBody(req, 64 * 1024), req.headers["content-type"]);
     const check = validateSignup(body, { signupSecret: opts.signupSecret, knownTemplates: templates.ids() });
+    // The token is a secret: never echoed back into a rendered form, whatever the outcome.
+    const echoValues = <T extends object>(v: T): Record<string, string> => {
+      const out: Record<string, string> = {};
+      for (const [k, val] of Object.entries(v)) {
+        if (typeof val === "string" && k !== "inviteCode" && k !== "brainToken" && k !== "brain_token") out[k] = val;
+      }
+      return out;
+    };
     if (!check.ok) {
       if (asJson) return json(res, 400, { error: "invalid signup", errors: check.errors });
-      const values = Object.fromEntries(Object.entries(body).filter(([k, v]) => k !== "inviteCode" && typeof v === "string")) as Record<string, string>;
-      return html(res, 400, renderLanding({ signupEnabled: true, requireInvite: Boolean(opts.signupSecret), errors: check.errors, values }));
+      return html(res, 400, renderLanding({ signupEnabled: true, requireInvite: Boolean(opts.signupSecret), errors: check.errors, values: echoValues(body) }));
     }
     const { value } = check;
 
@@ -295,10 +319,10 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       // Only invitees learn that a handle exists; the open form gets a generic answer.
       if (opts.signupSecret) {
         if (asJson) return json(res, 409, { error: "handle taken", errors: { handle: "That handle is taken." } });
-        return html(res, 409, renderLanding({ signupEnabled: true, requireInvite: true, errors: { handle: "That handle is taken." }, values: { ...value } }));
+        return html(res, 409, renderLanding({ signupEnabled: true, requireInvite: true, errors: { handle: "That handle is taken." }, values: echoValues(value) }));
       }
       if (asJson) return json(res, 400, { error: "could not create" });
-      return html(res, 400, renderLanding({ signupEnabled: true, requireInvite: false, errors: { form: "Could not create an Instinct with these details. Try different ones." }, values: { ...value } }));
+      return html(res, 400, renderLanding({ signupEnabled: true, requireInvite: false, errors: { form: "Could not create an Instinct with these details. Try different ones." }, values: echoValues(value) }));
     }
     if (byPhone) {
       void opts.notifyExisting?.(byPhone, connectUrl(byPhone.id)).catch((err: unknown) => log.warn("notify.failed", { userId: byPhone.id, error: String(err) }));
@@ -317,6 +341,8 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       name: value.name,
       phone: value.phone,
       ...(value.email ? { email: value.email } : {}),
+      ...(value.brainRepo ? { brainRepo: value.brainRepo } : {}),
+      ...(value.brainToken ? { brainToken: value.brainToken } : {}),
       handle: value.handle,
       templateId: value.templateId,
       identityId: "",
@@ -337,6 +363,86 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
         templateName: templates.get(user.templateId)?.title ?? null,
       });
     }
+    res.writeHead(303, { Location: `/connect/${encodeURIComponent(user.id)}` });
+    res.end();
+  }
+
+  /**
+   * POST /api/admin/desktop/<userId> {"enabled": true|false}
+   * Desktop seat toggles for one agent, bearer-protected by GATEWAY_ADMIN_TOKEN.
+   * 503 while unset (endpoint off), 401 on a bad token, 404 unknown user.
+   * Maritime's own constraints (seat cap 402, floor 409/422) pass through as-is.
+   */
+  async function handleAdminDesktop(req: IncomingMessage, res: ServerResponse, userId: string): Promise<void> {
+    if (!opts.adminToken) return json(res, 503, { error: "admin api is not configured" });
+    const auth = typeof req.headers["authorization"] === "string" ? req.headers["authorization"] : "";
+    const token = auth.replace(/^Bearer\s+/i, "");
+    if (!secretMatches(token, opts.adminToken)) {
+      log.warn("admin.unauthorized", { path: req.url });
+      return json(res, 401, { error: "unauthorized" });
+    }
+    const user = opts.store.get(userId);
+    if (!user) return json(res, 404, { error: "unknown user" });
+    if (!user.maritimeAgentId) return json(res, 409, { error: "agent is not ready yet" });
+    const body = parseBody(await readBody(req, 8 * 1024), req.headers["content-type"]);
+    const enabled = body["enabled"];
+    if (typeof enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean" });
+    try {
+      const desktop = await maritimeRequest(
+        { maritime: opts.maritime, fetchImpl: opts.fetchImpl },
+        "PATCH",
+        `/api/agents/${encodeURIComponent(user.maritimeAgentId)}/desktop-config`,
+        { enabled },
+      );
+      log.info("admin.desktop", { userId: user.id, enabled });
+      return json(res, 200, { ok: true, desktop: desktop ?? { enabled } });
+    } catch (err) {
+      if (err instanceof MaritimeApiError) return json(res, err.status, { error: err.detail });
+      throw err;
+    }
+  }
+
+  /**
+   * POST /connect/<userId> — the connect page's company-brain form.
+   * Empty repo clears the brain (and its token); an empty token keeps the saved
+   * one. The push to /data/brain runs fire-and-forget (a slow GitHub walk must
+   * not hold the page), and the stored record changes first, so a retry is safe.
+   */
+  async function handleConnectUpdate(req: IncomingMessage, res: ServerResponse, user: UserRecord): Promise<void> {
+    const body = parseBody(await readBody(req, 32 * 1024), req.headers["content-type"]);
+    const check = parseBrainUpdate(body);
+    const fail = (errors: Record<string, string>): void => {
+      if (wantsJson(req)) return json(res, 400, { error: "invalid brain", errors });
+      return html(res, 400, renderMessage("Check the brain form", Object.values(errors).join(" "), "error"));
+    };
+    if (!check.ok) return fail(check.errors);
+    const { repo, token } = check.value;
+
+    if (!repo) {
+      const { brainRepo: _r, brainToken: _t, ...rest } = user;
+      opts.store.save(rest);
+      log.info("connect.brain_cleared", { userId: user.id });
+    } else {
+      const next: UserRecord = { ...user, brainRepo: repo, ...(token ? { brainToken: token } : {}) };
+      opts.store.save(next);
+      // Never log the token — only the repo, which is not secret.
+      log.info("connect.brain_saved", { userId: user.id, repo, replacedToken: Boolean(token) });
+      if (next.maritimeAgentId) {
+        const agentId = next.maritimeAgentId;
+        void pushBrain(repo, next.brainToken, {
+          fetchImpl: opts.fetchImpl,
+          githubToken: opts.githubToken,
+          logger: log,
+          write: async (path, content) => {
+            await maritimeRequest({ maritime: opts.maritime, fetchImpl: opts.fetchImpl }, "PUT", `/api/agents/${encodeURIComponent(agentId)}/files/write`, { path, content });
+          },
+        })
+          .then((r) => log.info("connect.brain_pushed", { userId: user.id, repo, ...r }))
+          .catch((err: unknown) => log.warn("connect.brain_failed", { userId: user.id, repo, error: err instanceof Error ? err.message : String(err) }));
+      }
+    }
+
+    if (wantsJson(req)) return json(res, 200, { ok: true, hasBrain: Boolean(repo) });
     res.writeHead(303, { Location: `/connect/${encodeURIComponent(user.id)}` });
     res.end();
   }
@@ -423,10 +529,15 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       if (!user) throw new HttpError(404, "unknown user");
       return json(res, 200, { ...publicUser(user), connectUrl: connectUrl(user.id) });
     }
+    if (parts[0] === "api" && parts[1] === "admin" && parts[2] === "desktop" && parts.length === 4) {
+      if (method !== "POST") throw new HttpError(405, "method not allowed");
+      return handleAdminDesktop(req, res, decodeURIComponent(parts[3] ?? ""));
+    }
     if (parts[0] === "connect" && parts.length === 2) {
-      if (method !== "GET") throw new HttpError(405, "method not allowed");
       const user = opts.store.get(decodeURIComponent(parts[1] ?? ""));
       if (!user) return html(res, 404, renderMessage("Not found", "No Instinct with that id. Check the link you were given.", "error"));
+      if (method === "POST") return handleConnectUpdate(req, res, user);
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
       const [shared, perUser] = await Promise.all([routerInfo(), routerInfoForUser(user)]);
       return html(res, 200, renderConnect(user, connectRouterFor(user.handle, shared, perUser)));
     }

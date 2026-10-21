@@ -74,3 +74,32 @@ describe("checkSignupPolicy", () => {
     expect(checkSignupPolicy({ inkboxAdminApiKey: undefined, signupSecret: undefined, allowOpenSignup: false })).toEqual({ ok: true, open: false });
   });
 });
+
+describe("executor and admin settings", () => {
+  it("reads the executor, admin, computers-key and GitHub settings", () => {
+    const cfg = readEnv({
+      MARITIME_API_KEY: "mk",
+      EXECUTOR_MCP_URL: "https://executor.example/mcp",
+      EXECUTOR_MCP_TOKEN: "tok_secret",
+      GATEWAY_ADMIN_TOKEN: "adm_secret",
+      MARITIME_COMPUTERS_API_KEY: "mk_narrow",
+      GITHUB_TOKEN: "ghp_fleet",
+    });
+    expect(cfg).toMatchObject({
+      executorMcpUrl: "https://executor.example/mcp",
+      executorMcpToken: "tok_secret",
+      adminToken: "adm_secret",
+      maritimeComputersKey: "mk_narrow",
+      githubToken: "ghp_fleet",
+    });
+  });
+
+  it("leaves the executor, admin api and fallbacks off when unset", () => {
+    const cfg = readEnv({ MARITIME_API_KEY: "mk" });
+    expect(cfg.executorMcpUrl).toBeUndefined();
+    expect(cfg.executorMcpToken).toBeUndefined();
+    expect(cfg.adminToken).toBeUndefined();
+    expect(cfg.maritimeComputersKey).toBeUndefined();
+    expect(cfg.githubToken).toBeUndefined();
+  });
+});
