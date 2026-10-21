@@ -21,7 +21,7 @@ Credentials live in `<data>/secrets/whatsapp`. To unlink, delete that folder and
 - The sender's number is the identity: the owner's number is the owner, contacts get their
   tier, anyone else is a stranger. WhatsApp verifies numbers, so the owner's messages count
   as the owner, as on iMessage and SMS.
-- Photos, voice notes and documents are saved to `workspace/inbound` for `open_attachment`.
+- Photos, voice notes and documents are saved to `workspace/inbound`, named like Inkbox attachments.
 - Replies are text, with a typing indicator and read receipts. Owner notices follow the
   owner to WhatsApp once they last wrote from it.
 - Messages are persisted (`whatsapp-inbox.json`) before they are handled.

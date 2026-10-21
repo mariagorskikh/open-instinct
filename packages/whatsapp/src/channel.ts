@@ -7,7 +7,7 @@
  * must open WhatsApp at least every 14 days or WhatsApp logs linked devices out.
  *
  * Inbound: one-to-one chats only. Media is downloaded into the inbound folder under a hashed
- * name so open_attachment can read it. Outbound: text, a typing indicator, read receipts.
+ * name, like Inkbox attachments. Outbound: text, a typing indicator, read receipts.
  * Baileys is unofficial; keep the account for the agent alone and never bulk-message from it.
  */
 import { createHash } from "node:crypto";
@@ -262,7 +262,7 @@ export class WhatsAppChannel implements Outbox {
         const bytes = await downloadMediaMessage(m, "buffer", {}, { logger: baileysLogger(this.log), reuploadRequest: sock.updateMediaMessage });
         if (bytes.length > cap) throw new Error("too large");
         mkdirSync(this.opts.mediaDir, { recursive: true, mode: 0o700 });
-        // The same naming as the Inkbox hydrator: open_attachment only opens 64-hex names it could have written.
+        // The same naming as the Inkbox hydrator, so attachment readers treat both alike.
         const hash = createHash("sha256").update(`whatsapp\n${chat}\n${key.id}`).digest("hex");
         const file = path.join(this.opts.mediaDir, `${hash}${extensionFor(media.mimeType, media.name)}`);
         writeFileSync(file, bytes, { mode: 0o600 });
