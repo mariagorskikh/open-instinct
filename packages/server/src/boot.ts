@@ -455,6 +455,9 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       },
       onError: (id, status) => log(`WhatsApp message ${id}: ${status}`),
     });
+    // Without start() the inbox persists every message and never hands one to the runtime.
+    // Starting it also picks up messages saved before a restart.
+    whatsappInbox.start();
     await safely(log, "whatsapp", () => whatsapp.start());
   }
 
