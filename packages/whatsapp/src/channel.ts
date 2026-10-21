@@ -11,12 +11,13 @@
  * Baileys is unofficial; keep the account for the agent alone and never bulk-message from it.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
+  fetchLatestWaWebVersion,
   makeWASocket,
   normalizeMessageContent,
   useMultiFileAuthState,
@@ -30,6 +31,9 @@ export const WHATSAPP_MEDIA_MAX_BYTES = 16 * 1024 * 1024;
 const OPEN_WAIT_MS = 30_000;
 const RECONNECT_MIN_MS = 2_000;
 const RECONNECT_MAX_MS = 5 * 60_000;
+/** Fresh pairing codes to offer after one expires unused, before waiting for a restart. */
+const PAIRING_ATTEMPTS = 3;
+const VERSION_FETCH_MS = 10_000;
 
 export type WhatsAppState = "idle" | "connecting" | "pairing" | "open" | "closed" | "logged_out";
 
@@ -52,6 +56,8 @@ export class WhatsAppChannel implements Outbox {
   private stopped = false;
   private retryMs = RECONNECT_MIN_MS;
   private retryTimer?: NodeJS.Timeout;
+  private pairingAttempts = 0;
+  private waVersion?: [number, number, number];
   private openWaiters: Array<() => void> = [];
   private readonly log: (m: string) => void;
 
@@ -95,13 +101,16 @@ export class WhatsAppChannel implements Outbox {
 
   private async connect(): Promise<void> {
     const { state: auth, saveCreds } = await useMultiFileAuthState(this.opts.authDir);
+    const version = await this.webVersion();
     const sock = makeWASocket({
       auth,
+      ...(version ? { version } : {}),
       logger: baileysLogger(this.log),
       browser: Browsers.ubuntu("Open Instinct"),
       markOnlineOnConnect: false,
+      // Keep the default history-sync policy: it carries the LID-to-phone map new links need.
+      // Old messages arrive as "append", not "notify", so receive() never acts on them.
       syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
       generateHighQualityLinkPreview: false,
     });
     this.sock = sock;
@@ -118,10 +127,11 @@ export class WhatsAppChannel implements Outbox {
       if (update.connection === "open") {
         this.state = "open";
         this.retryMs = RECONNECT_MIN_MS;
+        this.pairingAttempts = 0;
         this.log(`whatsapp: connected as ${phoneFromJid(sock.user?.id) ?? sock.user?.id ?? "unknown"}`);
         for (const wake of this.openWaiters.splice(0)) wake();
       }
-      if (update.connection === "close") this.onClose(sock, update.lastDisconnect?.error);
+      if (update.connection === "close") this.onClose(sock, update.lastDisconnect?.error, Boolean(auth.creds.registered));
     });
     sock.ev.on("messages.upsert", ({ messages, type }) => {
       if (type !== "notify") return;
@@ -143,12 +153,30 @@ export class WhatsAppChannel implements Outbox {
     }
   }
 
-  private onClose(sock: WASocket, error: unknown): void {
+  private onClose(sock: WASocket, error: unknown, registered: boolean): void {
     if (this.sock !== sock) return;
     const code = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
-    if (code === DisconnectReason.loggedOut) {
+    if (code === DisconnectReason.loggedOut && registered) {
+      // The phone unlinked us (or WhatsApp did). The saved login is dead; clear it so a restart pairs afresh.
       this.state = "logged_out";
-      this.log(`whatsapp: logged out by WhatsApp. Delete ${this.opts.authDir} and restart to link again.`);
+      this.clearAuth();
+      this.log("whatsapp: logged out by WhatsApp. Restart to get a new pairing code.");
+      return;
+    }
+    if (!registered && code !== DisconnectReason.restartRequired) {
+      // Pairing never finished (the code expired, 408, or was refused). Reconnecting with the half-made
+      // login only earns a 401, so start clean and offer a fresh code, a few times at most.
+      this.clearAuth();
+      if (this.stopped) return;
+      this.pairingAttempts += 1;
+      if (this.pairingAttempts >= PAIRING_ATTEMPTS) {
+        this.state = "closed";
+        this.log(`whatsapp: pairing did not complete after ${PAIRING_ATTEMPTS} codes. Restart to try again, and enter the code within two minutes.`);
+        return;
+      }
+      this.state = "closed";
+      this.log(`whatsapp: pairing code expired unused (${code ?? "no code"}); issuing a new one`);
+      this.retryTimer = setTimeout(() => void this.connect().catch((err: Error) => this.log(`whatsapp: reconnect failed: ${err.message}`)), RECONNECT_MIN_MS);
       return;
     }
     this.state = "closed";
@@ -158,6 +186,27 @@ export class WhatsAppChannel implements Outbox {
     this.retryMs = Math.min(this.retryMs * 2, RECONNECT_MAX_MS);
     if (delay > 0) this.log(`whatsapp: connection closed (${code ?? "no code"}); retrying in ${Math.round(delay / 1000)}s`);
     this.retryTimer = setTimeout(() => void this.connect().catch((err: Error) => this.log(`whatsapp: reconnect failed: ${err.message}`)), delay);
+  }
+
+  /** Empty the credentials folder, keeping the folder itself. */
+  private clearAuth(): void {
+    rmSync(this.opts.authDir, { recursive: true, force: true });
+    mkdirSync(this.opts.authDir, { recursive: true, mode: 0o700 });
+  }
+
+  /**
+   * The WhatsApp Web revision to claim. The one baked into Baileys ages between releases and
+   * WhatsApp refuses stale clients, so ask web.whatsapp.com once; fall back to the default.
+   */
+  private async webVersion(): Promise<[number, number, number] | undefined> {
+    if (this.waVersion) return this.waVersion;
+    try {
+      const { version, isLatest } = await fetchLatestWaWebVersion({ signal: AbortSignal.timeout(VERSION_FETCH_MS) });
+      if (isLatest) this.waVersion = version as [number, number, number];
+    } catch {
+      // Offline or blocked: Baileys' own default still works most of the time.
+    }
+    return this.waVersion;
   }
 
   private async openSocket(): Promise<WASocket> {
