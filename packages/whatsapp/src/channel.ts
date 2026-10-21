@@ -106,7 +106,9 @@ export class WhatsAppChannel implements Outbox {
       auth,
       ...(version ? { version } : {}),
       logger: baileysLogger(this.log),
-      browser: Browsers.ubuntu("Open Instinct"),
+      // A real browser name: the phone checks it when linking by code, and an unknown one
+      // ("other web client") is refused with "Couldn't link device". The phone lists it as "Chrome (Ubuntu)".
+      browser: Browsers.ubuntu("Chrome"),
       markOnlineOnConnect: false,
       // Keep the default history-sync policy: it carries the LID-to-phone map new links need.
       // Old messages arrive as "append", not "notify", so receive() never acts on them.
@@ -147,7 +149,7 @@ export class WhatsAppChannel implements Outbox {
     try {
       const code = await sock.requestPairingCode(this.opts.phone.replace(/\D/g, ""));
       const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
-      this.log(`whatsapp: pairing code ${pretty}. On the phone with the agent's WhatsApp: Settings > Linked devices > Link a device > Link with phone number instead.`);
+      this.log(`whatsapp: pairing code ${pretty}. On the phone with the agent's WhatsApp: Settings > Linked devices > Link a device > Link with phone number instead. It shows up as "Chrome (Ubuntu)".`);
     } catch (err) {
       this.log(`whatsapp: could not get a pairing code: ${(err as Error).message}`);
     }
