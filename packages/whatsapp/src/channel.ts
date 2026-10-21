@@ -34,6 +34,8 @@ const RECONNECT_MAX_MS = 5 * 60_000;
 /** Fresh pairing codes to offer after one expires unused, before waiting for a restart. */
 const PAIRING_ATTEMPTS = 3;
 const VERSION_FETCH_MS = 10_000;
+/** WebMessageInfo.StubType.CIPHERTEXT: a message Baileys received but could not decrypt. */
+const CIPHERTEXT_STUB = 2;
 
 export type WhatsAppState = "idle" | "connecting" | "pairing" | "open" | "closed" | "logged_out";
 
@@ -136,7 +138,11 @@ export class WhatsAppChannel implements Outbox {
       if (update.connection === "close") this.onClose(sock, update.lastDisconnect?.error, Boolean(auth.creds.registered));
     });
     sock.ev.on("messages.upsert", ({ messages, type }) => {
-      if (type !== "notify") return;
+      if (type !== "notify") {
+        const fresh = messages.filter((m) => !m.key?.fromMe && isDirectChat(m.key?.remoteJid) && Date.now() / 1000 - Number(m.messageTimestamp ?? 0) < 120);
+        if (fresh.length) this.log(`whatsapp: ${fresh.length} recent message(s) arrived as "${type}" (history), not acted on`);
+        return;
+      }
       for (const m of messages) void this.receive(sock, m).catch((err: Error) => this.log(`whatsapp: dropped a message: ${err.message}`));
     });
   }
@@ -227,6 +233,11 @@ export class WhatsAppChannel implements Outbox {
   private async receive(sock: WASocket, m: WAMessage): Promise<void> {
     const key = m.key;
     if (!key?.id || key.fromMe || !isDirectChat(key.remoteJid)) return;
+    if (m.messageStubType === CIPHERTEXT_STUB) {
+      // Baileys could not decrypt it and has asked the sender's phone to send it again.
+      this.log(`whatsapp: a message from ${key.remoteJid} could not be decrypted (${m.messageStubParameters?.[0] ?? "no reason given"}); waiting for the phone to resend it`);
+      return;
+    }
     const content = normalizeMessageContent(m.message);
     let text = messageText(content);
     const media = mediaInfo(content);
@@ -263,6 +274,7 @@ export class WhatsAppChannel implements Outbox {
     }
 
     const sentAt = Number(m.messageTimestamp ?? 0);
+    this.log(`whatsapp: message from ${from}${media ? ` (${media.voiceNote ? "voice note" : media.kind})` : ""}`);
     const msg: InboundMessage = {
       id: `whatsapp:${key.id}`,
       channel: "whatsapp",
