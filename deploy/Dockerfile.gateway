@@ -25,6 +25,7 @@ COPY packages/atomicmail/package.json packages/atomicmail/
 COPY packages/server/package.json packages/server/
 COPY packages/gateway/package.json packages/gateway/
 COPY packages/cli/package.json packages/cli/
+COPY packages/postiz-mcp/package.json packages/postiz-mcp/
 RUN pnpm install --frozen-lockfile
 
 FROM deps AS build

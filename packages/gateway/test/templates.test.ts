@@ -31,7 +31,7 @@ describe("shipped template registry", () => {
     expect(t.skills.map((s) => s.name)).toEqual(["gtm-playbook"]);
     expect(t.skills[0]?.content).toContain("Pain-Qualified");
     expect(t.model).toEqual({ provider: "openai-compatible", default: "gpt-5.4" });
-    expect(t.env["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,custom_executor");
+    expect(t.env["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,custom_executor,linear,custom_oxygen");
     expect(t.env["COMPOSIO_MODE"]).toBe("router");
     expect(t.hardware).toEqual({ cpu: 2, ramGb: 4, desktop: false });
   });

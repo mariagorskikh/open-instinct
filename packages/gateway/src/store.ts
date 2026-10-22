@@ -24,6 +24,10 @@ export interface UserRecord {
   brainToken?: string;
   /** Composio connected account id for the executor toolkit (session user = handle). Reused while active. */
   composioAccountId?: string;
+  /** BYOK Postiz public-API key saved on the connect page. Kept like other secrets: never logged, never echoed back. */
+  postizKey?: string;
+  /** Composio connected account id for the Postiz toolkit, carrying the person's own key. Reused while active. */
+  postizComposioAccountId?: string;
   createdAt: string;
   updatedAt?: string;
   status: "provisioning" | "ready" | "error";
@@ -132,6 +136,7 @@ export function publicUser(u: UserRecord): Record<string, unknown> {
     hasAgent: Boolean(u.maritimeAgentId),
     templateId: u.templateId ?? "default",
     hasBrain: Boolean(u.brainRepo),
+    hasPostizKey: Boolean(u.postizKey),
     createdAt: u.createdAt,
     updatedAt: u.updatedAt,
   };

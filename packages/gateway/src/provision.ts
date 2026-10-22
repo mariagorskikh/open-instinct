@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { InkboxProvisioner } from "@open-instinct/inkbox";
 import { type BrainPushResult, pushBrain } from "./brain.js";
-import { EXECUTOR_TOOLKIT_NAME, type ComposioPlatform } from "./composio.js";
+import { EXECUTOR_TOOLKIT_NAME, OXYGEN_TOOLKIT_NAME, POSTIZ_TOOLKIT_NAME, POSTIZ_TOOLKIT_SLUG, type ComposioPlatform } from "./composio.js";
 import { type Logger, silentLogger } from "./logger.js";
 import { type UserRecord, type UserStore } from "./store.js";
 import type { GatewayTemplate } from "./templates.js";
@@ -15,8 +15,8 @@ export const DEFAULT_IDLE_TTL_SECONDS = 900;
  * packages/cli/src/maritime.ts carries the same constant for `instinct deploy`.
  */
 export const MARITIME_AGENT_PORT = 18789;
-/** Matches deploy/.env.example and core's DEFAULT_TOOLKITS. */
-export const DEFAULT_COMPOSIO_TOOLKITS = "gmail,googlecalendar,googlecontacts";
+/** Matches deploy/.env.example and core's DEFAULT_TOOLKITS. Linear is Composio-managed; custom_oxygen is the gateway's DCR toolkit. */
+export const DEFAULT_COMPOSIO_TOOLKITS = "gmail,googlecalendar,googlecontacts,linear,custom_oxygen";
 /** A model id Maritime's metered OpenAI-compatible proxy serves. Override with INSTINCT_MARITIME_MODEL. */
 export const DEFAULT_MARITIME_LLM_MODEL = "gpt-5.4";
 
@@ -198,20 +198,32 @@ export function agentEnvFor(user: UserRecord, deps: AgentEnvDeps): EnvVarInput[]
     env.push({ key, value, isSecret: SECRET_KEY_RE.test(key) });
   }
   if (deps.template) applyTemplateEnv(env, deps.template);
-  // The executor toolkit needs a per-user connected account the gateway manages;
-  // without a configured composio platform, drop it so the agent never sees a
-  // toolkit it cannot authenticate (and router-mode search would dead-end on).
-  if (!deps.composio) {
-    const entry = env.find((e) => e.key === "COMPOSIO_TOOLKITS");
-    const hasExecutor = entry?.value.split(",").some((s) => s.trim().toLowerCase() === EXECUTOR_TOOLKIT_NAME) ?? false;
-    if (entry && hasExecutor) {
-      entry.value =
-        entry.value
-          .split(",")
-          .map((s) => s.trim())
-          .filter((s) => s && s.toLowerCase() !== EXECUTOR_TOOLKIT_NAME)
-          .join(",") || DEFAULT_COMPOSIO_TOOLKITS;
+  // Gateway-managed toolkits need boot state the agent cannot create itself:
+  // a connected account (executor, postiz) or a DCR registration (oxygen).
+  // Whichever never booted is dropped so the agent never sees a toolkit it
+  // cannot authenticate (and router-mode search would dead-end on).
+  const toolkitsEntry = env.find((e) => e.key === "COMPOSIO_TOOLKITS");
+  if (toolkitsEntry) {
+    const drop = (name: string): boolean => {
+      if (name === EXECUTOR_TOOLKIT_NAME) return !deps.composio?.executorReady;
+      if (name === OXYGEN_TOOLKIT_NAME) return !deps.composio?.oxygenReady;
+      // Postiz is per-person BYOK: the toolkit belongs in a person's list only
+      // when the wrapper booted AND that person saved their own key.
+      if (name === POSTIZ_TOOLKIT_NAME) return !deps.composio?.postizReady || !user.postizKey;
+      return false;
+    };
+    const before = toolkitsEntry.value.split(",").map((s) => s.trim()).filter(Boolean);
+    const kept = before.filter((s) => !drop(s.toLowerCase()));
+    // A saved key opts the person into custom_postiz even though no template
+    // lists it — the connected account alone never reaches the agent's env.
+    if (deps.composio?.postizReady && user.postizKey && !kept.some((s) => s.toLowerCase() === POSTIZ_TOOLKIT_NAME)) {
+      kept.push(POSTIZ_TOOLKIT_NAME);
     }
+    // Compare contents, never counts: a dropped toolkit and a re-added one
+    // cancel out numerically, and a length check would silently keep the stale
+    // base string (dead custom_oxygen in, custom_postiz never landing).
+    const rebuilt = kept.join(",") || DEFAULT_COMPOSIO_TOOLKITS.split(",").filter((s) => !drop(s)).join(",");
+    if (rebuilt !== before.join(",")) toolkitsEntry.value = rebuilt;
   }
   return env;
 }
@@ -362,6 +374,50 @@ function blankRecord(input: ProvisionInput, id: string): UserRecord {
   return rec;
 }
 
+/** One env row as Maritime reports it from GET /api/agents/<id>/env. */
+interface MaritimeEnvVar {
+  key?: string;
+  value?: string;
+  isSecret?: boolean;
+}
+
+/**
+ * Recompute an agent's env and push only the keys that differ from what
+ * Maritime already has. Secrets are never compared against Maritime's masked
+ * value (****xxxx) — a stored secret always overwrites, so a rotated key
+ * reaches the agent. A ready agent's toolkit list, template env and model can
+ * all change after first provision (a new toolkit ships, the operator edits a
+ * template); without this, the agent stays frozen on its original env forever.
+ */
+export async function syncAgentEnv(
+  user: UserRecord,
+  deps: AgentEnvDeps & Pick<ProvisionDeps, "maritime"> & Pick<ProvisionDeps, "fetchImpl" | "logger">,
+): Promise<{ synced: number; total: number }> {
+  const log = deps.logger ?? silentLogger;
+  if (!user.maritimeAgentId) return { synced: 0, total: 0 };
+  const agentId = encodeURIComponent(user.maritimeAgentId);
+  const expected = agentEnvFor(user, deps);
+  const current = (await maritimeRequest(deps, "GET", `/api/agents/${agentId}/env`)) as MaritimeEnvVar[] | undefined;
+  const currentByKey = new Map<string, MaritimeEnvVar>();
+  for (const row of Array.isArray(current) ? current : []) {
+    if (row?.key) currentByKey.set(row.key, row);
+  }
+  let synced = 0;
+  for (const entry of expected) {
+    const existing = currentByKey.get(entry.key);
+    const differs = !existing || (entry.isSecret ? true : existing.value !== entry.value);
+    if (!differs) continue;
+    await maritimeRequest(deps, "POST", `/api/agents/${agentId}/env`, {
+      key: entry.key,
+      value: entry.value,
+      isSecret: entry.isSecret,
+    });
+    synced += 1;
+  }
+  if (synced > 0) log.info("provision.env_synced", { userId: user.id, synced, total: expected.length });
+  return { synced, total: expected.length };
+}
+
 /**
  * Provision one person end to end. Completed steps are recorded before moving
  * on, so retries reuse the resources already saved for this person.
@@ -371,7 +427,15 @@ export async function provisionUser(input: ProvisionInput, deps: ProvisionDeps):
   const store = deps.store;
   let user =
     (deps.userId ? store.get(deps.userId) : undefined) ?? store.byHandle(input.handle) ?? blankRecord(input, deps.userId ?? newUserId());
-  if (user.status === "ready" && user.maritimeAgentId) return user;
+  if (user.status === "ready" && user.maritimeAgentId) {
+    // A ready agent keeps its identity, account and agent id — but its env can
+    // go stale (new toolkits, an edited template, a rotated key). Re-sync the
+    // delta in the background so a reconnect heals it without a recreate.
+    void syncAgentEnv(user, deps).catch((err: unknown) =>
+      log.warn("provision.env_sync_failed", { userId: user.id, error: err instanceof Error ? err.message : String(err) }),
+    );
+    return user;
+  }
 
   user = store.save({ ...user, status: "provisioning", error: undefined });
   try {
@@ -421,7 +485,7 @@ export async function provisionUser(input: ProvisionInput, deps: ProvisionDeps):
     // user_id (= the handle the agent signs its sessions with). Reused while it
     // is still active; a stale id is replaced. A Composio hiccup never fails
     // provisioning — the gateway logs it and the next retry heals it.
-    if (deps.composio && executorRequested(deps)) {
+    if (deps.composio?.executorReady && executorRequested(deps)) {
       try {
         let accountId = user.composioAccountId;
         if (accountId && !(await deps.composio.accountActive(accountId))) accountId = undefined;
@@ -430,6 +494,22 @@ export async function provisionUser(input: ProvisionInput, deps: ProvisionDeps):
         log.info("provision.composio_account", { userId: user.id, accountId });
       } catch (err) {
         log.warn("provision.composio_account_failed", {
+          userId: user.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // Postiz: same reuse-while-active pattern, but the connection carries the
+    // person's own BYOK key instead of a fleet credential.
+    if (deps.composio?.postizReady && user.postizKey) {
+      try {
+        let accountId = user.postizComposioAccountId;
+        if (accountId && !(await deps.composio.accountActive(accountId))) accountId = undefined;
+        if (!accountId) accountId = await deps.composio.ensureAccount(user.handle, { toolkit: POSTIZ_TOOLKIT_SLUG, apiKey: user.postizKey });
+        if (accountId !== user.postizComposioAccountId) user = store.save({ ...user, postizComposioAccountId: accountId });
+        log.info("provision.postiz_account", { userId: user.id, accountId });
+      } catch (err) {
+        log.warn("provision.postiz_account_failed", {
           userId: user.id,
           error: err instanceof Error ? err.message : String(err),
         });

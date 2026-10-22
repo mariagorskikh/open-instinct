@@ -26,4 +26,4 @@ env:
   # Router mode: executor tools are reachable at runtime through search + multi-execute
   # (direct mode's preload does not expose project custom toolkits).
   COMPOSIO_MODE: router
-  COMPOSIO_TOOLKITS: gmail,googlecalendar,custom_executor
+  COMPOSIO_TOOLKITS: gmail,googlecalendar,custom_executor,linear,custom_oxygen

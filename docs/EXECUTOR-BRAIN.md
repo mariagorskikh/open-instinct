@@ -19,7 +19,7 @@ Set on the gateway (never on an agent):
 | `COMPOSIO_API_KEY` | for the executor | The project's Composio key. With `EXECUTOR_MCP_URL` + `EXECUTOR_MCP_TOKEN` present, the gateway registers the executor toolkit at boot. |
 | `EXECUTOR_MCP_URL` | for the executor | The executor's MCP endpoint, registered as the toolkit's `app_url`. |
 | `EXECUTOR_MCP_TOKEN` | for the executor | Bearer sent to the executor on every call. Lives only in Composio's auth config and connected-account state; never forwarded to agents. |
-| `GATEWAY_ADMIN_TOKEN` | for the desktop toggle | Bearer for `POST /api/admin/desktop/<userId>`. Unset disables the endpoint (503). |
+| `GATEWAY_ADMIN_TOKEN` | for the admin API | Bearer for `POST /api/admin/desktop/<userId>` and `POST /api/admin/reprovision/<userId>`. Unset disables both endpoints (503). |
 | `MARITIME_COMPUTERS_API_KEY` | no | Operator-minted computer key; wins over the gateway's own mint. |
 | `GITHUB_TOKEN` | no | Fleet fallback token for brain pushes. A person's own token always wins; public repos need no token. |
 
@@ -145,6 +145,31 @@ Answers: `503` while `GATEWAY_ADMIN_TOKEN` is unset, `401` on a wrong bearer,
 constraints pass through unchanged — including `402` when the org's desktop
 seat cap is reached. The response is `{ok: true, desktop: …}`.
 
+```
+POST /api/admin/reprovision/<userId>
+Authorization: Bearer <GATEWAY_ADMIN_TOKEN>
+```
+
+Recomputes the agent's full env from its template + current boot readiness
+(executor/oxygen/postiz flags) and pushes only the differing keys to Maritime —
+`{ok: true, synced, total}`. Secrets re-push every time (Maritime masks stored
+secret values, so a rotated key can only be detected by sending it). Nothing is
+recreated: identity, accounts and `maritimeAgentId` stay. `provisionUser` runs
+the same sync in the background whenever a ready agent's owner reconnects, so
+the endpoint is for healing without waiting for that. A ready agent that is
+asleep picks the new env up on its next wake.
+
+## One owner, many agents
+
+Reuse keys on handle **and** phone together: the same details land on the
+existing record (retry, lost connect page), while a fresh handle is a fresh
+agent — one owner phone can run a fleet. The platform deploy flow
+(`claim-machine` in founder-synergy-agent-platform) keeps one `agent_machines`
+row per agent: in-flight rows refresh, settled rows mean the next deploy derives
+`<base>-2`, `<base>-3`… and signs up a new gateway user. Same-handle re-signups
+answer `202 {status:"pending", userId, connectUrl, …}` (the caller's own record
+only) so a retry attaches to the row it already owns.
+
 ## Recovery procedures
 
 **Toolkit `app_url` changed (409 on upsert).** `app_url` and `auth_schemes` are
@@ -197,3 +222,65 @@ docker logs instinct-gateway --since 5m | grep -E "listening|executor|computers_
 
 Compose lives at `/opt/instinct-gateway/docker-compose.yaml` (env lives there,
 not in the source tree); the data volume is `gateway-data:/data`.
+
+## Deploying the Postiz MCP wrapper
+
+The gateway hands every agent the `custom_postiz` toolkit, which points at a
+small stateless MCP server (`packages/postiz-mcp`) that relays to the
+self-hosted Postiz public API. Each request carries that person's own Postiz
+key (BYOK), so the wrapper never holds a credential.
+
+Source syncs to `/opt/postiz-mcp-src` (same rsync flags as above; create the
+dir once with `sudo mkdir -p /opt/postiz-mcp-src && sudo chown ubuntu:ubuntu
+/opt/postiz-mcp-src`). Build detached:
+
+```
+cd /opt/postiz-mcp-src
+nohup sh -c "docker build -f deploy/Dockerfile.postiz-mcp -t postiz-mcp:latest . > ~/postiz-mcp-build.log 2>&1; echo BUILD_EXIT=\$? >> ~/postiz-mcp-build.log" >/dev/null 2>&1 &
+tail -f ~/postiz-mcp-build.log      # wait for BUILD_EXIT=0
+```
+
+Compose lives at `/opt/postiz-mcp/docker-compose.yaml`: it sets
+`POSTIZ_API_URL=http://postiz:5000/api` (internal — reaches the Postiz stack on
+the `postiz_postiz-network` bridge, no hairpin through Cloudflare), joins both
+that network and the external `coolify` network, and carries Traefik labels for
+`postiz-mcp.foundersynergy.network` with the `letsencrypt` certresolver, same
+shape as the gateway. Bring it up with `cd /opt/postiz-mcp && docker compose
+up -d`.
+
+Point the gateway at it by adding this line to
+`/opt/instinct-gateway/docker-compose.yaml` (env lives only there, not in the
+source tree):
+
+```
+POSTIZ_MCP_URL: "https://postiz-mcp.foundersynergy.network/mcp"
+```
+
+then rebuild + restart the gateway as above (`docker compose up -d --no-deps
+gateway`) and confirm the boot line:
+
+```
+docker logs instinct-gateway --since 5m | grep -E "postiz_ready|listening"
+```
+
+You want `composio.postiz_ready` and a `gateway.listening` line whose flags
+include `"postiz":true`.
+
+### DNS-lag workaround (VM-local curls)
+
+The wrapper hostname resolves on public resolvers (1.1.1.1, 8.8.8.8) as soon
+as the Cloudflare record is added, but the OCI VM's own resolver
+(Oracle VCN, `169.254.169.254`) can lag minutes behind. A `curl` from the VM may
+print `Could not resolve host` even though the service is healthy and the
+gateway reaches it fine. Skip the local resolver and pin the IP:
+
+```
+curl --resolve postiz-mcp.foundersynergy.network:443:104.21.50.143 \
+  https://postiz-mcp.foundersynergy.network/health
+```
+
+Expect `{"ok":true}`. To smoke the MCP surface end to end, `POST /mcp` with
+headers `Content-Type: application/json`, `Accept: application/json,
+text/event-stream`, and `Authorization: Bearer <postiz-api-key>`: an
+`initialize` should return `serverInfo.name: "postiz-mcp"`, and a request
+without the key must return 401.

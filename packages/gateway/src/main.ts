@@ -42,6 +42,8 @@ export interface GatewayEnv {
   executorMcpUrl?: string;
   /** EXECUTOR_MCP_TOKEN: Bearer sent to the executor on every call. Required with the URL; never forwarded to agents. */
   executorMcpToken?: string;
+  /** POSTIZ_MCP_URL: MCP wrapper around the self-hosted Postiz public API (Composio custom-toolkit app_url). Unset disables custom_postiz. */
+  postizMcpUrl?: string;
   /** GATEWAY_ADMIN_TOKEN: bearer for POST /api/admin/desktop/<userId>. Unset disables the endpoint (503). */
   adminToken?: string;
   /** MARITIME_COMPUTERS_API_KEY: operator-minted computers-scoped key; wins over the gateway's own mint. */
@@ -122,6 +124,7 @@ export function readEnv(env: NodeJS.ProcessEnv): GatewayEnv {
     templatesDir: env["GATEWAY_TEMPLATES_DIR"] || undefined,
     executorMcpUrl: env["EXECUTOR_MCP_URL"] || undefined,
     executorMcpToken: env["EXECUTOR_MCP_TOKEN"] || undefined,
+    postizMcpUrl: env["POSTIZ_MCP_URL"] || undefined,
     adminToken: env["GATEWAY_ADMIN_TOKEN"] || undefined,
     maritimeComputersKey: env["MARITIME_COMPUTERS_API_KEY"] || undefined,
     githubToken: env["GITHUB_TOKEN"] || undefined,
@@ -197,27 +200,33 @@ export async function startGateway(cfg: GatewayEnv): Promise<GatewayServer> {
   ).catch(() => undefined);
   if (computersKey) log.info("computers_key.ready", { source: cfg.maritimeComputersKey ? "override" : "minted" });
 
-  // Executor: all three parts are required (API key, MCP URL, token). A boot
-  // failure logs loudly and leaves the gateway running without the executor —
-  // template lists that name `custom_executor` are stripped at provision time.
+  // Composio: each custom toolkit boots independently (executor needs URL+token,
+  // oxygen boots DCR registration, postiz needs the wrapper URL). Linear is
+  // Composio-managed and needs nothing. A boot failure logs loudly per toolkit
+  // and leaves the gateway running without it — template lists that name a
+  // dead custom toolkit are stripped at provision time.
   let composio: ComposioPlatform | undefined;
-  if (cfg.composioApiKey && cfg.executorMcpUrl && cfg.executorMcpToken) {
+  if (cfg.composioApiKey) {
     const platform = new ComposioPlatform(
-      { apiKey: cfg.composioApiKey, appUrl: cfg.executorMcpUrl, token: cfg.executorMcpToken },
+      {
+        apiKey: cfg.composioApiKey,
+        ...(cfg.executorMcpUrl && cfg.executorMcpToken ? { appUrl: cfg.executorMcpUrl, token: cfg.executorMcpToken } : {}),
+        ...(cfg.postizMcpUrl ? { postizAppUrl: cfg.postizMcpUrl } : {}),
+      },
       { logger: log },
     );
     try {
       await withTimeout("composio_boot", platform.ensureBoot(), BOOT_TIMEOUT_MS, log);
-      composio = platform;
     } catch (err) {
-      log.error("composio.executor_unavailable", {
+      log.error("composio.boot_failed", {
         error: err instanceof Error ? err.message : String(err),
-        effect: "agents run without the executor (custom_executor stripped from their toolkit list)",
+        effect: "agents run without whichever toolkits failed to boot",
       });
     }
+    if (platform.anyReady) composio = platform;
   } else {
-    log.warn("composio.executor_disabled", {
-      reason: "COMPOSIO_API_KEY, EXECUTOR_MCP_URL and EXECUTOR_MCP_TOKEN must all be set",
+    log.warn("composio.disabled", {
+      reason: "COMPOSIO_API_KEY not set",
     });
   }
 
@@ -257,7 +266,9 @@ export async function startGateway(cfg: GatewayEnv): Promise<GatewayServer> {
       users: store.all().length,
       signup: Boolean(inkbox),
       link: Boolean(cfg.link),
-      executor: Boolean(composio),
+      executor: Boolean(composio?.executorReady),
+      oxygen: Boolean(composio?.oxygenReady),
+      postiz: Boolean(composio?.postizReady),
       computer: Boolean(computersKey),
       adminApi: Boolean(cfg.adminToken),
     });

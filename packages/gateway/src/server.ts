@@ -5,13 +5,13 @@ import { join } from "node:path";
 import { type SignupLimits, SlidingWindowLimiter, clientAddress, pendingCount, signupLimits } from "./limits.js";
 import { type Logger, consoleLogger } from "./logger.js";
 import { GITHUB_URL, type RouterInfo, connectRouterFor, renderConnect, renderLanding, renderLinkDone, renderMessage, renderPending } from "./pages.js";
-import { MaritimeApiError, type LinkPassthrough, type MaritimeProvisionOptions, maritimeRequest, newUserId, provisionUser } from "./provision.js";
-import { type ComposioPlatform } from "./composio.js";
+import { MaritimeApiError, type LinkPassthrough, type MaritimeProvisionOptions, maritimeRequest, newUserId, provisionUser, syncAgentEnv } from "./provision.js";
+import { POSTIZ_TOOLKIT_SLUG, type ComposioPlatform } from "./composio.js";
 import { pushBrain } from "./brain.js";
 import { EventDeduper, type HeaderMap, relayVerifiedEvent, relayGatewayEvent, verifyForUser } from "./relay.js";
 import { type UserRecord, type UserStore, publicUser } from "./store.js";
 import { loadTemplateRegistry } from "./templates.js";
-import { parseBrainUpdate, secretMatches, validateSignup } from "./validate.js";
+import { parseBrainUpdate, parsePostizKeyUpdate, secretMatches, validateSignup } from "./validate.js";
 
 export interface GatewayOptions {
   store: UserStore;
@@ -271,11 +271,25 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     return `${opts.publicUrl.replace(/\/+$/, "")}/connect/${encodeURIComponent(userId)}`;
   }
 
-  /** Same body for "this phone already has an Instinct" and "you asked again": nothing to learn. */
-  async function respondPending(req: IncomingMessage, res: ServerResponse, handle: string): Promise<void> {
-    if (wantsJson(req)) return json(res, 202, { status: "pending" });
+  /**
+   * Reply when handle+phone both match an existing record: a retry, a crash mid-provision,
+   * or a lost connect page. Only ever reached for the caller's own signup, so the JSON body
+   * carries that record's identity (the deploy edge function attaches it to its own row)
+   * while nothing about anyone else's record is revealed.
+   */
+  async function respondPending(req: IncomingMessage, res: ServerResponse, user: UserRecord): Promise<void> {
+    if (wantsJson(req)) {
+      return json(res, 202, {
+        status: "pending",
+        userId: user.id,
+        connectUrl: connectUrl(user.id),
+        handle: user.handle,
+        templateId: user.templateId,
+        templateName: templates.get(user.templateId)?.title ?? null,
+      });
+    }
     const shared = await routerInfo();
-    return html(res, 202, renderPending(handle, connectRouterFor(handle, shared, undefined)));
+    return html(res, 202, renderPending(user.handle, connectRouterFor(user.handle, shared, undefined)));
   }
 
   async function handleSignup(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -290,7 +304,7 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     const echoValues = <T extends object>(v: T): Record<string, string> => {
       const out: Record<string, string> = {};
       for (const [k, val] of Object.entries(v)) {
-        if (typeof val === "string" && k !== "inviteCode" && k !== "brainToken" && k !== "brain_token") out[k] = val;
+        if (typeof val === "string" && k !== "inviteCode" && k !== "brainToken" && k !== "brain_token" && k !== "postizKey" && k !== "postiz_key") out[k] = val;
       }
       return out;
     };
@@ -307,13 +321,15 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       return html(res, 429, renderMessage("Slow down", "Too many signups from this address. Try again in a few minutes.", "error"));
     }
 
+    // Reuse only ever keys on handle AND phone together: the same person re-submitting
+    // their own details lands on their record, while a fresh handle is a fresh agent —
+    // one owner phone can run a fleet (each platform deploy derives a new handle).
     const byHandle = opts.store.byHandle(value.handle);
-    const byPhone = opts.store.byPhone(value.phone);
     if (byHandle && byHandle.phone === value.phone) {
       // Same person again: a retry after an error, a crash mid-provision, or a lost connect page.
       if (byHandle.status !== "ready") startProvisioning(byHandle);
       void opts.notifyExisting?.(byHandle, connectUrl(byHandle.id)).catch((err: unknown) => log.warn("notify.failed", { userId: byHandle.id, error: String(err) }));
-      return respondPending(req, res, value.handle);
+      return respondPending(req, res, byHandle);
     }
     if (byHandle) {
       // Only invitees learn that a handle exists; the open form gets a generic answer.
@@ -323,10 +339,6 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       }
       if (asJson) return json(res, 400, { error: "could not create" });
       return html(res, 400, renderLanding({ signupEnabled: true, requireInvite: false, errors: { form: "Could not create an Instinct with these details. Try different ones." }, values: echoValues(value) }));
-    }
-    if (byPhone) {
-      void opts.notifyExisting?.(byPhone, connectUrl(byPhone.id)).catch((err: unknown) => log.warn("notify.failed", { userId: byPhone.id, error: String(err) }));
-      return respondPending(req, res, value.handle);
     }
 
     const pending = pendingCount(opts.store.all(), now(), limits.pendingWindowMs);
@@ -403,46 +415,116 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
   }
 
   /**
-   * POST /connect/<userId> — the connect page's company-brain form.
-   * Empty repo clears the brain (and its token); an empty token keeps the saved
-   * one. The push to /data/brain runs fire-and-forget (a slow GitHub walk must
-   * not hold the page), and the stored record changes first, so a retry is safe.
+   * POST /api/admin/reprovision/<userId>
+   * Recompute an agent's env from its template + current readiness and push
+   * only the differing keys to Maritime. The agent keeps its id, identity and
+   * connected accounts — nothing is recreated. Bearer-protected by
+   * GATEWAY_ADMIN_TOKEN; 503 while unset, 401 on a bad token, 404 unknown user.
+   */
+  async function handleAdminReprovision(req: IncomingMessage, res: ServerResponse, userId: string): Promise<void> {
+    if (!opts.adminToken) return json(res, 503, { error: "admin api is not configured" });
+    const auth = typeof req.headers["authorization"] === "string" ? req.headers["authorization"] : "";
+    const token = auth.replace(/^Bearer\s+/i, "");
+    if (!secretMatches(token, opts.adminToken)) {
+      log.warn("admin.unauthorized", { path: req.url });
+      return json(res, 401, { error: "unauthorized" });
+    }
+    const user = opts.store.get(userId);
+    if (!user) return json(res, 404, { error: "unknown user" });
+    if (!user.maritimeAgentId) return json(res, 409, { error: "agent is not provisioned yet" });
+    try {
+      const result = await syncAgentEnv(user, {
+        inkboxBaseUrl: opts.inkboxBaseUrl,
+        maritime: opts.maritime,
+        publicUrl: opts.publicUrl,
+        anthropicApiKey: opts.anthropicApiKey,
+        composioApiKey: opts.composioApiKey,
+        composioToolkits: opts.composioToolkits,
+        composio: opts.composio,
+        link: opts.link,
+        template: templates.get(user.templateId),
+        fetchImpl: opts.fetchImpl,
+        logger: log,
+      });
+      log.info("admin.reprovision", { userId: user.id, ...result });
+      return json(res, 200, { ok: true, ...result });
+    } catch (err) {
+      if (err instanceof MaritimeApiError) return json(res, err.status, { error: err.detail });
+      throw err;
+    }
+  }
+
+  /**
+   * POST /connect/<userId> — the connect page's connections form (brain + Postiz).
+   * Empty repo clears the brain (and its token); an empty token or Postiz key
+   * keeps the saved one; the Postiz checkbox removes it. The brain push and the
+   * Postiz account mint run fire-and-forget (a slow GitHub walk must not hold
+   * the page), and the stored record changes first, so a retry is safe.
    */
   async function handleConnectUpdate(req: IncomingMessage, res: ServerResponse, user: UserRecord): Promise<void> {
     const body = parseBody(await readBody(req, 32 * 1024), req.headers["content-type"]);
     const check = parseBrainUpdate(body);
+    const postiz = parsePostizKeyUpdate(body);
     const fail = (errors: Record<string, string>): void => {
-      if (wantsJson(req)) return json(res, 400, { error: "invalid brain", errors });
-      return html(res, 400, renderMessage("Check the brain form", Object.values(errors).join(" "), "error"));
+      if (wantsJson(req)) return json(res, 400, { error: "invalid connections", errors });
+      return html(res, 400, renderMessage("Check the form", Object.values(errors).join(" "), "error"));
     };
     if (!check.ok) return fail(check.errors);
+    if (!postiz.ok) return fail(postiz.errors);
     const { repo, token } = check.value;
 
+    let next: UserRecord = { ...user };
     if (!repo) {
-      const { brainRepo: _r, brainToken: _t, ...rest } = user;
-      opts.store.save(rest);
+      delete next.brainRepo;
+      delete next.brainToken;
       log.info("connect.brain_cleared", { userId: user.id });
     } else {
-      const next: UserRecord = { ...user, brainRepo: repo, ...(token ? { brainToken: token } : {}) };
-      opts.store.save(next);
+      next.brainRepo = repo;
+      if (token) next.brainToken = token;
       // Never log the token — only the repo, which is not secret.
       log.info("connect.brain_saved", { userId: user.id, repo, replacedToken: Boolean(token) });
-      if (next.maritimeAgentId) {
-        const agentId = next.maritimeAgentId;
-        void pushBrain(repo, next.brainToken, {
-          fetchImpl: opts.fetchImpl,
-          githubToken: opts.githubToken,
-          logger: log,
-          write: async (path, content) => {
-            await maritimeRequest({ maritime: opts.maritime, fetchImpl: opts.fetchImpl }, "PUT", `/api/agents/${encodeURIComponent(agentId)}/files/write`, { path, content });
-          },
+    }
+    // The Postiz key is a secret: never logged, never echoed back.
+    if (postiz.value.clear) {
+      delete next.postizKey;
+      delete next.postizComposioAccountId;
+      log.info("connect.postiz_key_cleared", { userId: user.id });
+    } else if (postiz.value.key) {
+      next.postizKey = postiz.value.key;
+      // A new key means the old connection no longer matches; re-mint below.
+      delete next.postizComposioAccountId;
+      log.info("connect.postiz_key_saved", { userId: user.id });
+    }
+    next = opts.store.save(next);
+
+    if (repo && next.maritimeAgentId) {
+      const agentId = next.maritimeAgentId;
+      void pushBrain(repo, next.brainToken, {
+        fetchImpl: opts.fetchImpl,
+        githubToken: opts.githubToken,
+        logger: log,
+        write: async (path, content) => {
+          await maritimeRequest({ maritime: opts.maritime, fetchImpl: opts.fetchImpl }, "PUT", `/api/agents/${encodeURIComponent(agentId)}/files/write`, { path, content });
+        },
+      })
+        .then((r) => log.info("connect.brain_pushed", { userId: user.id, repo, ...r }))
+        .catch((err: unknown) => log.warn("connect.brain_failed", { userId: user.id, repo, error: err instanceof Error ? err.message : String(err) }));
+    }
+    // Mint the Postiz connected account carrying this person's own key.
+    if (postiz.value.key && !postiz.value.clear && opts.composio?.postizReady) {
+      const key = postiz.value.key;
+      const handle = next.handle;
+      void opts.composio
+        .ensureAccount(handle, { toolkit: POSTIZ_TOOLKIT_SLUG, apiKey: key })
+        .then((accountId) => {
+          const u = opts.store.get(next.id);
+          if (u && u.postizComposioAccountId !== accountId) opts.store.save({ ...u, postizComposioAccountId: accountId });
+          log.info("connect.postiz_account", { userId: next.id, accountId });
         })
-          .then((r) => log.info("connect.brain_pushed", { userId: user.id, repo, ...r }))
-          .catch((err: unknown) => log.warn("connect.brain_failed", { userId: user.id, repo, error: err instanceof Error ? err.message : String(err) }));
-      }
+        .catch((err: unknown) => log.warn("connect.postiz_account_failed", { userId: next.id, error: err instanceof Error ? err.message : String(err) }));
     }
 
-    if (wantsJson(req)) return json(res, 200, { ok: true, hasBrain: Boolean(repo) });
+    if (wantsJson(req)) return json(res, 200, { ok: true, hasBrain: Boolean(next.brainRepo), hasPostizKey: Boolean(next.postizKey) });
     res.writeHead(303, { Location: `/connect/${encodeURIComponent(user.id)}` });
     res.end();
   }
@@ -532,6 +614,10 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     if (parts[0] === "api" && parts[1] === "admin" && parts[2] === "desktop" && parts.length === 4) {
       if (method !== "POST") throw new HttpError(405, "method not allowed");
       return handleAdminDesktop(req, res, decodeURIComponent(parts[3] ?? ""));
+    }
+    if (parts[0] === "api" && parts[1] === "admin" && parts[2] === "reprovision" && parts.length === 4) {
+      if (method !== "POST") throw new HttpError(405, "method not allowed");
+      return handleAdminReprovision(req, res, decodeURIComponent(parts[3] ?? ""));
     }
     if (parts[0] === "connect" && parts.length === 2) {
       const user = opts.store.get(decodeURIComponent(parts[1] ?? ""));

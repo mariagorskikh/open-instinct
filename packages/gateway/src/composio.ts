@@ -4,6 +4,16 @@ import { type Logger, silentLogger } from "./logger.js";
 export const EXECUTOR_TOOLKIT_SLUG = "CUSTOM_EXECUTOR";
 /** Lowercased form the agent normalizes toolkits to; what templates list in COMPOSIO_TOOLKITS. */
 export const EXECUTOR_TOOLKIT_NAME = "custom_executor";
+/** Oxygen: custom toolkit with per-user DCR OAuth (Clerk-backed; no credentials at boot). */
+export const OXYGEN_TOOLKIT_SLUG = "CUSTOM_OXYGEN";
+export const OXYGEN_TOOLKIT_NAME = "custom_oxygen";
+export const OXYGEN_MCP_URL = "https://oxygen-agent.com/mcp";
+export const OXYGEN_DISCOVERY_URL = "https://oxygen-agent.com/.well-known/oauth-authorization-server";
+/** Linear: a Composio-managed toolkit. Nothing to register at boot; each person connects their own account. */
+export const LINEAR_TOOLKIT_NAME = "linear";
+/** Postiz: custom toolkit over an MCP wrapper around the self-hosted Postiz public API. */
+export const POSTIZ_TOOLKIT_SLUG = "CUSTOM_POSTIZ";
+export const POSTIZ_TOOLKIT_NAME = "custom_postiz";
 export const DEFAULT_COMPOSIO_BASE_URL = "https://backend.composio.dev";
 /** Session user id the gateway's own bootstrap connected account lives under. Agent sessions use the person's handle. */
 export const GATEWAY_COMPOSIO_USER = "instinct-gateway";
@@ -11,12 +21,16 @@ export const GATEWAY_COMPOSIO_USER = "instinct-gateway";
 export interface ExecutorConfig {
   /** COMPOSIO_API_KEY for this project. */
   apiKey: string;
-  /** EXECUTOR_MCP_URL: the executor's MCP endpoint (app_url the toolkit registers). */
-  appUrl: string;
+  /** EXECUTOR_MCP_URL: the executor's MCP endpoint (app_url the toolkit registers). Absent skips the executor. */
+  appUrl?: string;
   /** EXECUTOR_MCP_TOKEN: sent as the toolkit's generic_api_key credential (Bearer on every executor call). */
-  token: string;
+  token?: string;
   /** COMPOSIO_BASE_URL override for tests. */
   baseUrl?: string;
+  /** CUSTOM_POSTIZ app_url (the MCP wrapper). Absent skips the Postiz toolkit. */
+  postizAppUrl?: string;
+  /** false skips the Oxygen DCR toolkit at boot (tests). Default true. */
+  oxygen?: boolean;
 }
 
 export class ComposioApiError extends Error {
@@ -42,11 +56,25 @@ interface ListEnvelope {
   items?: Array<Record<string, unknown>>;
 }
 
+export interface EnsureAccountOptions {
+  /** Toolkit slug; default EXECUTOR_TOOLKIT_SLUG. */
+  toolkit?: string;
+  /** generic_api_key carried by the connection; default the executor fleet token. */
+  apiKey?: string;
+  /** Skip the auth-config lookup when the caller already has one. */
+  authConfigId?: string;
+}
+
 /**
  * The project-level Composio state the gateway keeps on behalf of every agent:
- * the executor custom toolkit, its API-key auth config, a bootstrap connected
- * account (used to sync tool definitions at boot), and per-user connected
- * accounts created at provision time.
+ * the executor custom toolkit (API-key, fleet token), the Oxygen custom toolkit
+ * (per-user DCR OAuth), the Postiz custom toolkit (per-user BYOK key), and per-
+ * user connected accounts created at provision time. Linear is Composio-managed
+ * and needs nothing at boot.
+ *
+ * Each toolkit boots independently and records a readiness flag: one toolkit
+ * failing must not take the others down, and the gateway strips a toolkit from
+ * agent env lists whose flag never turned on.
  *
  * Every call is idempotent: boots repeat them, and a repeat must not create a
  * second toolkit or account.
@@ -55,12 +83,21 @@ export class ComposioPlatform {
   private readonly cfg: ExecutorConfig;
   private readonly fetchImpl: typeof fetch;
   private readonly log: Logger;
-  private authConfigId: string | undefined;
+  private readonly authConfigIds = new Map<string, string>();
+
+  executorReady = false;
+  oxygenReady = false;
+  postizReady = false;
 
   constructor(cfg: ExecutorConfig, deps: { fetchImpl?: typeof fetch; logger?: Logger } = {}) {
     this.cfg = cfg;
     this.fetchImpl = deps.fetchImpl ?? globalThis.fetch;
     this.log = deps.logger ?? silentLogger;
+  }
+
+  /** True when at least one custom toolkit finished booting; the platform is worth keeping. */
+  get anyReady(): boolean {
+    return this.executorReady || this.oxygenReady || this.postizReady;
   }
 
   private async request<T = Record<string, unknown>>(method: string, path: string, body?: unknown): Promise<T> {
@@ -85,18 +122,57 @@ export class ComposioPlatform {
   }
 
   /**
-   * Boot sequence: register the toolkit, resolve its auth config, connect the
-   * gateway's own account, then sync tool definitions from the executor MCP.
-   * Called once before the gateway starts accepting signups; every step logs
-   * and rethrows so the caller can decide (a missing executor must not stop
-   * the gateway, but it must be loud).
+   * Boot sequence: each configured toolkit registers independently — executor
+   * (upsert, auth config, bootstrap account, sync), Oxygen (upsert, DCR auth
+   * config), Postiz (upsert, auth config). Called once before the gateway
+   * accepts signups. Failures are logged per toolkit and never throw: the
+   * readiness flags tell the caller what survived.
    */
   async ensureBoot(): Promise<void> {
-    await this.ensureToolkit();
-    const authConfigId = await this.ensureAuthConfig();
-    const account = await this.ensureAccount(GATEWAY_COMPOSIO_USER, authConfigId);
-    await this.sync(account);
-    this.log.info("composio.executor_ready", { toolkit: EXECUTOR_TOOLKIT_SLUG, appUrl: this.cfg.appUrl });
+    if (this.cfg.appUrl && this.cfg.token) {
+      try {
+        await this.ensureToolkit();
+        const authConfigId = await this.ensureAuthConfig();
+        const account = await this.ensureAccount(GATEWAY_COMPOSIO_USER, { authConfigId });
+        await this.sync(account);
+        this.executorReady = true;
+        this.log.info("composio.executor_ready", { toolkit: EXECUTOR_TOOLKIT_SLUG, appUrl: this.cfg.appUrl });
+      } catch (err) {
+        this.log.error("composio.executor_unavailable", {
+          error: err instanceof Error ? err.message : String(err),
+          effect: "agents run without the executor (custom_executor stripped from their toolkit list)",
+        });
+      }
+    } else {
+      this.log.warn("composio.executor_disabled", {
+        reason: "EXECUTOR_MCP_URL and EXECUTOR_MCP_TOKEN must both be set",
+      });
+    }
+    if (this.cfg.oxygen !== false) {
+      try {
+        await this.ensureOxygenToolkit();
+        await this.ensureDcrAuthConfig(OXYGEN_TOOLKIT_SLUG, "Oxygen");
+        this.oxygenReady = true;
+        this.log.info("composio.oxygen_ready", { toolkit: OXYGEN_TOOLKIT_SLUG });
+      } catch (err) {
+        this.log.warn("composio.oxygen_unavailable", {
+          error: err instanceof Error ? err.message : String(err),
+          effect: "custom_oxygen stripped from their toolkit list",
+        });
+      }
+    }
+    if (this.cfg.postizAppUrl) {
+      try {
+        await this.ensurePostizToolkit();
+        this.postizReady = true;
+        this.log.info("composio.postiz_ready", { toolkit: POSTIZ_TOOLKIT_SLUG, appUrl: this.cfg.postizAppUrl });
+      } catch (err) {
+        this.log.warn("composio.postiz_unavailable", {
+          error: err instanceof Error ? err.message : String(err),
+          effect: "custom_postiz stripped from their toolkit list",
+        });
+      }
+    }
   }
 
   /**
@@ -106,22 +182,54 @@ export class ComposioPlatform {
    * serving stale tools.
    */
   async ensureToolkit(): Promise<void> {
+    if (!this.cfg.appUrl || !this.cfg.token) throw new ComposioApiError(500, "executor is not configured");
+    await this.ensureCustomToolkit(EXECUTOR_TOOLKIT_SLUG, "Executor", this.cfg.appUrl, [
+      { mode: "API_KEY", headers: { Authorization: "Bearer {{generic_api_key}}" } },
+    ]);
+  }
+
+  async ensureOxygenToolkit(): Promise<void> {
+    await this.ensureCustomToolkit(OXYGEN_TOOLKIT_SLUG, "Oxygen", OXYGEN_MCP_URL, [
+      { mode: "DCR_OAUTH", discovery_url: OXYGEN_DISCOVERY_URL },
+    ]);
+  }
+
+  async ensurePostizToolkit(): Promise<void> {
+    const appUrl = this.cfg.postizAppUrl;
+    if (!appUrl) throw new ComposioApiError(500, "postiz is not configured");
+    await this.ensureCustomToolkit(POSTIZ_TOOLKIT_SLUG, "Postiz", appUrl, [
+      { mode: "API_KEY", headers: { Authorization: "Bearer {{generic_api_key}}" } },
+    ]);
+  }
+
+  private async ensureCustomToolkit(slug: string, name: string, appUrl: string, authSchemes: Array<Record<string, unknown>>): Promise<void> {
     await this.request("POST", "/api/v3.1/custom/toolkits/upsert", {
-      slug: EXECUTOR_TOOLKIT_SLUG,
+      slug,
       toolkit_config: {
-        name: "Executor",
-        app_url: this.cfg.appUrl,
-        auth_schemes: [{ mode: "API_KEY", headers: { Authorization: "Bearer {{generic_api_key}}" } }],
+        name,
+        app_url: appUrl,
+        auth_schemes: authSchemes,
       },
     });
   }
 
-  /** The toolkit's own API-key auth config: list first (a boot must not duplicate), create otherwise. */
+  /** The executor toolkit's own API-key auth config: list first (a boot must not duplicate), create otherwise. */
   async ensureAuthConfig(): Promise<string> {
-    if (this.authConfigId) return this.authConfigId;
+    if (!this.cfg.token) throw new ComposioApiError(500, "executor is not configured");
+    return this.ensureApiKeyAuthConfig(EXECUTOR_TOOLKIT_SLUG, "Executor token", this.cfg.token);
+  }
+
+  /**
+   * An API-key auth config for a custom toolkit. The template key is only a
+   * placeholder for the config itself — each connected account carries its own
+   * key in its connection state, which is how BYOK toolkits stay per-person.
+   */
+  private async ensureApiKeyAuthConfig(slug: string, name: string, templateKey: string): Promise<string> {
+    const cached = this.authConfigIds.get(slug);
+    if (cached) return cached;
     const list = await this.request<ListEnvelope>(
       "GET",
-      `/api/v3.1/auth_configs?toolkit_slug=${encodeURIComponent(EXECUTOR_TOOLKIT_SLUG)}&limit=50`,
+      `/api/v3.1/auth_configs?toolkit_slug=${encodeURIComponent(slug)}&limit=50`,
     );
     const found = (list.items ?? []).find((item) => {
       const scheme = String(item["auth_scheme"] ?? item["authScheme"] ?? "");
@@ -130,40 +238,87 @@ export class ComposioPlatform {
     });
     const foundId = found ? String(found["id"] ?? "") : "";
     if (foundId) {
-      this.authConfigId = foundId;
+      this.authConfigIds.set(slug, foundId);
       return foundId;
     }
     const created = await this.request<Record<string, unknown>>("POST", "/api/v3.1/auth_configs", {
-      toolkit: { slug: EXECUTOR_TOOLKIT_SLUG },
+      toolkit: { slug },
       auth_config: {
         type: "use_custom_auth",
-        name: "Executor token",
+        name,
         authScheme: "API_KEY",
-        credentials: { generic_api_key: this.cfg.token },
+        credentials: { generic_api_key: templateKey },
         is_enabled_for_tool_router: true,
       },
     });
     const nested = created["auth_config"] as { id?: string } | undefined;
     const id = String(created["id"] ?? nested?.id ?? "");
     if (!id) throw new ComposioApiError(500, "auth config create returned no id");
-    this.authConfigId = id;
+    this.authConfigIds.set(slug, id);
     return id;
   }
 
   /**
-   * Connect one session user (an agent's Inkbox handle) to the executor. The
-   * connection carries the token as its state, so agent sessions resolve it by
-   * `user_id` without any pinning.
+   * A DCR OAuth auth config for a custom toolkit (Oxygen). No credentials: the
+   * person finishes the OAuth dance in their own browser via the Composio
+   * connect link, and the resulting connected account is theirs alone.
    */
-  async ensureAccount(userId: string, authConfigId?: string): Promise<string> {
-    const ac = authConfigId ?? (await this.ensureAuthConfig());
+  private async ensureDcrAuthConfig(slug: string, name: string): Promise<string> {
+    const cached = this.authConfigIds.get(slug);
+    if (cached) return cached;
+    const list = await this.request<ListEnvelope>(
+      "GET",
+      `/api/v3.1/auth_configs?toolkit_slug=${encodeURIComponent(slug)}&limit=50`,
+    );
+    const found = (list.items ?? []).find((item) => {
+      const scheme = String(item["auth_scheme"] ?? item["authScheme"] ?? "");
+      const managed = item["is_composio_managed"] ?? item["isComposioManaged"];
+      return scheme === "DCR_OAUTH" && managed !== true;
+    });
+    const foundId = found ? String(found["id"] ?? "") : "";
+    if (foundId) {
+      this.authConfigIds.set(slug, foundId);
+      return foundId;
+    }
+    const created = await this.request<Record<string, unknown>>("POST", "/api/v3.1/auth_configs", {
+      toolkit: { slug },
+      auth_config: {
+        type: "use_custom_auth",
+        name,
+        authScheme: "DCR_OAUTH",
+        is_enabled_for_tool_router: true,
+      },
+    });
+    const nested = created["auth_config"] as { id?: string } | undefined;
+    const id = String(created["id"] ?? nested?.id ?? "");
+    if (!id) throw new ComposioApiError(500, "auth config create returned no id");
+    this.authConfigIds.set(slug, id);
+    return id;
+  }
+
+  /** The Postiz toolkit's auth config, created lazily when the first person saves a key. */
+  private async postizAuthConfig(templateKey: string): Promise<string> {
+    return this.ensureApiKeyAuthConfig(POSTIZ_TOOLKIT_SLUG, "Postiz API key", templateKey);
+  }
+
+  /**
+   * Connect one session user (an agent's Inkbox handle) to a toolkit. The
+   * connection carries the key as its state, so agent sessions resolve it by
+   * `user_id` without any pinning. Default: the executor fleet token.
+   */
+  async ensureAccount(userId: string, opts: EnsureAccountOptions = {}): Promise<string> {
+    const toolkit = opts.toolkit ?? EXECUTOR_TOOLKIT_SLUG;
+    const apiKey = opts.apiKey ?? this.cfg.token;
+    if (!apiKey) throw new ComposioApiError(500, `${toolkit.toLowerCase()} is not configured`);
+    let ac = opts.authConfigId;
+    if (!ac) ac = toolkit === POSTIZ_TOOLKIT_SLUG ? await this.postizAuthConfig(apiKey) : await this.ensureApiKeyAuthConfig(toolkit, toolkit, apiKey);
     const created = await this.request<Record<string, unknown>>("POST", "/api/v3.1/connected_accounts", {
-      toolkit: EXECUTOR_TOOLKIT_SLUG,
+      toolkit,
       user_id: userId,
       auth_config: { id: ac },
       connection: {
         user_id: userId,
-        state: { authScheme: "API_KEY", val: { generic_api_key: this.cfg.token } },
+        state: { authScheme: "API_KEY", val: { generic_api_key: apiKey } },
       },
     });
     const nested = created["connected_account"] as { id?: string } | undefined;
@@ -171,7 +326,7 @@ export class ComposioPlatform {
     if (!id) throw new ComposioApiError(500, "connected account create returned no id");
     const status = typeof created["status"] === "string" ? created["status"] : "";
     if (status && status !== "ACTIVE") {
-      this.log.warn("composio.account_not_active", { userId, status });
+      this.log.warn("composio.account_not_active", { userId, toolkit, status });
     }
     return id;
   }

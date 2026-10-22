@@ -231,18 +231,30 @@ ${qr ? `<p class="hint" style="text-align:center;margin-top:22px">Or scan from a
   ${routerBlock}
 </div>
 <div class="card">
-  <b>Company brain</b>
+  <b>Connections</b>
   ${
     user.brainRepo
-      ? `<p class="hint">Saved: <code>${escapeHtml(user.brainRepo)}</code>${user.brainToken ? " (private)" : ""}. Its files are pushed into your Instinct's machine.</p>`
+      ? `<p class="hint">Brain saved: <code>${escapeHtml(user.brainRepo)}</code>${user.brainToken ? " (private)" : ""}. Its files are pushed into your Instinct's machine.</p>`
       : `<p class="hint">Hand your Instinct a GitHub repo (public or private) — your handbook, notes or code — and it reads the files at setup.</p>`
+  }
+  ${
+    user.postizKey
+      ? `<p class="hint">Postiz key saved. Your agent can schedule and publish through your Postiz account.</p>`
+      : `<p class="hint">Paste a Postiz public-API key so your agent can schedule and publish through your Postiz account.</p>`
   }
   <form method="post" action="/connect/${encodeURIComponent(user.id)}">
     <label for="brainRepo">Repo <small>owner/repo or a github.com URL; empty saves nothing</small></label>
     <input id="brainRepo" name="brainRepo" placeholder="acme/handbook" autocapitalize="off" autocorrect="off" spellcheck="false" value="${escapeHtml(user.brainRepo ?? "")}">
     <label for="brainToken">GitHub token <small>private repos only; leave empty to keep the saved one</small></label>
     <input id="brainToken" name="brainToken" type="password" autocomplete="off" value="">
-    <button class="btn" type="submit">Save brain</button>
+    <label for="postizKey">Postiz API key <small>public API key; leave empty to keep the saved one</small></label>
+    <input id="postizKey" name="postizKey" type="password" autocomplete="off" value="">
+    ${
+      user.postizKey
+        ? `<label class="hint" style="display:block;margin:10px 0 0"><input type="checkbox" name="postizClear" value="on"> Remove the saved Postiz key</label>`
+        : ""
+    }
+    <button class="btn" type="submit">Save connections</button>
   </form>
 </div>
 <h2>What happens next</h2>

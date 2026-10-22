@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { ComposioApiError, ComposioPlatform, EXECUTOR_TOOLKIT_SLUG } from "../src/composio.js";
+import {
+  ComposioApiError,
+  ComposioPlatform,
+  EXECUTOR_TOOLKIT_SLUG,
+  OXYGEN_DISCOVERY_URL,
+  OXYGEN_MCP_URL,
+  OXYGEN_TOOLKIT_SLUG,
+  POSTIZ_TOOLKIT_SLUG,
+} from "../src/composio.js";
 
 interface Call {
   method: string;
@@ -20,7 +28,8 @@ function mockFetch(responder: (method: string, path: string, body?: unknown) => 
   return { calls, fetchImpl };
 }
 
-const cfg = { apiKey: "ak_test", appUrl: "https://executor.example/mcp", token: "tok_secret" };
+// Executor-focused fixture: oxygen off so the boot-order assertions see only the executor calls.
+const cfg = { apiKey: "ak_test", appUrl: "https://executor.example/mcp", token: "tok_secret", oxygen: false };
 
 function bootResponder(): (method: string, path: string, body?: unknown) => Response {
   return (method, path) => {
@@ -116,5 +125,90 @@ describe("ComposioPlatform", () => {
     });
     await expect(platform.ensureToolkit()).rejects.toMatchObject({ name: "ComposioApiError", status: 403 });
     await expect(platform.ensureToolkit()).rejects.toBeInstanceOf(ComposioApiError);
+  });
+
+  it("boots oxygen by default: DCR toolkit upsert + DCR auth config, no bootstrap account", async () => {
+    const { calls, fetchImpl } = mockFetch((method, path) => {
+      if (method === "POST" && path.includes("/custom/toolkits/upsert")) return Response.json({ slug: OXYGEN_TOOLKIT_SLUG });
+      if (method === "GET" && path.startsWith("/api/v3.1/auth_configs")) return Response.json({ items: [] });
+      if (method === "POST" && path === "/api/v3.1/auth_configs") return Response.json({ id: "ac_o1" });
+      return Response.json({ detail: "not found" }, { status: 404 });
+    });
+    const platform = new ComposioPlatform({ apiKey: "ak_test", oxygen: true }, { fetchImpl });
+    await platform.ensureBoot();
+
+    expect(platform.oxygenReady).toBe(true);
+    expect(platform.executorReady).toBe(false);
+    const upsert = calls.find((c) => c.method === "POST" && c.path.includes("/custom/toolkits/upsert"))?.body as Record<string, any>;
+    expect(upsert["slug"]).toBe(OXYGEN_TOOLKIT_SLUG);
+    expect(upsert["toolkit_config"]["app_url"]).toBe(OXYGEN_MCP_URL);
+    expect(upsert["toolkit_config"]["auth_schemes"][0]).toMatchObject({ mode: "DCR_OAUTH", discovery_url: OXYGEN_DISCOVERY_URL });
+
+    const auth = calls.find((c) => c.method === "POST" && c.path === "/api/v3.1/auth_configs")?.body as Record<string, any>;
+    expect(auth["auth_config"]["authScheme"]).toBe("DCR_OAUTH");
+    expect(auth["auth_config"]["credentials"]).toBeUndefined();
+    // DCR OAuth has no bootstrap account: each person connects in their own browser.
+    expect(calls.some((c) => c.method === "POST" && c.path === "/api/v3.1/connected_accounts")).toBe(false);
+  });
+
+  it("boots postiz when a wrapper URL is configured: API_KEY toolkit upsert, no sync without an account", async () => {
+    const { calls, fetchImpl } = mockFetch((method, path) => {
+      if (method === "POST" && path.includes("/custom/toolkits/upsert")) return Response.json({ slug: POSTIZ_TOOLKIT_SLUG });
+      if (method === "GET" && path.startsWith("/api/v3.1/auth_configs")) return Response.json({ items: [] });
+      if (method === "POST" && path === "/api/v3.1/auth_configs") return Response.json({ id: "ac_p1" });
+      return Response.json({ detail: "not found" }, { status: 404 });
+    });
+    const platform = new ComposioPlatform(
+      { apiKey: "ak_test", oxygen: false, postizAppUrl: "https://postiz-mcp.example/mcp" },
+      { fetchImpl },
+    );
+    await platform.ensureBoot();
+
+    expect(platform.postizReady).toBe(true);
+    const upsert = calls.find((c) => c.method === "POST" && c.path.includes("/custom/toolkits/upsert"))?.body as Record<string, any>;
+    expect(upsert["slug"]).toBe(POSTIZ_TOOLKIT_SLUG);
+    expect(upsert["toolkit_config"]["app_url"]).toBe("https://postiz-mcp.example/mcp");
+    expect(upsert["toolkit_config"]["auth_schemes"][0]["mode"]).toBe("API_KEY");
+    expect(calls.some((c) => c.path.includes("/custom/toolkits/sync"))).toBe(false);
+  });
+
+  it("a failing executor does not stop the oxygen boot (and vice versa)", async () => {
+    const { fetchImpl } = mockFetch((method, path) => {
+      if (method === "POST" && path.includes("/custom/toolkits/upsert")) return Response.json({ slug: "OK" });
+      if (method === "GET" && path.startsWith("/api/v3.1/auth_configs")) return Response.json({ items: [] });
+      if (method === "POST" && path === "/api/v3.1/auth_configs") return Response.json({ id: "ac_1" });
+      if (method === "POST" && path === "/api/v3.1/connected_accounts") return Response.json({ id: "ca_1", status: "ACTIVE" });
+      if (method === "POST" && path.includes("/custom/toolkits/sync")) return Response.json({ synced_count: 1 });
+      return Response.json({ detail: "not found" }, { status: 404 });
+    });
+    // Executor upsert fails (403), oxygen upsert succeeds.
+    const failingExecutor = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (init?.method === "POST" && url.pathname.includes("/custom/toolkits/upsert") && String(init.body).includes(EXECUTOR_TOOLKIT_SLUG)) {
+        return Response.json({ detail: "forbidden" }, { status: 403 });
+      }
+      return fetchImpl(input, init);
+    }) as typeof fetch;
+    const platform = new ComposioPlatform({ apiKey: "ak_test", appUrl: "https://executor.example/mcp", token: "tok" }, { fetchImpl: failingExecutor });
+    await platform.ensureBoot();
+    expect(platform.executorReady).toBe(false);
+    expect(platform.oxygenReady).toBe(true);
+    expect(platform.anyReady).toBe(true);
+  });
+
+  it("creates a per-user Postiz account carrying the person's own key", async () => {
+    const { calls, fetchImpl } = mockFetch((method, path) => {
+      if (method === "GET" && path.startsWith("/api/v3.1/auth_configs")) return Response.json({ items: [] });
+      if (method === "POST" && path === "/api/v3.1/auth_configs") return Response.json({ id: "ac_p1" });
+      if (method === "POST" && path === "/api/v3.1/connected_accounts") return Response.json({ id: "pca_1", status: "ACTIVE" });
+      return Response.json({ detail: "not found" }, { status: 404 });
+    });
+    const platform = new ComposioPlatform({ apiKey: "ak_test", oxygen: false, postizAppUrl: "https://postiz-mcp.example/mcp" }, { fetchImpl });
+    const id = await platform.ensureAccount("maria", { toolkit: POSTIZ_TOOLKIT_SLUG, apiKey: "pk_abcdefgh" });
+    expect(id).toBe("pca_1");
+    const ca = calls.find((c) => c.method === "POST" && c.path === "/api/v3.1/connected_accounts")?.body as Record<string, any>;
+    expect(ca["toolkit"]).toBe(POSTIZ_TOOLKIT_SLUG);
+    expect(ca["user_id"]).toBe("maria");
+    expect(ca["connection"]["state"]["val"]["generic_api_key"]).toBe("pk_abcdefgh");
   });
 });

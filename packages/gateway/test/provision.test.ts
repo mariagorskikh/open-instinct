@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InkboxProvisioner } from "@open-instinct/inkbox";
-import { DEFAULT_MARITIME_LLM_MODEL, MARITIME_AGENT_PORT, agentEnvFor, effectiveToolkits, executorRequested, linkRedirectUriFor, maritimeCreateBody, provisionUser, webhookUrlFor } from "../src/provision.js";
+import { DEFAULT_MARITIME_LLM_MODEL, MARITIME_AGENT_PORT, agentEnvFor, effectiveToolkits, executorRequested, linkRedirectUriFor, maritimeCreateBody, provisionUser, syncAgentEnv, webhookUrlFor } from "../src/provision.js";
 import type { ComposioPlatform } from "../src/composio.js";
 import { UserStore } from "../src/store.js";
 import { loadTemplateRegistry } from "../src/templates.js";
@@ -104,7 +104,8 @@ describe("provisionUser", () => {
     expect(byKey["ANTHROPIC_API_KEY"]).toMatchObject({ isSecret: true });
     expect(byKey["COMPOSIO_API_KEY"]).toMatchObject({ isSecret: true });
     // Without COMPOSIO_TOOLKITS core keeps apps disabled, so the key alone would be useless.
-    expect(byKey["COMPOSIO_TOOLKITS"]).toEqual({ key: "COMPOSIO_TOOLKITS", value: "gmail,googlecalendar,googlecontacts", isSecret: false });
+    // No platform here, so the gateway-managed custom_oxygen is stripped from the default.
+    expect(byKey["COMPOSIO_TOOLKITS"]).toEqual({ key: "COMPOSIO_TOOLKITS", value: "gmail,googlecalendar,googlecontacts,linear", isSecret: false });
     expect(byKey["INSTINCT_COMPUTER"]?.value).toBe("auto");
     expect(byKey["INSTINCT_MODEL"]).toMatchObject({ isSecret: false });
     expect(byKey["EXTRA_TOKEN"]).toMatchObject({ isSecret: true });
@@ -255,7 +256,8 @@ describe("templates in provisioning", () => {
     expect(byKey["INSTINCT_INSTRUCTIONS"]).toContain("explicit approval");
     // The template's model wins over the fleet maritime-llm model.
     expect(byKey["INSTINCT_MODEL"]).toBe("openai-compatible/gpt-5.4");
-    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar");
+    // No composio platform here: the gateway-managed custom toolkits are stripped, linear stays.
+    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,linear");
   });
 
   it("default template provisions desktop-less with TEMPLATE_ID but no persona", async () => {
@@ -312,30 +314,82 @@ describe("executor wiring", () => {
   it("computes the effective toolkit list and detects an executor request", () => {
     const gtm = shipped.resolve("gtm-ai");
     expect(executorRequested({ template: gtm })).toBe(true);
-    expect(effectiveToolkits({ template: gtm })).toBe("gmail,googlecalendar,custom_executor");
+    expect(effectiveToolkits({ template: gtm })).toBe("gmail,googlecalendar,custom_executor,linear,custom_oxygen");
     expect(executorRequested({ template: shipped.resolve("default") })).toBe(false);
     expect(executorRequested({ composioToolkits: "custom_executor,gmail" })).toBe(true);
     expect(executorRequested({ composioToolkits: "gmail,googlecalendar" })).toBe(false);
     expect(effectiveToolkits({ composioToolkits: "gmail, slack" })).toBe("gmail, slack");
-    expect(effectiveToolkits({})).toBe("gmail,googlecalendar,googlecontacts");
+    expect(effectiveToolkits({})).toBe("gmail,googlecalendar,googlecontacts,linear,custom_oxygen");
   });
 
-  it("strips custom_executor from the agent env when no composio platform is configured", async () => {
+  it("strips gateway-managed toolkits that never booted from the agent env", async () => {
     const d = deps();
     await provisionUser(input, { ...d.deps, template: shipped.resolve("gtm-ai") });
     const body = d.mar.calls.find((c) => c.method === "POST" && c.url.endsWith("/api/agents"))?.body as Record<string, unknown>;
     const byKey = Object.fromEntries((body["initialEnvVars"] as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
-    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar");
+    // custom_executor and custom_oxygen need gateway boot state; linear is Composio-managed and stays.
+    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,linear");
     expect(byKey["COMPOSIO_MODE"]).toBe("router");
   });
 
-  it("keeps custom_executor when the composio platform is present", async () => {
+  it("keeps gateway-managed toolkits when the matching boot flags are on", async () => {
     const d = deps();
-    const composio = {} as unknown as ComposioPlatform;
+    const composio = { executorReady: true, oxygenReady: true, postizReady: false } as unknown as ComposioPlatform;
     await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai") });
     const body = d.mar.calls.find((c) => c.method === "POST" && c.url.endsWith("/api/agents"))?.body as Record<string, unknown>;
     const byKey = Object.fromEntries((body["initialEnvVars"] as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
-    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,custom_executor");
+    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,custom_executor,linear,custom_oxygen");
+  });
+
+  it("adds custom_postiz to the toolkit list only when the person saved a key", async () => {
+    const d = deps();
+    const composio = { executorReady: true, oxygenReady: true, postizReady: true } as unknown as ComposioPlatform;
+
+    // Saved key: the toolkit joins the list even though no template mentions it.
+    const withKey = agentEnvFor(readyUser({ postizKey: "pk_abcdefgh" }), {
+      composioApiKey: "cmp",
+      composio,
+      template: shipped.resolve("gtm-ai"),
+      maritime: { apiKey: "k", agentImage: "img" },
+    });
+    const withKeyList = withKey.find((e) => e.key === "COMPOSIO_TOOLKITS")?.value ?? "";
+    expect(withKeyList.split(",")).toContain("custom_postiz");
+
+    // No key: the toolkit stays out, and a template listing it would be stripped.
+    const withoutKey = agentEnvFor(readyUser(), {
+      composioApiKey: "cmp",
+      composio,
+      template: shipped.resolve("gtm-ai"),
+      maritime: { apiKey: "k", agentImage: "img" },
+    });
+    expect(withoutKey.find((e) => e.key === "COMPOSIO_TOOLKITS")?.value).not.toContain("custom_postiz");
+
+    // Wrapper down: a saved key must not leave a dead toolkit in the list.
+    const wrapperDown = agentEnvFor(readyUser({ postizKey: "pk_abcdefgh" }), {
+      composioApiKey: "cmp",
+      composio: { ...composio, postizReady: false } as unknown as ComposioPlatform,
+      template: shipped.resolve("gtm-ai"),
+      maritime: { apiKey: "k", agentImage: "img" },
+    });
+    expect(wrapperDown.find((e) => e.key === "COMPOSIO_TOOLKITS")?.value).not.toContain("custom_postiz");
+  });
+
+  it("rewrites the toolkit list when a drop and the postiz add cancel out numerically", () => {
+    // One dead toolkit out (oxygen) and one BYOK toolkit in (postiz): equal
+    // counts, different contents — a length-based guard would keep the stale
+    // base string and leave agents with dead custom_oxygen and no custom_postiz.
+    const composio = { executorReady: true, oxygenReady: false, postizReady: true } as unknown as ComposioPlatform;
+    const env = agentEnvFor(readyUser({ postizKey: "pk_abcdefgh" }), {
+      composioApiKey: "cmp",
+      composio,
+      composioToolkits: "gmail,googlecalendar,custom_executor,linear,custom_oxygen",
+      template: shipped.resolve("gtm-ai"),
+      maritime: { apiKey: "k", agentImage: "img" },
+    });
+    const list = env.find((e) => e.key === "COMPOSIO_TOOLKITS")?.value ?? "";
+    expect(list.split(",")).toContain("custom_postiz");
+    expect(list.split(",")).not.toContain("custom_oxygen");
+    expect(list.split(",")).toContain("custom_executor");
   });
 
   it("connects an executor account under the handle, reuses it while active, replaces it when dead", async () => {
@@ -343,6 +397,7 @@ describe("executor wiring", () => {
     const created: string[] = [];
     const live = { value: true };
     const composio = {
+      executorReady: true,
       accountActive: async () => live.value,
       ensureAccount: async (handle: string) => {
         created.push(handle);
@@ -372,6 +427,7 @@ describe("executor wiring", () => {
   it("a composio failure never fails provisioning", async () => {
     const d = deps();
     const composio = {
+      executorReady: true,
       accountActive: async () => false,
       ensureAccount: async () => {
         throw new Error("composio down");
@@ -380,6 +436,42 @@ describe("executor wiring", () => {
     const user = await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai") });
     expect(user.status).toBe("ready");
     expect(user.composioAccountId).toBeUndefined();
+  });
+
+  it("mints a Postiz connected account from the saved BYOK key, reusing it while active", async () => {
+    const d = deps();
+    const created: Array<{ handle: string; opts: { toolkit?: string; apiKey?: string } }> = [];
+    const live = { value: true };
+    const composio = {
+      postizReady: true,
+      accountActive: async () => live.value,
+      ensureAccount: async (handle: string, opts: { toolkit?: string; apiKey?: string } = {}) => {
+        created.push({ handle, opts });
+        return `pca_${created.length}`;
+      },
+    } as unknown as ComposioPlatform;
+    d.store.save({ ...readyUser(), status: "provisioning", postizKey: "pk_abcdefgh" });
+
+    const user = await provisionUser(input, { ...d.deps, composio, userId: "usr_test", template: shipped.resolve("gtm-ai") });
+    expect(created).toEqual([{ handle: "maria", opts: { toolkit: "CUSTOM_POSTIZ", apiKey: "pk_abcdefgh" } }]);
+    expect(user.postizComposioAccountId).toBe("pca_1");
+
+    // Stored id still active: the next run reuses it, no second account.
+    d.store.save({ ...user, status: "provisioning" });
+    const again = await provisionUser(input, { ...d.deps, composio, userId: "usr_test", template: shipped.resolve("gtm-ai") });
+    expect(again.postizComposioAccountId).toBe("pca_1");
+    expect(created).toHaveLength(1);
+  });
+
+  it("skips the Postiz account when the person saved no key", async () => {
+    const d = deps();
+    const ensureAccount = async (): Promise<string> => {
+      throw new Error("must not be called");
+    };
+    const composio = { postizReady: true, accountActive: async () => true, ensureAccount } as unknown as ComposioPlatform;
+    const user = await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai") });
+    expect(user.status).toBe("ready");
+    expect(user.postizComposioAccountId).toBeUndefined();
   });
 
   it("pushes the person's brain repo into the agent's files", async () => {
@@ -421,5 +513,59 @@ describe("executor wiring", () => {
       { ...d.deps, fetchImpl, template: shipped.resolve("gtm-ai") },
     );
     expect(user.status).toBe("ready");
+  });
+});
+
+describe("syncAgentEnv", () => {
+  const ready = readyUser({ templateId: "gtm-ai" });
+  const template = shipped.resolve("gtm-ai");
+
+  it("pushes only the keys that differ and leaves matching ones alone", async () => {
+    const d = deps();
+    // The agent already has PORT and COMPOSIO_TOOLKITS, but the toolkit list is stale.
+    d.mar.env[ready.maritimeAgentId!] = [
+      { key: "PORT", value: String(MARITIME_AGENT_PORT) },
+      { key: "COMPOSIO_TOOLKITS", value: "gmail,googlecalendar" },
+    ];
+    const result = await syncAgentEnv(ready, { ...d.deps, template });
+    // Every expected key that is missing or different got pushed.
+    expect(result.synced).toBeGreaterThan(0);
+    const envCalls = d.mar.calls.filter((c) => c.url.endsWith("/env") && c.method === "POST");
+    const pushedKeys = envCalls.map((c) => (c.body as { key: string }).key);
+    expect(pushedKeys).toContain("COMPOSIO_TOOLKITS");
+    expect(pushedKeys).not.toContain("PORT"); // already matches, not re-pushed
+    // With no composio platform in deps, gateway-managed toolkits (executor,
+    // oxygen) are stripped by the flag-based strip — only Composio-managed ones
+    // (gmail, calendar, linear) survive. Working as designed, not a sync bug.
+    const toolkits = d.mar.env[ready.maritimeAgentId!].find((r) => r.key === "COMPOSIO_TOOLKITS");
+    expect(toolkits?.value).toBe("gmail,googlecalendar,linear");
+  });
+
+  it("re-pushes a secret even when Maritime already has one (masked value is untrustworthy)", async () => {
+    const d = deps();
+    d.mar.env[ready.maritimeAgentId!] = [
+      { key: "ANTHROPIC_API_KEY", value: "****old1", isSecret: true },
+      { key: "PORT", value: String(MARITIME_AGENT_PORT) },
+    ];
+    await syncAgentEnv(ready, { ...d.deps, template });
+    const secretPush = d.mar.calls.find((c) => c.url.endsWith("/env") && c.method === "POST" && (c.body as { key: string }).key === "ANTHROPIC_API_KEY");
+    expect(secretPush).toBeDefined();
+    expect((secretPush!.body as { value: string }).value).toBe("sk-ant");
+    // Non-secret PORT still matches and is not re-pushed.
+    expect(d.mar.calls.filter((c) => c.method === "POST" && (c.body as { key: string }).key === "PORT")).toHaveLength(0);
+  });
+
+  it("provisionUser re-syncs a ready agent's env without recreating the agent", async () => {
+    const d = deps();
+    d.store.save(ready);
+    d.mar.env[ready.maritimeAgentId!] = [{ key: "COMPOSIO_TOOLKITS", value: "gmail,googlecalendar" }];
+    await provisionUser({ ...input, handle: ready.handle }, { ...d.deps, template, userId: ready.id });
+    // The fire-and-forget sync resolves on the microtask queue; let it land.
+    await new Promise((r) => setTimeout(r, 0));
+    const envPush = d.mar.calls.find((c) => c.url.endsWith("/env") && c.method === "POST" && (c.body as { key: string }).key === "COMPOSIO_TOOLKITS");
+    expect(envPush).toBeDefined();
+    // No agent-create or identity call went out — nothing was recreated.
+    expect(d.mar.calls.some((c) => c.url.endsWith("/api/agents") && c.method === "POST")).toBe(false);
+    expect(d.ink.calls).toEqual([]);
   });
 });

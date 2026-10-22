@@ -1,8 +1,10 @@
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { decodeEvent } from "@open-instinct/core";
+import type { ComposioPlatform } from "../src/composio.js";
 import { silentLogger } from "../src/logger.js";
 import type { RouterInfo } from "../src/pages.js";
+import { MARITIME_AGENT_PORT } from "../src/provision.js";
 import { type GatewayOptions, createGateway } from "../src/server.js";
 import { type UserRecord, UserStore } from "../src/store.js";
 import { fakeInkbox, fakeMaritime, imessageEvent, readyUser, signHeaders, tempDir } from "./helpers.js";
@@ -24,6 +26,7 @@ interface BootOpts {
   now?: () => number;
   adminToken?: string;
   githubToken?: string;
+  composio?: ComposioPlatform;
 }
 
 async function boot(opts: BootOpts = {}) {
@@ -47,6 +50,7 @@ async function boot(opts: BootOpts = {}) {
     now: opts.now,
     adminToken: opts.adminToken,
     githubToken: opts.githubToken,
+    composio: opts.composio,
   });
   servers.push(server);
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
@@ -163,35 +167,38 @@ describe("gateway http", () => {
     expect(good.headers.get("location")).toMatch(/^\/connect\/usr_/);
   });
 
-  it("answers a repeat phone with a neutral response and never reveals the existing record", async () => {
+  it("gives a repeat phone a brand-new agent and never reveals the existing record", async () => {
     const notified: string[] = [];
     const { base, store } = await boot({ notifyExisting: async (u, url) => void notified.push(`${u.id} ${url}`) });
-    store.save(readyUser({ id: "usr_a", name: "Maria Secret", handle: "maria", phone: "+14155550123" }));
+    store.save(readyUser({ id: "usr_seedmaria", name: "Maria Secret", handle: "maria", phone: "+14155550123" }));
 
     const samePhone = await signup(base, { name: "x", phone: "+14155550123", handle: "zzz-random" });
     expect(samePhone.status).toBe(202);
     const body = (await samePhone.json()) as Record<string, unknown>;
-    expect(body).toEqual({ status: "pending" });
-    expect(JSON.stringify(body)).not.toContain("usr_a");
+    // The caller learns only about the record just created for them.
+    expect(body).toMatchObject({ status: "provisioning", templateId: "default" });
+    expect(String(body.userId)).toMatch(/^usr_/);
+    expect(body.userId).not.toBe("usr_seedmaria");
+    expect(String(body.connectUrl)).toContain(String(body.userId));
+    expect(JSON.stringify(body)).not.toContain("usr_seedmaria");
+    expect(JSON.stringify(body)).not.toContain("Maria Secret");
 
     const asHtml = await fetch(`${base}/api/signup`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
-      body: new URLSearchParams({ name: "x", phone: "+14155550123", handle: "zzz-random" }).toString(),
+      body: new URLSearchParams({ name: "x", phone: "+14155550123", handle: "zzz-two" }).toString(),
       redirect: "manual",
     });
-    expect(asHtml.status).toBe(202);
-    const page = await asHtml.text();
-    expect(page).toContain("Check your phone");
-    expect(page).toContain("connect @zzz-random");
-    expect(page).not.toContain("usr_a");
-    expect(page).not.toContain("Maria Secret");
-    expect(page).not.toContain("@maria<");
+    expect(asHtml.status).toBe(303);
+    const location = asHtml.headers.get("location") ?? "";
+    expect(location).toMatch(/^\/connect\/usr_/);
+    expect(location).not.toContain("usr_seedmaria");
 
-    // The existing person can still be reached out of band.
-    expect(notified).toEqual(["usr_a https://gw.example.com/connect/usr_a", "usr_a https://gw.example.com/connect/usr_a"]);
-    // No second record was created.
-    expect(store.all()).toHaveLength(1);
+    // The existing record is untouched, and a fresh agent earns no reuse notice.
+    expect(notified).toEqual([]);
+    expect(store.all()).toHaveLength(3);
+    expect(store.byHandle("maria")?.id).toBe("usr_seedmaria");
+    expect(store.byHandle("zzz-random")?.phone).toBe("+14155550123");
   });
 
   it("hides handle conflicts behind a generic error unless an invite code gates the form", async () => {
@@ -213,16 +220,31 @@ describe("gateway http", () => {
     const { base, store, ink } = await boot({ seed: [stuck] });
     const retry = await signup(base, { name: "Maria", phone: "+14155550123", handle: "maria" });
     expect(retry.status).toBe(202);
-    expect(await retry.json()).toEqual({ status: "pending" });
+    const retryBody = (await retry.json()) as Record<string, unknown>;
+    expect(retryBody).toMatchObject({ status: "pending", userId: "usr_stuck", handle: "maria" });
+    expect(String(retryBody.connectUrl)).toContain("usr_stuck");
     await waitFor(() => store.get("usr_stuck")?.status === "ready");
     expect(ink.calls[0]).toBe("provisionIdentity");
     expect(store.all()).toHaveLength(1);
 
-    // A ready record is left alone.
+    // A ready record is left alone — the JSON reply still identifies the caller's own agent.
     const again = await signup(base, { name: "Maria", phone: "+14155550123", handle: "maria" });
     expect(again.status).toBe(202);
+    expect((await again.json()) as Record<string, unknown>).toMatchObject({ status: "pending", userId: "usr_stuck" });
     await new Promise((r) => setTimeout(r, 30));
     expect(ink.calls.filter((c) => c === "provisionIdentity")).toHaveLength(1);
+
+    // The HTML path for the same record still renders the pending page.
+    const htmlRetry = await fetch(`${base}/api/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
+      body: new URLSearchParams({ name: "Maria", phone: "+14155550123", handle: "maria" }).toString(),
+      redirect: "manual",
+    });
+    expect(htmlRetry.status).toBe(202);
+    const page = await htmlRetry.text();
+    expect(page).toContain("Check your phone");
+    expect(page).toContain("connect @maria");
   });
 
   it("resumePending restarts every record a crash left in provisioning", async () => {
@@ -497,6 +519,45 @@ describe("admin desktop api", () => {
   });
 });
 
+describe("admin reprovision api", () => {
+  function repro(base: string, token: string | undefined, userId: string) {
+    return fetch(`${base}/api/admin/reprovision/${userId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    });
+  }
+
+  it("answers 503 while the admin token is not configured", async () => {
+    const { base } = await boot({ seed: [readyUser()] });
+    expect((await repro(base, "whatever", "usr_test")).status).toBe(503);
+  });
+
+  it("rejects a bad bearer token with 401 before touching anything", async () => {
+    const { base, mar } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    expect((await repro(base, "wrong", "usr_test")).status).toBe(401);
+    expect(mar.calls).toHaveLength(0);
+  });
+
+  it("404s an unknown user and 409s an agent that is not provisioned", async () => {
+    const { base } = await boot({ seed: [readyUser({ maritimeAgentId: undefined })], adminToken: "adm_secret" });
+    expect((await repro(base, "adm_secret", "usr_missing")).status).toBe(404);
+    expect((await repro(base, "adm_secret", "usr_test")).status).toBe(409);
+  });
+
+  it("recomputes env and pushes the delta without recreating the agent", async () => {
+    const { base, mar } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    mar.env["agt_42"] = [{ key: "PORT", value: String(MARITIME_AGENT_PORT) }];
+    const res = await repro(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.synced).toBeGreaterThan(0);
+    // It pushed env, never a create/identity call.
+    expect(mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/env"))).toBe(true);
+    expect(mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/api/agents"))).toBe(false);
+  });
+});
+
 describe("connect brain form", () => {
   function saveBrain(base: string, userId: string, fields: Record<string, string>) {
     return fetch(`${base}/connect/${userId}`, {
@@ -543,8 +604,56 @@ describe("connect brain form", () => {
       body: JSON.stringify({ brainRepo: "acme/handbook" }),
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, hasBrain: true });
+    expect(await res.json()).toEqual({ ok: true, hasBrain: true, hasPostizKey: false });
     expect(store.get("usr_test")?.brainRepo).toBe("acme/handbook");
+  });
+
+  it("saves a Postiz key, keeps it on empty, and clears it via the checkbox", async () => {
+    const { base, store } = await boot({ seed: [readyUser()] });
+    const id = "usr_test";
+
+    const saved = await saveBrain(base, id, { brainRepo: "acme/handbook", postizKey: "pk_abcdefgh1234" });
+    expect(saved.status).toBe(303);
+    expect(store.get(id)?.postizKey).toBe("pk_abcdefgh1234");
+
+    // The key is a secret: never on the page, never in the JSON.
+    const page = await (await fetch(`${base}/connect/${id}`)).text();
+    expect(page).toContain("Postiz key saved");
+    expect(page).not.toContain("pk_abcdefgh1234");
+    expect(page).toContain('name="postizClear"');
+
+    // Re-saving the brain with an empty Postiz box must not lose the key.
+    const kept = await saveBrain(base, id, { brainRepo: "acme/handbook" });
+    expect(kept.status).toBe(303);
+    expect(store.get(id)?.postizKey).toBe("pk_abcdefgh1234");
+
+    const cleared = await saveBrain(base, id, { brainRepo: "acme/handbook", postizClear: "on" });
+    expect(cleared.status).toBe(303);
+    expect(store.get(id)?.postizKey).toBeUndefined();
+  });
+
+  it("rejects an invalid Postiz key without touching the saved one", async () => {
+    const { base, store } = await boot({ seed: [readyUser({ postizKey: "pk_abcdefgh" })] });
+    const invalid = await saveBrain(base, "usr_test", { brainRepo: "acme/handbook", postizKey: "short" });
+    expect(invalid.status).toBe(400);
+    expect(store.get("usr_test")?.postizKey).toBe("pk_abcdefgh");
+  });
+
+  it("mints a Postiz connected account in the background when the key is saved", async () => {
+    const minted: Array<{ handle: string; toolkit?: string }> = [];
+    const composio = {
+      postizReady: true,
+      ensureAccount: async (handle: string, opts: { toolkit?: string } = {}) => {
+        minted.push({ handle, toolkit: opts.toolkit });
+        return "pca_1";
+      },
+    } as unknown as ComposioPlatform;
+    const { base, store } = await boot({ seed: [readyUser()], composio });
+    const res = await saveBrain(base, "usr_test", { brainRepo: "", postizKey: "pk_abcdefgh1234" });
+    expect(res.status).toBe(303);
+    await waitFor(() => minted.length === 1);
+    expect(minted[0]).toMatchObject({ handle: "maria", toolkit: "CUSTOM_POSTIZ" });
+    expect(store.get("usr_test")?.postizComposioAccountId).toBe("pca_1");
   });
 
   it("404s an unknown connect id", async () => {

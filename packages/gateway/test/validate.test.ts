@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeHandle, normalizePhone, parseBrainUpdate, secretMatches, validateSignup } from "../src/validate.js";
+import { normalizeHandle, normalizePhone, parseBrainUpdate, parsePostizKeyUpdate, secretMatches, validateSignup } from "../src/validate.js";
 
 describe("validateSignup", () => {
   it("normalizes and accepts a good signup", () => {
@@ -121,5 +121,34 @@ describe("parseBrainUpdate", () => {
     const token = parseBrainUpdate({ brainRepo: "acme/notes", brainToken: "no" });
     expect(token.ok).toBe(false);
     if (!token.ok) expect(token.errors["brainToken"]).toBeDefined();
+  });
+});
+
+describe("parsePostizKeyUpdate", () => {
+  it("reads an empty field as keep", () => {
+    expect(parsePostizKeyUpdate({})).toEqual({ ok: true, value: { clear: false } });
+    expect(parsePostizKeyUpdate({ postizKey: "" })).toEqual({ ok: true, value: { clear: false } });
+  });
+
+  it("takes a sane key", () => {
+    expect(parsePostizKeyUpdate({ postizKey: " pk_abcdefgh1234 " })).toEqual({ ok: true, value: { key: "pk_abcdefgh1234", clear: false } });
+  });
+
+  it("reads the clear checkbox, which wins over a pasted key", () => {
+    expect(parsePostizKeyUpdate({ postizClear: "on" })).toEqual({ ok: true, value: { clear: true } });
+    expect(parsePostizKeyUpdate({ postiz_clear: "1" })).toEqual({ ok: true, value: { clear: true } });
+    expect(parsePostizKeyUpdate({ postizKey: "pk_abcdefgh", postizClear: "on" })).toEqual({ ok: true, value: { clear: true } });
+  });
+
+  it("rejects a key that is too short, too long or contains whitespace", () => {
+    const short = parsePostizKeyUpdate({ postizKey: "short" });
+    expect(short.ok).toBe(false);
+    if (!short.ok) expect(short.errors["postizKey"]).toBeDefined();
+
+    const spaces = parsePostizKeyUpdate({ postizKey: "pk_abc defgh" });
+    expect(spaces.ok).toBe(false);
+
+    const long = parsePostizKeyUpdate({ postizKey: "k".repeat(201) });
+    expect(long.ok).toBe(false);
   });
 });

@@ -107,3 +107,28 @@ export function parseBrainUpdate(input: Record<string, unknown>): { ok: true; va
   if (!token) return { ok: false, errors: { brainToken: "That GitHub token does not look valid." } };
   return { ok: true, value: { repo, token } };
 }
+
+export interface PostizKeyUpdate {
+  /** New key when supplied; undefined keeps the saved one. */
+  key?: string;
+  /** True when the form asked to remove the saved key. Wins over a pasted key. */
+  clear: boolean;
+}
+
+/**
+ * The connect page's Postiz key field. Like the brain token: an empty box keeps
+ * whatever was saved (re-saving the brain must not drop the key), and a checkbox
+ * removes it. The key itself is never echoed back anywhere.
+ */
+export function parsePostizKeyUpdate(input: Record<string, unknown>): { ok: true; value: PostizKeyUpdate } | { ok: false; errors: Record<string, string> } {
+  const clearRaw = str(input["postizClear"] ?? input["postiz_clear"]);
+  const clear = /^(1|on|true|yes)$/i.test(clearRaw);
+  const keyRaw = str(input["postizKey"] ?? input["postiz_key"]);
+  if (!keyRaw) return { ok: true, value: { clear } };
+  if (clear) return { ok: true, value: { clear: true } };
+  const key = keyRaw.trim();
+  if (key.length < 8 || key.length > 200 || /\s/.test(key)) {
+    return { ok: false, errors: { postizKey: "That Postiz API key does not look valid." } };
+  }
+  return { ok: true, value: { key, clear: false } };
+}
