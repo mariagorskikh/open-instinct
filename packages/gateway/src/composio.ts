@@ -189,7 +189,10 @@ export class ComposioPlatform {
   }
 
   async ensureOxygenToolkit(): Promise<void> {
-    await this.ensureCustomToolkit(OXYGEN_TOOLKIT_SLUG, "Oxygen", OXYGEN_MCP_URL, [
+    // Same bare-name rule as Postiz: the upsert endpoint prefixes "CUSTOM_"
+    // itself, so sending OXYGEN_TOOLKIT_SLUG would register the unreachable
+    // "CUSTOM_CUSTOM_OXYGEN". Send the name; the toolkit lands as "custom_oxygen".
+    await this.ensureCustomToolkit(OXYGEN_TOOLKIT_SLUG.replace(/^CUSTOM_/i, ""), "Oxygen", OXYGEN_MCP_URL, [
       { mode: "DCR_OAUTH", discovery_url: OXYGEN_DISCOVERY_URL },
     ]);
   }
@@ -197,7 +200,13 @@ export class ComposioPlatform {
   async ensurePostizToolkit(): Promise<void> {
     const appUrl = this.cfg.postizAppUrl;
     if (!appUrl) throw new ComposioApiError(500, "postiz is not configured");
-    await this.ensureCustomToolkit(POSTIZ_TOOLKIT_SLUG, "Postiz", appUrl, [
+    // The upsert endpoint prefixes custom slugs with "CUSTOM_" itself: sending
+    // POSTIZ_TOOLKIT_SLUG ("CUSTOM_POSTIZ") would register "CUSTOM_CUSTOM_POSTIZ",
+    // which neither auth-config creation nor the agent's tool router can find.
+    // Send the bare name so the toolkit lands as "custom_postiz". (The executor
+    // and Oxygen upserts keep their prefixed slugs untouched: the executor lives
+    // on a pre-existing "custom_executor" toolkit that must not be re-upserted.)
+    await this.ensureCustomToolkit(POSTIZ_TOOLKIT_SLUG.replace(/^CUSTOM_/i, ""), "Postiz", appUrl, [
       { mode: "API_KEY", headers: { Authorization: "Bearer {{generic_api_key}}" } },
     ]);
   }
@@ -340,6 +349,43 @@ export class ComposioPlatform {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Start the per-person Oxygen OAuth dance through Composio's hosted connect
+   * link. DCR_OAUTH carries no shared credential: the person approves in their
+   * own browser (Clerk at the toolkit's issuer) and the resulting connected
+   * account is theirs alone. Returns the link to redirect the browser to and
+   * the account id created for it — still INITIATED until the person finishes.
+   * callbackUrl is where Composio sends the browser back, with
+   * `?connectedAccountId=…` appended.
+   */
+  async initiateOxygenLink(userId: string, callbackUrl: string): Promise<{ redirectUrl: string; accountId: string }> {
+    const authConfigId = await this.ensureDcrAuthConfig(OXYGEN_TOOLKIT_SLUG, "Oxygen");
+    const created = await this.request<Record<string, unknown>>("POST", "/api/v3.1/connected_accounts/link", {
+      auth_config_id: authConfigId,
+      user_id: userId,
+      callback_url: callbackUrl,
+    });
+    const redirectUrl = String(created["redirect_url"] ?? "");
+    const accountId = String(created["connected_account_id"] ?? "");
+    if (!redirectUrl || !accountId) throw new ComposioApiError(500, "oxygen link creation returned no redirect url");
+    this.log.info("composio.oxygen_link", { userId, accountId });
+    return { redirectUrl, accountId };
+  }
+
+  /**
+   * Full look at one connected account — the OAuth callback verifies status,
+   * owner and toolkit with this before promoting a pending account.
+   */
+  async connectedAccountInfo(id: string): Promise<{ status: string; userId: string; toolkit: string }> {
+    const acc = await this.request<Record<string, unknown>>("GET", `/api/v3.1/connected_accounts/${encodeURIComponent(id)}`);
+    const nested = acc["toolkit"];
+    return {
+      status: String(acc["status"] ?? ""),
+      userId: String(acc["user_id"] ?? ""),
+      toolkit: String((nested as { slug?: unknown })?.slug ?? nested ?? ""),
+    };
   }
 
   /** Re-fetch tool definitions from the executor MCP through the given account. */

@@ -222,7 +222,7 @@ Everything is in one directory. The CLI default is `./.instinct`. The server def
 
 Two rules worth knowing:
 
-- `config.json` wins over the environment after the first boot. Env seeds it; it does not override it later. To change the owner or the model, run `init` again or edit the file.
+- `config.json` wins over the environment after the first boot, with two env overrides that keep winning: `INSTINCT_MODEL` and `COMPOSIO_TOOLKITS`. Env otherwise only seeds the file. To change the owner or the model, run `init` again or edit the file.
 - Memory is Markdown. You can open `memory/MEMORY.md` and read or fix it by hand.
 
 ## Backups
@@ -323,7 +323,7 @@ The tunnel does not change any of this. It carries signed webhooks only and neve
 
 ## Environment variables
 
-Every variable below is read by the server or the CLI. `deploy/.env.example` lists them with comments. `config.json` wins over most of them after the first boot.
+Every variable below is read by the server or the CLI. `deploy/.env.example` lists them with comments. `config.json` wins over most of them after the first boot — except `INSTINCT_MODEL` and `COMPOSIO_TOOLKITS`, which win from env on every load.
 
 | Variable | Read by | Meaning |
 |---|---|---|

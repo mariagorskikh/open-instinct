@@ -33,6 +33,7 @@ COPY packages/network/package.json packages/network/
 COPY packages/payments/package.json packages/payments/
 COPY packages/ample/package.json packages/ample/
 COPY packages/atomicmail/package.json packages/atomicmail/
+COPY packages/postiz-mcp/package.json packages/postiz-mcp/
 COPY packages/server/package.json packages/server/
 COPY packages/gateway/package.json packages/gateway/
 COPY packages/cli/package.json packages/cli/

@@ -199,14 +199,17 @@ export function agentEnvFor(user: UserRecord, deps: AgentEnvDeps): EnvVarInput[]
   }
   if (deps.template) applyTemplateEnv(env, deps.template);
   // Gateway-managed toolkits need boot state the agent cannot create itself:
-  // a connected account (executor, postiz) or a DCR registration (oxygen).
-  // Whichever never booted is dropped so the agent never sees a toolkit it
-  // cannot authenticate (and router-mode search would dead-end on).
+  // a connected account (executor, postiz) or a finished per-person OAuth
+  // (oxygen). Whichever never booted — or whose person never connected — is
+  // dropped so the agent never sees a toolkit it cannot authenticate (and
+  // router-mode search would dead-end on).
   const toolkitsEntry = env.find((e) => e.key === "COMPOSIO_TOOLKITS");
   if (toolkitsEntry) {
     const drop = (name: string): boolean => {
       if (name === EXECUTOR_TOOLKIT_NAME) return !deps.composio?.executorReady;
-      if (name === OXYGEN_TOOLKIT_NAME) return !deps.composio?.oxygenReady;
+      // Oxygen is per-person OAuth: the toolkit belongs in a person's list only
+      // when the DCR registration booted AND that person finished connecting.
+      if (name === OXYGEN_TOOLKIT_NAME) return !deps.composio?.oxygenReady || !user.oxygenComposioAccountId;
       // Postiz is per-person BYOK: the toolkit belongs in a person's list only
       // when the wrapper booted AND that person saved their own key.
       if (name === POSTIZ_TOOLKIT_NAME) return !deps.composio?.postizReady || !user.postizKey;
@@ -388,13 +391,25 @@ interface MaritimeEnvVar {
  * reaches the agent. A ready agent's toolkit list, template env and model can
  * all change after first provision (a new toolkit ships, the operator edits a
  * template); without this, the agent stays frozen on its original env forever.
+ *
+ * Pushing to Maritime's env store is only half the job: a running or sleeping
+ * container does NOT pick store changes up (hot `reload-env` never reaches the
+ * orchestrator process, `restart` does not restart the container, and a
+ * reload-triggered rebuild re-applies the CREATE-time payload, which for older
+ * agents predates later vars). The only reliable application is a fresh
+ * container cycle: stop → start deploys from the current store, and sleep
+ * checkpoints after that capture the new env so subsequent wakes keep it.
+ * Every sync therefore ends with that cycle — secrets always re-push anyway,
+ * so gating the bounce on "something changed" would never skip it in practice.
+ * Callers are reconnects, the admin reprovision endpoint and the per-person
+ * OAuth callback: all rare, all wanting a live agent on current env.
  */
 export async function syncAgentEnv(
   user: UserRecord,
   deps: AgentEnvDeps & Pick<ProvisionDeps, "maritime"> & Pick<ProvisionDeps, "fetchImpl" | "logger">,
-): Promise<{ synced: number; total: number }> {
+): Promise<{ synced: number; total: number; refreshed: boolean }> {
   const log = deps.logger ?? silentLogger;
-  if (!user.maritimeAgentId) return { synced: 0, total: 0 };
+  if (!user.maritimeAgentId) return { synced: 0, total: 0, refreshed: false };
   const agentId = encodeURIComponent(user.maritimeAgentId);
   const expected = agentEnvFor(user, deps);
   const current = (await maritimeRequest(deps, "GET", `/api/agents/${agentId}/env`)) as MaritimeEnvVar[] | undefined;
@@ -415,7 +430,103 @@ export async function syncAgentEnv(
     synced += 1;
   }
   if (synced > 0) log.info("provision.env_synced", { userId: user.id, synced, total: expected.length });
-  return { synced, total: expected.length };
+  let refreshed = false;
+  try {
+    try {
+      await maritimeRequest(deps, "POST", `/api/agents/${agentId}/stop`);
+    } catch (stopErr) {
+      // An already-stopped agent answers 409; start below is what deploys.
+      log.warn("provision.env_refresh_stop_failed", {
+        userId: user.id,
+        error: stopErr instanceof Error ? stopErr.message : String(stopErr),
+      });
+    }
+    await maritimeRequest(deps, "POST", `/api/agents/${agentId}/start`);
+    refreshed = true;
+    log.info("provision.env_container_refreshed", { userId: user.id, synced });
+  } catch (err) {
+    // The store is the source of truth and still correct; a failed bounce
+    // only leaves the container stale until the next sync retries it.
+    log.warn("provision.env_container_refresh_failed", {
+      userId: user.id,
+      synced,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return { synced, total: expected.length, refreshed };
+}
+
+/**
+ * Ensure this owner has an active Composio connected account carrying their own
+ * Postiz BYOK key: reuse a live account, replace a stale id, mint when it never
+ * existed (the saved key predates account minting). Used by provisioning, the
+ * admin reprovision endpoint and ready-agent reconnects. Never throws — a
+ * Composio hiccup is logged so the next heal can retry.
+ */
+export async function healPostizAccount(
+  user: UserRecord,
+  deps: Pick<ProvisionDeps, "composio">,
+  store: UserStore,
+  log: Logger = silentLogger,
+): Promise<UserRecord> {
+  if (!deps.composio?.postizReady || !user.postizKey) return user;
+  try {
+    let accountId = user.postizComposioAccountId;
+    if (accountId && !(await deps.composio.accountActive(accountId))) accountId = undefined;
+    if (!accountId) accountId = await deps.composio.ensureAccount(user.handle, { toolkit: POSTIZ_TOOLKIT_SLUG, apiKey: user.postizKey });
+    if (accountId !== user.postizComposioAccountId) user = store.save({ ...user, postizComposioAccountId: accountId });
+    log.info("provision.postiz_account", { userId: user.id, accountId });
+    return user;
+  } catch (err) {
+    log.warn("provision.postiz_account_failed", {
+      userId: user.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return user;
+  }
+}
+
+/**
+ * Promote a completed Oxygen OAuth dance even when the browser callback never
+ * arrived (Composio can fail its final redirect with "Invalid or expired state"
+ * while the account is already ACTIVE). Reuses a live account, drops a stale
+ * id, and promotes the pending account the connect page recorded once Composio
+ * reports it ACTIVE, owned by this person's handle, for custom_oxygen. Never
+ * throws — a Composio hiccup is logged so the next heal can retry.
+ */
+export async function healOxygenAccount(
+  user: UserRecord,
+  deps: Pick<ProvisionDeps, "composio">,
+  store: UserStore,
+  log: Logger = silentLogger,
+): Promise<UserRecord> {
+  if (!deps.composio?.oxygenReady) return user;
+  try {
+    let accountId = user.oxygenComposioAccountId;
+    const live = accountId ? await deps.composio.accountActive(accountId) : false;
+    // Replace a dead id only when a completed dance is waiting: unlike Postiz
+    // (which re-mints from a saved key), Oxygen needs a fresh browser OAuth, so
+    // dropping the only id on a transient Composio error would lose it for good.
+    if (!live && user.oxygenPendingAccountId) {
+      const info = await deps.composio.connectedAccountInfo(user.oxygenPendingAccountId);
+      if (info.status === "ACTIVE" && info.userId === user.handle && info.toolkit === OXYGEN_TOOLKIT_NAME) {
+        accountId = user.oxygenPendingAccountId;
+      }
+    }
+    if (accountId && accountId !== user.oxygenComposioAccountId) {
+      const next: UserRecord = { ...user, oxygenComposioAccountId: accountId };
+      delete next.oxygenPendingAccountId;
+      user = store.save(next);
+      log.info("provision.oxygen_account", { userId: user.id, accountId });
+    }
+    return user;
+  } catch (err) {
+    log.warn("provision.oxygen_account_failed", {
+      userId: user.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return user;
+  }
 }
 
 /**
@@ -431,9 +542,12 @@ export async function provisionUser(input: ProvisionInput, deps: ProvisionDeps):
     // A ready agent keeps its identity, account and agent id — but its env can
     // go stale (new toolkits, an edited template, a rotated key). Re-sync the
     // delta in the background so a reconnect heals it without a recreate.
-    void syncAgentEnv(user, deps).catch((err: unknown) =>
-      log.warn("provision.env_sync_failed", { userId: user.id, error: err instanceof Error ? err.message : String(err) }),
-    );
+    // Oxygen heal runs before the sync: custom_oxygen only enters the env once
+    // the account id is saved, so syncing first would push a list without it.
+    void healPostizAccount(user, deps, store, log);
+    void healOxygenAccount(user, deps, store, log)
+      .then((next) => syncAgentEnv(next, deps))
+      .catch((err: unknown) => log.warn("provision.env_sync_failed", { userId: user.id, error: err instanceof Error ? err.message : String(err) }));
     return user;
   }
 
@@ -500,21 +614,11 @@ export async function provisionUser(input: ProvisionInput, deps: ProvisionDeps):
       }
     }
     // Postiz: same reuse-while-active pattern, but the connection carries the
-    // person's own BYOK key instead of a fleet credential.
-    if (deps.composio?.postizReady && user.postizKey) {
-      try {
-        let accountId = user.postizComposioAccountId;
-        if (accountId && !(await deps.composio.accountActive(accountId))) accountId = undefined;
-        if (!accountId) accountId = await deps.composio.ensureAccount(user.handle, { toolkit: POSTIZ_TOOLKIT_SLUG, apiKey: user.postizKey });
-        if (accountId !== user.postizComposioAccountId) user = store.save({ ...user, postizComposioAccountId: accountId });
-        log.info("provision.postiz_account", { userId: user.id, accountId });
-      } catch (err) {
-        log.warn("provision.postiz_account_failed", {
-          userId: user.id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
+    // person's own BYOK key instead of a fleet credential (healPostizAccount).
+    user = await healPostizAccount(user, deps, store, log);
+    // Oxygen: promote a completed OAuth dance whose browser callback never
+    // arrived (healOxygenAccount) so custom_oxygen enters the env below.
+    user = await healOxygenAccount(user, deps, store, log);
     // Company brain: push the person's repo into /data/brain so first boot has
     // their context on disk. Best effort — a bad token or a private repo must
     // not fail provisioning; the connect page can retry.

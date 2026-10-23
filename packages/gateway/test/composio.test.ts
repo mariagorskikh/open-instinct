@@ -140,7 +140,8 @@ describe("ComposioPlatform", () => {
     expect(platform.oxygenReady).toBe(true);
     expect(platform.executorReady).toBe(false);
     const upsert = calls.find((c) => c.method === "POST" && c.path.includes("/custom/toolkits/upsert"))?.body as Record<string, any>;
-    expect(upsert["slug"]).toBe(OXYGEN_TOOLKIT_SLUG);
+    // Same bare-name rule as Postiz: the endpoint prefixes "CUSTOM_" itself.
+    expect(upsert["slug"]).toBe("OXYGEN");
     expect(upsert["toolkit_config"]["app_url"]).toBe(OXYGEN_MCP_URL);
     expect(upsert["toolkit_config"]["auth_schemes"][0]).toMatchObject({ mode: "DCR_OAUTH", discovery_url: OXYGEN_DISCOVERY_URL });
 
@@ -149,6 +150,29 @@ describe("ComposioPlatform", () => {
     expect(auth["auth_config"]["credentials"]).toBeUndefined();
     // DCR OAuth has no bootstrap account: each person connects in their own browser.
     expect(calls.some((c) => c.method === "POST" && c.path === "/api/v3.1/connected_accounts")).toBe(false);
+  });
+
+  it("initiates the per-person Oxygen link through the hosted connect flow", async () => {
+    const { calls, fetchImpl } = mockFetch((method, path) => {
+      if (method === "GET" && path.startsWith("/api/v3.1/auth_configs")) return Response.json({ items: [] });
+      if (method === "POST" && path === "/api/v3.1/auth_configs") return Response.json({ id: "ac_o1" });
+      if (method === "POST" && path === "/api/v3.1/connected_accounts/link") {
+        return Response.json({ link_token: "ln_t", redirect_url: "https://connect.composio.dev/link/ln_1", connected_account_id: "ca_o1" });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    });
+    const platform = new ComposioPlatform({ apiKey: "ak_test" }, { fetchImpl });
+    const callback = "https://gw.example.com/oauth/composio/callback?user=usr_1";
+    const out = await platform.initiateOxygenLink("maria", callback);
+    expect(out).toEqual({ redirectUrl: "https://connect.composio.dev/link/ln_1", accountId: "ca_o1" });
+    const link = calls.find((c) => c.method === "POST" && c.path === "/api/v3.1/connected_accounts/link")?.body as Record<string, any>;
+    expect(link).toMatchObject({ auth_config_id: "ac_o1", user_id: "maria", callback_url: callback });
+  });
+
+  it("reads a connected account's status, owner and toolkit for the callback check", async () => {
+    const { fetchImpl } = mockFetch(() => Response.json({ id: "ca_x", status: "ACTIVE", user_id: "maria", toolkit: { slug: "custom_oxygen" } }));
+    const platform = new ComposioPlatform({ apiKey: "ak_test" }, { fetchImpl });
+    expect(await platform.connectedAccountInfo("ca_x")).toEqual({ status: "ACTIVE", userId: "maria", toolkit: "custom_oxygen" });
   });
 
   it("boots postiz when a wrapper URL is configured: API_KEY toolkit upsert, no sync without an account", async () => {
@@ -166,7 +190,9 @@ describe("ComposioPlatform", () => {
 
     expect(platform.postizReady).toBe(true);
     const upsert = calls.find((c) => c.method === "POST" && c.path.includes("/custom/toolkits/upsert"))?.body as Record<string, any>;
-    expect(upsert["slug"]).toBe(POSTIZ_TOOLKIT_SLUG);
+    // The endpoint prefixes custom slugs itself, so the bare name is sent —
+    // sending "CUSTOM_POSTIZ" would register the unreachable "CUSTOM_CUSTOM_POSTIZ".
+    expect(upsert["slug"]).toBe("POSTIZ");
     expect(upsert["toolkit_config"]["app_url"]).toBe("https://postiz-mcp.example/mcp");
     expect(upsert["toolkit_config"]["auth_schemes"][0]["mode"]).toBe("API_KEY");
     expect(calls.some((c) => c.path.includes("/custom/toolkits/sync"))).toBe(false);

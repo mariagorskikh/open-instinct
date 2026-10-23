@@ -28,6 +28,10 @@ export interface UserRecord {
   postizKey?: string;
   /** Composio connected account id for the Postiz toolkit, carrying the person's own key. Reused while active. */
   postizComposioAccountId?: string;
+  /** Composio connected account id for the per-person Oxygen DCR connection (session user = handle). Set once OAuth completes. */
+  oxygenComposioAccountId?: string;
+  /** Account created when the person started Oxygen OAuth but has not finished it yet; promoted on callback. */
+  oxygenPendingAccountId?: string;
   createdAt: string;
   updatedAt?: string;
   status: "provisioning" | "ready" | "error";

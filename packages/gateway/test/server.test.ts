@@ -247,6 +247,18 @@ describe("gateway http", () => {
     expect(page).toContain("connect @maria");
   });
 
+  it("re-syncs a ready agent's env in the background when its owner re-submits the same details", async () => {
+    const { base, mar } = await boot({ seed: [readyUser()] });
+    mar.env["agt_42"] = [{ key: "PORT", value: String(MARITIME_AGENT_PORT) }];
+    const again = await signup(base, { name: "Maria", phone: "+14155550123", handle: "maria" });
+    expect(again.status).toBe(202);
+    const body = (await again.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ status: "pending", userId: "usr_test", handle: "maria" });
+    // The ready branch re-synced env without ever creating a second agent.
+    await waitFor(() => mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/env")));
+    expect(mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/api/agents"))).toBe(false);
+  });
+
   it("resumePending restarts every record a crash left in provisioning", async () => {
     const seed = [
       readyUser({ id: "usr_p1", handle: "p-one", phone: "+14155550001", status: "provisioning", identityId: "", identityApiKey: "", signingKey: "", maritimeAgentId: undefined }),
@@ -552,9 +564,130 @@ describe("admin reprovision api", () => {
     const body = await res.json();
     expect(body.ok).toBe(true);
     expect(body.synced).toBeGreaterThan(0);
-    // It pushed env, never a create/identity call.
+    // It pushed env and cycled the container, never a create/identity call.
     expect(mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/env"))).toBe(true);
+    expect(body.refreshed).toBe(true);
+    expect(mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/stop"))).toBe(true);
+    expect(mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/start"))).toBe(true);
     expect(mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/api/agents"))).toBe(false);
+  });
+
+  it("mints the saved Postiz BYOK connection when it is missing and reports its id", async () => {
+    const minted: Array<{ handle: string; toolkit?: string }> = [];
+    const composio = {
+      postizReady: true,
+      ensureAccount: async (handle: string, opts: { toolkit?: string } = {}) => {
+        minted.push({ handle, toolkit: opts.toolkit });
+        return "pca_repro";
+      },
+    } as unknown as ComposioPlatform;
+    const { base, store } = await boot({ seed: [readyUser({ postizKey: "pk_abcdefgh1234" })], adminToken: "adm_secret", composio });
+    const res = await repro(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.postizAccountId).toBe("pca_repro");
+    expect(minted).toEqual([{ handle: "maria", toolkit: "CUSTOM_POSTIZ" }]);
+    expect(store.get("usr_test")?.postizComposioAccountId).toBe("pca_repro");
+  });
+
+  it("reuses an active Postiz connection and reports null when the owner has no key", async () => {
+    const minted: string[] = [];
+    const composio = {
+      postizReady: true,
+      accountActive: async () => true,
+      ensureAccount: async (handle: string) => {
+        minted.push(handle);
+        return "pca_new";
+      },
+    } as unknown as ComposioPlatform;
+    const active = await boot({ seed: [readyUser({ postizKey: "pk_abcdefgh1234", postizComposioAccountId: "pca_live" })], adminToken: "adm_secret", composio });
+    const activeBody = await (await repro(active.base, "adm_secret", "usr_test")).json();
+    expect(activeBody.postizAccountId).toBe("pca_live");
+    expect(minted).toHaveLength(0);
+
+    const without = await boot({ seed: [readyUser()], adminToken: "adm_secret", composio });
+    const withoutBody = await (await repro(without.base, "adm_secret", "usr_test")).json();
+    expect(withoutBody.postizAccountId).toBeNull();
+    expect(minted).toHaveLength(0);
+  });
+});
+
+describe("oxygen connect flow", () => {
+  it("sends the browser to Composio's hosted link and records the pending account", async () => {
+    const initiated: Array<{ handle: string; callback: string }> = [];
+    const composio = {
+      oxygenReady: true,
+      initiateOxygenLink: async (handle: string, callback: string) => {
+        initiated.push({ handle, callback });
+        return { redirectUrl: "https://connect.composio.dev/link/ln_o1", accountId: "ca_o1" };
+      },
+    } as unknown as ComposioPlatform;
+    const { base, store } = await boot({ seed: [readyUser()], composio });
+    const res = await fetch(`${base}/connect/usr_test/oxygen`, { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://connect.composio.dev/link/ln_o1");
+    expect(store.get("usr_test")?.oxygenPendingAccountId).toBe("ca_o1");
+    expect(initiated).toEqual([{ handle: "maria", callback: "https://gw.example.com/oauth/composio/callback?user=usr_test" }]);
+  });
+
+  it("503s while the registration never booted and 404s an unknown user", async () => {
+    const { base } = await boot({ seed: [readyUser()] });
+    expect((await fetch(`${base}/connect/usr_test/oxygen`, { redirect: "manual" })).status).toBe(503);
+    expect((await fetch(`${base}/connect/usr_missing/oxygen`, { redirect: "manual" })).status).toBe(404);
+  });
+
+  it("offers the start on the connect page only while ready, and shows the connected state", async () => {
+    const composio = { oxygenReady: true } as unknown as ComposioPlatform;
+    const notReady = await boot({ seed: [readyUser()] });
+    expect(await (await fetch(`${notReady.base}/connect/usr_test`)).text()).not.toContain("/connect/usr_test/oxygen");
+
+    const ready = await boot({ seed: [readyUser()], composio });
+    const readyPage = await (await fetch(`${ready.base}/connect/usr_test`)).text();
+    expect(readyPage).toContain("/connect/usr_test/oxygen");
+
+    const done = await boot({ seed: [readyUser({ oxygenComposioAccountId: "ca_o1" })], composio });
+    const donePage = await (await fetch(`${done.base}/connect/usr_test`)).text();
+    expect(donePage).toContain("Oxygen connected");
+    expect(donePage).not.toContain("/connect/usr_test/oxygen");
+  });
+
+  it("verifies the callback account, saves it, clears the pending id and re-syncs env", async () => {
+    const composio = {
+      oxygenReady: true,
+      connectedAccountInfo: async () => ({ status: "ACTIVE", userId: "maria", toolkit: "custom_oxygen" }),
+    } as unknown as ComposioPlatform;
+    const { base, store, mar } = await boot({ seed: [readyUser({ oxygenPendingAccountId: "ca_o1" })], composio });
+    const res = await fetch(`${base}/oauth/composio/callback?user=usr_test&connectedAccountId=ca_o1`, { redirect: "manual" });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/connect/usr_test");
+    const saved = store.get("usr_test");
+    expect(saved?.oxygenComposioAccountId).toBe("ca_o1");
+    expect(saved?.oxygenPendingAccountId).toBeUndefined();
+    // The env push carries custom_oxygen to the agent's toolkit list.
+    await waitFor(() => mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/env")));
+  });
+
+  it("changes nothing when the account belongs to someone else or the wrong toolkit", async () => {
+    const composio = {
+      oxygenReady: true,
+      connectedAccountInfo: async () => ({ status: "ACTIVE", userId: "someone-else", toolkit: "custom_oxygen" }),
+    } as unknown as ComposioPlatform;
+    const { base, store } = await boot({ seed: [readyUser({ oxygenPendingAccountId: "ca_bad" })], composio });
+    const res = await fetch(`${base}/oauth/composio/callback?user=usr_test`, { redirect: "manual" });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Oxygen not connected");
+    const u = store.get("usr_test");
+    expect(u?.oxygenComposioAccountId).toBeUndefined();
+    expect(u?.oxygenPendingAccountId).toBe("ca_bad");
+  });
+
+  it("surfaces a Composio error parameter without touching the record", async () => {
+    const { base, store } = await boot({ seed: [readyUser()] });
+    const res = await fetch(`${base}/oauth/composio/callback?user=usr_test&error_description=user%20denied`, { redirect: "manual" });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("user denied");
+    expect(store.get("usr_test")?.oxygenComposioAccountId).toBeUndefined();
   });
 });
 

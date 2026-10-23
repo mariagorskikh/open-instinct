@@ -281,7 +281,9 @@ The BYO contract the image must satisfy: bind `0.0.0.0:$PORT`, `GET /health` →
 ## Configuration
 
 Only `server`, `gateway` and `cli` read `process.env`. `config.json` wins over env after first
-boot; env seeds it. The annotated list is [deploy/.env.example](../deploy/.env.example).
+boot; env seeds it. Two operator overrides win on every load instead of only
+seeding: `INSTINCT_MODEL` and `COMPOSIO_TOOLKITS`. The annotated list is
+[deploy/.env.example](../deploy/.env.example).
 
 What the model is told is five files, not env: `PERSONA.md` (voice), `AGENTS.md` (standing
 instructions), `skills/`, `memory/MEMORY.md` and `policy.json`. `instinct prompt --layers`

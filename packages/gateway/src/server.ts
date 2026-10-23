@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { type SignupLimits, SlidingWindowLimiter, clientAddress, pendingCount, signupLimits } from "./limits.js";
 import { type Logger, consoleLogger } from "./logger.js";
 import { GITHUB_URL, type RouterInfo, connectRouterFor, renderConnect, renderLanding, renderLinkDone, renderMessage, renderPending } from "./pages.js";
-import { MaritimeApiError, type LinkPassthrough, type MaritimeProvisionOptions, maritimeRequest, newUserId, provisionUser, syncAgentEnv } from "./provision.js";
-import { POSTIZ_TOOLKIT_SLUG, type ComposioPlatform } from "./composio.js";
+import { MaritimeApiError, type LinkPassthrough, type MaritimeProvisionOptions, healOxygenAccount, healPostizAccount, maritimeRequest, newUserId, provisionUser, syncAgentEnv } from "./provision.js";
+import { OXYGEN_TOOLKIT_NAME, POSTIZ_TOOLKIT_SLUG, type ComposioPlatform } from "./composio.js";
 import { pushBrain } from "./brain.js";
 import { EventDeduper, type HeaderMap, relayVerifiedEvent, relayGatewayEvent, verifyForUser } from "./relay.js";
 import { type UserRecord, type UserStore, publicUser } from "./store.js";
@@ -327,7 +327,9 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     const byHandle = opts.store.byHandle(value.handle);
     if (byHandle && byHandle.phone === value.phone) {
       // Same person again: a retry after an error, a crash mid-provision, or a lost connect page.
-      if (byHandle.status !== "ready") startProvisioning(byHandle);
+      // Runs for a ready record too — provisionUser's ready branch only re-syncs
+      // env and re-mints a missing Postiz connection; nothing is recreated.
+      startProvisioning(byHandle);
       void opts.notifyExisting?.(byHandle, connectUrl(byHandle.id)).catch((err: unknown) => log.warn("notify.failed", { userId: byHandle.id, error: String(err) }));
       return respondPending(req, res, byHandle);
     }
@@ -415,11 +417,34 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
   }
 
   /**
+   * Full env-sync dependency set (template, readiness flags, secrets) for one
+   * person — used by the admin reprovision endpoint and the Oxygen callback.
+   */
+  function envSyncDeps(user: UserRecord) {
+    return {
+      inkboxBaseUrl: opts.inkboxBaseUrl,
+      maritime: opts.maritime,
+      publicUrl: opts.publicUrl,
+      anthropicApiKey: opts.anthropicApiKey,
+      composioApiKey: opts.composioApiKey,
+      composioToolkits: opts.composioToolkits,
+      composio: opts.composio,
+      link: opts.link,
+      template: templates.get(user.templateId),
+      fetchImpl: opts.fetchImpl,
+      logger: log,
+    };
+  }
+
+  /**
    * POST /api/admin/reprovision/<userId>
-   * Recompute an agent's env from its template + current readiness and push
-   * only the differing keys to Maritime. The agent keeps its id, identity and
-   * connected accounts — nothing is recreated. Bearer-protected by
-   * GATEWAY_ADMIN_TOKEN; 503 while unset, 401 on a bad token, 404 unknown user.
+   * Recompute an agent's env from its template + current readiness, push only
+   * the differing keys to Maritime, and bounce the agent's container
+   * (stop → start) so the store's env is actually applied — store writes
+   * alone never reach an already-deployed container. The agent keeps its id,
+   * identity and connected accounts — nothing is recreated. Bearer-protected
+   * by GATEWAY_ADMIN_TOKEN; 503 while unset, 401 on a bad token, 404 unknown
+   * user.
    */
   async function handleAdminReprovision(req: IncomingMessage, res: ServerResponse, userId: string): Promise<void> {
     if (!opts.adminToken) return json(res, 503, { error: "admin api is not configured" });
@@ -433,21 +458,17 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     if (!user) return json(res, 404, { error: "unknown user" });
     if (!user.maritimeAgentId) return json(res, 409, { error: "agent is not provisioned yet" });
     try {
-      const result = await syncAgentEnv(user, {
-        inkboxBaseUrl: opts.inkboxBaseUrl,
-        maritime: opts.maritime,
-        publicUrl: opts.publicUrl,
-        anthropicApiKey: opts.anthropicApiKey,
-        composioApiKey: opts.composioApiKey,
-        composioToolkits: opts.composioToolkits,
-        composio: opts.composio,
-        link: opts.link,
-        template: templates.get(user.templateId),
-        fetchImpl: opts.fetchImpl,
-        logger: log,
-      });
-      log.info("admin.reprovision", { userId: user.id, ...result });
-      return json(res, 200, { ok: true, ...result });
+      // Heal first: both heals can add a toolkit to the env (custom_oxygen via
+      // its account id), so syncing before them would push a stale list.
+      const healedPostiz = await healPostizAccount(user, { composio: opts.composio }, opts.store, log);
+      const healed = await healOxygenAccount(healedPostiz, { composio: opts.composio }, opts.store, log);
+      const result = await syncAgentEnv(healed, envSyncDeps(healed));
+      const summary = {
+        postizAccountId: healed.postizComposioAccountId ?? null,
+        oxygenAccountId: healed.oxygenComposioAccountId ?? null,
+      };
+      log.info("admin.reprovision", { userId: user.id, ...result, ...summary });
+      return json(res, 200, { ok: true, ...result, ...summary });
     } catch (err) {
       if (err instanceof MaritimeApiError) return json(res, err.status, { error: err.detail });
       throw err;
@@ -527,6 +548,90 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     if (wantsJson(req)) return json(res, 200, { ok: true, hasBrain: Boolean(next.brainRepo), hasPostizKey: Boolean(next.postizKey) });
     res.writeHead(303, { Location: `/connect/${encodeURIComponent(user.id)}` });
     res.end();
+  }
+
+  /**
+   * GET /connect/<userId>/oxygen — start the per-person Oxygen OAuth dance.
+   * Creates the connected account (INITIATED) and Composio's hosted link,
+   * records the pending account id, and sends the browser to the link; the
+   * person approves there (Clerk at the toolkit's issuer) and Composio returns
+   * them to the OAuth callback below.
+   */
+  async function handleOxygenConnect(res: ServerResponse, userId: string): Promise<void> {
+    const user = opts.store.get(userId);
+    if (!user) return html(res, 404, renderMessage("Not found", "No Instinct with that id. Check the link you were given.", "error"));
+    if (!opts.composio?.oxygenReady) {
+      return html(res, 503, renderMessage("Oxygen not ready", "The Oxygen connection cannot start right now. Try again in a minute.", "error"));
+    }
+    try {
+      const callbackUrl = `${opts.publicUrl.replace(/\/+$/, "")}/oauth/composio/callback?user=${encodeURIComponent(user.id)}`;
+      const { redirectUrl, accountId } = await opts.composio.initiateOxygenLink(user.handle, callbackUrl);
+      opts.store.save({ ...user, oxygenPendingAccountId: accountId });
+      log.info("connect.oxygen_initiated", { userId: user.id, accountId });
+      res.writeHead(302, { Location: redirectUrl });
+      res.end();
+    } catch (err) {
+      log.warn("connect.oxygen_initiate_failed", { userId: user.id, error: err instanceof Error ? err.message : String(err) });
+      return html(res, 502, renderMessage("Could not start Oxygen", "Composio did not hand back a connection link. Go back and try once more.", "error"));
+    }
+  }
+
+  /**
+   * GET /oauth/composio/callback?user=<id>[&connectedAccountId=…][&error=…]
+   * Composio returns the browser here after the Oxygen OAuth dance. Verify the
+   * account — ACTIVE, owned by this person's handle, toolkit custom_oxygen —
+   * polling briefly because the redirect can land before the token exchange
+   * finishes; then save it, clear the pending id and re-sync the agent's env so
+   * custom_oxygen enters its toolkit list. Any mismatch changes nothing and
+   * says so; a failure is logged with what Composio actually reported.
+   */
+  async function handleOxygenCallback(res: ServerResponse, query: URLSearchParams): Promise<void> {
+    const user = opts.store.get(query.get("user") ?? "");
+    if (!user) {
+      return html(res, 404, renderMessage("Not found", "This link does not belong to an agent here. Start the connection again from your connect page.", "error"));
+    }
+    const error = query.get("error_description") ?? query.get("error");
+    if (error) {
+      return html(res, 200, renderMessage("Oxygen not connected", `Composio returned: ${error}. Nothing was changed — start again from your connect page.`, "error"));
+    }
+    const candidate = query.get("connectedAccountId") || user.oxygenPendingAccountId || "";
+    if (!candidate || !opts.composio) {
+      return html(res, 200, renderMessage("Oxygen not connected", "There is no connection to verify yet. Start again from your connect page.", "error"));
+    }
+    let info: { status: string; userId: string; toolkit: string } | undefined;
+    for (let i = 0; i < 10; i += 1) {
+      try {
+        info = await opts.composio.connectedAccountInfo(candidate);
+        if (info.status === "ACTIVE") break;
+      } catch {
+        info = undefined; // not visible yet
+      }
+      if (i < 9) await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (info && info.status === "ACTIVE" && info.userId === user.handle && info.toolkit === OXYGEN_TOOLKIT_NAME) {
+      const next: UserRecord = { ...user, oxygenComposioAccountId: candidate };
+      delete next.oxygenPendingAccountId;
+      const saved = opts.store.save(next);
+      log.info("connect.oxygen_connected", { userId: saved.id, accountId: candidate });
+      void syncAgentEnv(saved, envSyncDeps(saved)).catch((err: unknown) =>
+        log.warn("connect.oxygen_env_sync_failed", { userId: saved.id, error: err instanceof Error ? err.message : String(err) }),
+      );
+      res.writeHead(303, { Location: `/connect/${encodeURIComponent(saved.id)}` });
+      res.end();
+      return;
+    }
+    log.warn("connect.oxygen_verify_failed", {
+      userId: user.id,
+      accountId: candidate,
+      status: info?.status ?? "not_found",
+      owner: info?.userId ?? "",
+      toolkit: info?.toolkit ?? "",
+    });
+    return html(
+      res,
+      200,
+      renderMessage("Oxygen not connected", "Composio did not report an active connection. Nothing was changed — start again from your connect page.", "error"),
+    );
   }
 
   async function handleWebhook(req: IncomingMessage, res: ServerResponse, userId: string): Promise<void> {
@@ -619,17 +724,38 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       if (method !== "POST") throw new HttpError(405, "method not allowed");
       return handleAdminReprovision(req, res, decodeURIComponent(parts[3] ?? ""));
     }
+    if (parts[0] === "connect" && parts.length === 3 && parts[2] === "oxygen") {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      return handleOxygenConnect(res, decodeURIComponent(parts[1] ?? ""));
+    }
     if (parts[0] === "connect" && parts.length === 2) {
       const user = opts.store.get(decodeURIComponent(parts[1] ?? ""));
       if (!user) return html(res, 404, renderMessage("Not found", "No Instinct with that id. Check the link you were given.", "error"));
       if (method === "POST") return handleConnectUpdate(req, res, user);
       if (method !== "GET") throw new HttpError(405, "method not allowed");
-      const [shared, perUser] = await Promise.all([routerInfo(), routerInfoForUser(user)]);
-      return html(res, 200, renderConnect(user, connectRouterFor(user.handle, shared, perUser)));
+      // Visiting the page heals a completed-but-uncaptured Oxygen dance (the
+      // browser callback can fail on Composio's side while the account is
+      // already ACTIVE), so the page shows Connected and the env follows.
+      let current = user;
+      if (opts.composio?.oxygenReady && !current.oxygenComposioAccountId && current.oxygenPendingAccountId) {
+        const healed = await healOxygenAccount(current, { composio: opts.composio }, opts.store, log);
+        if (healed.oxygenComposioAccountId) {
+          current = healed;
+          void syncAgentEnv(current, envSyncDeps(current)).catch((err: unknown) =>
+            log.warn("connect.oxygen_env_sync_failed", { userId: current.id, error: err instanceof Error ? err.message : String(err) }),
+          );
+        }
+      }
+      const [shared, perUser] = await Promise.all([routerInfo(), routerInfoForUser(current)]);
+      return html(res, 200, renderConnect(current, connectRouterFor(current.handle, shared, perUser), Boolean(opts.composio?.oxygenReady)));
     }
     if (parts[0] === "webhooks" && parts[1] === "inkbox" && parts.length === 3) {
       if (method !== "POST") throw new HttpError(405, "method not allowed");
       return handleWebhook(req, res, decodeURIComponent(parts[2] ?? ""));
+    }
+    if (parts[0] === "oauth" && parts[1] === "composio" && parts[2] === "callback") {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      return handleOxygenCallback(res, url.searchParams);
     }
     if (parts[0] === "oauth" && parts[1] === "link" && parts[2] === "callback" && parts.length === 4) {
       if (method !== "GET") throw new HttpError(405, "method not allowed");

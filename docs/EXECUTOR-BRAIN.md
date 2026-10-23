@@ -41,10 +41,13 @@ Before the gateway listens:
 
 Each step has a 30 s timeout; a hung or failed boot logs loudly
 (`*_timeout` / `composio.executor_unavailable`) and the gateway still comes up.
-Healthy boot ends with:
+Oxygen and Postiz register the same way, independently of the executor (DCR
+auth config / toolkit upsert, logged `composio.oxygen_ready` /
+`composio.postiz_ready`, or `*_unavailable` when the wrapper URL is unset or the
+upsert fails). Healthy boot ends with:
 
 ```
-gateway.listening {executor: true, computer: true, adminApi: true}
+gateway.listening {executor: true, oxygen: true, postiz: true, computer: true, adminApi: true}
 ```
 
 ## How an agent gets the executor
@@ -79,6 +82,72 @@ At provision time the gateway:
 
 Without a configured composio platform, `custom_executor` is filtered out of
 `COMPOSIO_TOOLKITS` in the agent's env.
+
+## Per-person connections (Postiz key, Oxygen OAuth)
+
+The connect page's **Connections** card carries everything one person adds
+themselves: the company brain, a **Postiz** public-API key (BYOK), and the
+**Oxygen** OAuth button. Two gateway-managed toolkits are per-person by design,
+and an agent's `COMPOSIO_TOOLKITS` reflects exactly what its owner connected:
+
+- `custom_postiz` — in the list only while the wrapper booted **and** the person
+  saved their own key. The key mints a Composio connected account
+  (`postizComposioAccountId`, reused while active; a new key re-mints).
+- `custom_oxygen` — in the list only while the DCR registration booted **and**
+  the person finished their OAuth dance
+  (`oxygenComposioAccountId`). Registration alone never puts a dead toolkit in
+  front of an agent.
+- `custom_executor` — fleet-managed: in the list whenever the executor booted;
+  the account mints silently at provision.
+
+### The Oxygen connect flow
+
+Oxygen is a DCR OAuth toolkit: there is no shared credential, so each person
+approves in their own browser (Clerk at `oxygen-agent.com`, discovered from the
+toolkit's `/.well-known/oauth-authorization-server`).
+
+1. `GET /connect/<userId>/oxygen` (the page's **Connect Oxygen** button) —
+   requires `composio.oxygen_ready`, else 503. Creates the connected account
+   (`INITIATED`) and Composio's hosted link via
+   `POST /api/v3.1/connected_accounts/link`, stores it as
+   `oxygenPendingAccountId`, and 302s the browser to the link.
+2. The person approves at Composio, then at Clerk; Composio redirects them to
+   `GET /oauth/composio/callback?user=<id>&connectedAccountId=<id>`
+   (the gateway set the `callback_url`).
+3. The callback verifies the account — `ACTIVE` (polled up to 10 s; the
+   redirect can land before the token exchange finishes), `user_id` equal to
+   the person's handle, toolkit `custom_oxygen` — then saves
+   `oxygenComposioAccountId`, clears the pending id, re-syncs the agent's env
+   (so `custom_oxygen` reaches the toolkit list; the agent picks it up on its
+   next wake) and 303s back to the connect page. Any mismatch or Composio
+   `error` parameter renders "Oxygen not connected", changes nothing, and logs
+   `connect.oxygen_verify_failed` with what Composio actually reported.
+   Success logs `connect.oxygen_connected`.
+
+4. **The callback is not the only way in.** Observed live: Composio can flip the
+   account to `ACTIVE` and then fail its own final redirect
+   (`dashboard.composio.dev/redirect?status=failed&error=Invalid+or+expired+state`),
+   so the browser never reaches step 2 and `oxygenComposioAccountId` stays unset.
+   `healOxygenAccount` covers this: it verifies the recorded pending account
+   (`ACTIVE`, owner handle, toolkit `custom_oxygen`) and promotes it — on the
+   admin reprovision, on a ready-agent reconnect, during provisioning, and on a
+   plain visit to the connect page (which then re-syncs the env too). Success
+   logs `provision.oxygen_account`. A saved id is never dropped for a transient
+   `accountActive` miss — unlike Postiz, Oxygen cannot re-mint without a fresh
+   browser dance, so the id is only replaced by a newer completed one.
+
+A person whose agent is still provisioning can connect too: the account rides
+on the record and provision applies it when the env is first built.
+
+### The `CUSTOM_` upsert gotcha
+
+Composio's `POST /api/v3.1/custom/toolkits/upsert` **prefixes `CUSTOM_`
+itself**: sending `CUSTOM_POSTIZ` registers `CUSTOM_CUSTOM_POSTIZ`, which
+neither auth-config creation nor the agent's tool router can ever find (this is
+why Oxygen silently never worked). The gateway therefore sends the bare names
+(`POSTIZ`, `OXYGEN`). The executor keeps its prefixed slug — it lives on a
+pre-existing `custom_executor` toolkit (auth config + 8 connections) that must
+not be re-upserted; its boot finds the legacy config instead of creating one.
 
 ## The narrow computer key (fleet-key isolation)
 
@@ -152,12 +221,40 @@ Authorization: Bearer <GATEWAY_ADMIN_TOKEN>
 
 Recomputes the agent's full env from its template + current boot readiness
 (executor/oxygen/postiz flags) and pushes only the differing keys to Maritime —
-`{ok: true, synced, total}`. Secrets re-push every time (Maritime masks stored
-secret values, so a rotated key can only be detected by sending it). Nothing is
-recreated: identity, accounts and `maritimeAgentId` stay. `provisionUser` runs
-the same sync in the background whenever a ready agent's owner reconnects, so
-the endpoint is for healing without waiting for that. A ready agent that is
-asleep picks the new env up on its next wake.
+`{ok: true, synced, total, refreshed, postizAccountId, oxygenAccountId}`.
+Secrets re-push every time (Maritime masks stored secret values, so a rotated
+key can only be detected by sending it). Nothing is recreated: identity,
+accounts and `maritimeAgentId` stay. The endpoint heals **before** it syncs —
+Postiz BYOK (reuse-while-active, replace stale, mint missing) and Oxygen
+(promote a completed-but-uncaptured dance) — so a healed toolkit id enters the
+env in the same call; the response reports both account ids (`null` when the
+owner has no key/dance or Composio is off). `provisionUser` runs the same heals
+in the background whenever a ready agent's owner reconnects (same handle +
+phone), so the endpoint is for healing without waiting for that.
+
+**Agent-side toolkit list.** The synced `COMPOSIO_TOOLKITS` env is what the
+agent *should* build its Composio session from, but until the agent image ships
+the `loadConfig` override (env wins for `apps.toolkits`, like `INSTINCT_MODEL`),
+an already-booted agent still reads the toolkit list from its `/data/config.json`
+(file wins after first boot). For a new toolkit on an existing agent: edit the
+agent's config through its shell (`python3 -c` patching
+`config.json → apps.toolkits`, reply comes back on the chat probe), *then*
+reprovision — the bounce makes the agent rebuild its session with the new list
+(session mismatch is detected; the old `apps.json` session is replaced).
+
+**Env writes do not reach a deployed container on their own.** Maritime keeps
+env in a per-agent store, but a running or sleeping container keeps its own
+copy: hot `POST …/reload-env` never changes the orchestrator process,
+`POST …/restart` does not restart the container, a reload-triggered rebuild
+re-applies the CREATE-time payload (stale for agents created before a var
+existed), and waking from a sleep checkpoint restores the checkpointed env —
+not the store. The only reliable application is a fresh container cycle:
+`POST …/stop` then `POST …/start`, which deploys from the current store;
+sleep checkpoints after that capture the new env, so later wakes keep it.
+Every `syncAgentEnv` therefore ends with that bounce (`refreshed` reports it;
+a failed bounce only warns — the store stays correct for the next sync). This
+is why an agent can look "synced" in the store while its runtime still reports
+`COMPOSIO_API_KEY missing`: check the *container*, not the store.
 
 ## One owner, many agents
 

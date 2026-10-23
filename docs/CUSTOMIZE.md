@@ -205,7 +205,7 @@ any tool runs, whatever the persona says.
 ## 8. Change the model
 
 ```bash
-# For this process. Env wins over config.json for the model, and only for the model.
+# For this process. Env wins over config.json for the model (and, likewise, COMPOSIO_TOOLKITS for the toolkit list).
 INSTINCT_MODEL=anthropic/claude-sonnet-5-5 instinct dev
 
 # For good: writes config.json.

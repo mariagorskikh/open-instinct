@@ -199,7 +199,7 @@ function statusPill(u: UserRecord): string {
   return `<span class="pill warn"><i></i>Setting up</span>`;
 }
 
-export function renderConnect(user: UserRecord, router: ConnectRouter | undefined): string {
+export function renderConnect(user: UserRecord, router: ConnectRouter | undefined, oxygenReady = false): string {
   const command = connectCommandFor(user.handle);
   const smsHref = router ? safeUrl(smsHrefFor(router.number, user.handle)) : "";
   const qr = router ? safeUrl(router.qrPngDataUrl, true) : "";
@@ -241,6 +241,14 @@ ${qr ? `<p class="hint" style="text-align:center;margin-top:22px">Or scan from a
     user.postizKey
       ? `<p class="hint">Postiz key saved. Your agent can schedule and publish through your Postiz account.</p>`
       : `<p class="hint">Paste a Postiz public-API key so your agent can schedule and publish through your Postiz account.</p>`
+  }
+  ${
+    oxygenReady
+      ? user.oxygenComposioAccountId
+        ? `<p class="hint">Oxygen connected. Your agent can search and act through your Oxygen account.</p>`
+        : `<p class="hint">Connect Oxygen so your agent can search and act through your Oxygen account. You approve in your own browser.</p>
+<a class="btn" href="/connect/${encodeURIComponent(user.id)}/oxygen">Connect Oxygen</a>`
+      : ""
   }
   <form method="post" action="/connect/${encodeURIComponent(user.id)}">
     <label for="brainRepo">Repo <small>owner/repo or a github.com URL; empty saves nothing</small></label>

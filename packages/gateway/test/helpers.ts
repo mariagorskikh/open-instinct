@@ -122,6 +122,8 @@ export interface FakeMaritime {
   agentStatus: Record<string, string>;
   /** Env rows per agent id, backing GET/POST /api/agents/<id>/env. */
   env: Record<string, Array<{ key: string; value: string; isSecret?: boolean }>>;
+  /** When true, POST /api/agents/<id>/start answers 500 (refresh-failure tests). */
+  refreshFails?: boolean;
 }
 
 export function fakeMaritime(): FakeMaritime {
@@ -151,6 +153,15 @@ export function fakeMaritime(): FakeMaritime {
       return new Response(JSON.stringify(agent), { status: 201 });
     }
     if (method === "POST" && url.includes("/chat")) return new Response(JSON.stringify({ response: "ok" }), { status: 200 });
+    const cycleMatch = url.match(/\/api\/agents\/([^/?]+)\/(stop|start|restart)$/);
+    if (cycleMatch) {
+      const id = decodeURIComponent(cycleMatch[1] ?? "");
+      const action = cycleMatch[2];
+      if (action === "start" && state.refreshFails) return new Response(JSON.stringify({ detail: "boom" }), { status: 500 });
+      const status = action === "stop" ? "stopped" : "active";
+      state.agentStatus[id] = status;
+      return new Response(JSON.stringify({ id, status }), { status: 200 });
+    }
     const envMatch = url.match(/\/api\/agents\/([^/?]+)\/env$/);
     if (envMatch) {
       const agentId = decodeURIComponent(envMatch[1] ?? "");

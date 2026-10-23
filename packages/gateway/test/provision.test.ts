@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InkboxProvisioner } from "@open-instinct/inkbox";
-import { DEFAULT_MARITIME_LLM_MODEL, MARITIME_AGENT_PORT, agentEnvFor, effectiveToolkits, executorRequested, linkRedirectUriFor, maritimeCreateBody, provisionUser, syncAgentEnv, webhookUrlFor } from "../src/provision.js";
+import { DEFAULT_MARITIME_LLM_MODEL, MARITIME_AGENT_PORT, agentEnvFor, effectiveToolkits, executorRequested, healOxygenAccount, linkRedirectUriFor, maritimeCreateBody, provisionUser, syncAgentEnv, webhookUrlFor } from "../src/provision.js";
 import type { ComposioPlatform } from "../src/composio.js";
 import { UserStore } from "../src/store.js";
 import { loadTemplateRegistry } from "../src/templates.js";
@@ -332,13 +332,39 @@ describe("executor wiring", () => {
     expect(byKey["COMPOSIO_MODE"]).toBe("router");
   });
 
-  it("keeps gateway-managed toolkits when the matching boot flags are on", async () => {
+  it("keeps gateway-managed toolkits when the matching boot flags are on, per-person ones only after their connect", async () => {
     const d = deps();
     const composio = { executorReady: true, oxygenReady: true, postizReady: false } as unknown as ComposioPlatform;
     await provisionUser(input, { ...d.deps, composio, template: shipped.resolve("gtm-ai") });
     const body = d.mar.calls.find((c) => c.method === "POST" && c.url.endsWith("/api/agents"))?.body as Record<string, unknown>;
     const byKey = Object.fromEntries((body["initialEnvVars"] as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
-    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,custom_executor,linear,custom_oxygen");
+    // The executor account mints during this provision; Oxygen needs the person's
+    // own OAuth dance, which has not happened for a brand-new record.
+    expect(byKey["COMPOSIO_TOOLKITS"]).toBe("gmail,googlecalendar,custom_executor,linear");
+  });
+
+  it("adds custom_oxygen to the toolkit list only when the person finished connecting", async () => {
+    const base = {
+      composioApiKey: "cmp",
+      composio: { executorReady: true, oxygenReady: true, postizReady: false } as unknown as ComposioPlatform,
+      template: shipped.resolve("gtm-ai"),
+      maritime: { apiKey: "k", agentImage: "img" },
+    };
+
+    // Finished OAuth: the toolkit joins the list.
+    const connected = agentEnvFor(readyUser({ oxygenComposioAccountId: "ca_o1" }), base);
+    expect(connected.find((e) => e.key === "COMPOSIO_TOOLKITS")?.value.split(",")).toContain("custom_oxygen");
+
+    // Registration booted but the person never finished OAuth: stripped, like never-booted.
+    const notConnected = agentEnvFor(readyUser(), base);
+    expect(notConnected.find((e) => e.key === "COMPOSIO_TOOLKITS")?.value).not.toContain("custom_oxygen");
+
+    // Registration down: even a finished connection must not leave a dead toolkit.
+    const down = agentEnvFor(readyUser({ oxygenComposioAccountId: "ca_o1" }), {
+      ...base,
+      composio: { ...base.composio, oxygenReady: false } as unknown as ComposioPlatform,
+    });
+    expect(down.find((e) => e.key === "COMPOSIO_TOOLKITS")?.value).not.toContain("custom_oxygen");
   });
 
   it("adds custom_postiz to the toolkit list only when the person saved a key", async () => {
@@ -474,6 +500,84 @@ describe("executor wiring", () => {
     expect(user.postizComposioAccountId).toBeUndefined();
   });
 
+  it("promotes a pending Oxygen account once Composio reports it ACTIVE", async () => {
+    const d = deps();
+    const composio = {
+      oxygenReady: true,
+      accountActive: async () => false,
+      connectedAccountInfo: async () => ({ status: "ACTIVE", userId: "maria", toolkit: "custom_oxygen" }),
+    } as unknown as ComposioPlatform;
+    d.store.save({ ...readyUser(), oxygenPendingAccountId: "ca_o1" });
+
+    const healed = await healOxygenAccount(d.store.get("usr_test")!, { composio }, d.store);
+    expect(healed.oxygenComposioAccountId).toBe("ca_o1");
+    expect(healed.oxygenPendingAccountId).toBeUndefined();
+    expect(d.store.get("usr_test")?.oxygenComposioAccountId).toBe("ca_o1");
+    expect(d.store.get("usr_test")?.oxygenPendingAccountId).toBeUndefined();
+  });
+
+  it("leaves the pending Oxygen id alone until owner and toolkit match", async () => {
+    const d = deps();
+    const info = { status: "INITIATED", userId: "maria", toolkit: "custom_oxygen" };
+    const composio = {
+      oxygenReady: true,
+      accountActive: async () => false,
+      connectedAccountInfo: async () => ({ ...info }),
+    } as unknown as ComposioPlatform;
+    d.store.save({ ...readyUser(), oxygenPendingAccountId: "ca_p" });
+
+    const notYet = await healOxygenAccount(d.store.get("usr_test")!, { composio }, d.store);
+    expect(notYet.oxygenComposioAccountId).toBeUndefined();
+    expect(notYet.oxygenPendingAccountId).toBe("ca_p");
+
+    info.status = "ACTIVE";
+    info.userId = "someone-else";
+    const wrongOwner = await healOxygenAccount(d.store.get("usr_test")!, { composio }, d.store);
+    expect(wrongOwner.oxygenComposioAccountId).toBeUndefined();
+    expect(wrongOwner.oxygenPendingAccountId).toBe("ca_p");
+  });
+
+  it("keeps a saved Oxygen id when Composio briefly reports it dead, replaces it from a fresh dance", async () => {
+    const d = deps();
+    const live = { value: false };
+    const info = { status: "ACTIVE", userId: "maria", toolkit: "custom_oxygen" };
+    const composio = {
+      oxygenReady: true,
+      accountActive: async () => live.value,
+      connectedAccountInfo: async () => ({ ...info }),
+    } as unknown as ComposioPlatform;
+
+    // Dead saved id, no pending dance: keep it — a blip must not lose the only id.
+    d.store.save({ ...readyUser(), oxygenComposioAccountId: "ca_dead" });
+    const kept = await healOxygenAccount(d.store.get("usr_test")!, { composio }, d.store);
+    expect(kept.oxygenComposioAccountId).toBe("ca_dead");
+
+    // A completed fresh dance replaces the dead id.
+    d.store.save({ ...kept, oxygenPendingAccountId: "ca_new" });
+    const replaced = await healOxygenAccount(d.store.get("usr_test")!, { composio }, d.store);
+    expect(replaced.oxygenComposioAccountId).toBe("ca_new");
+    expect(replaced.oxygenPendingAccountId).toBeUndefined();
+  });
+
+  it("an Oxygen heal is a no-op when the platform is off or Composio fails", async () => {
+    const d = deps();
+    const off = { oxygenReady: false, accountActive: async () => false } as unknown as ComposioPlatform;
+    d.store.save({ ...readyUser(), oxygenPendingAccountId: "ca_p" });
+    const skipped = await healOxygenAccount(d.store.get("usr_test")!, { composio: off }, d.store);
+    expect(skipped.oxygenPendingAccountId).toBe("ca_p");
+    expect(skipped.oxygenComposioAccountId).toBeUndefined();
+
+    const broken = {
+      oxygenReady: true,
+      accountActive: async () => {
+        throw new Error("composio down");
+      },
+    } as unknown as ComposioPlatform;
+    const survived = await healOxygenAccount(d.store.get("usr_test")!, { composio: broken }, d.store);
+    expect(survived.oxygenPendingAccountId).toBe("ca_p");
+    expect(survived.oxygenComposioAccountId).toBeUndefined();
+  });
+
   it("pushes the person's brain repo into the agent's files", async () => {
     const d = deps();
     const github: string[] = [];
@@ -552,7 +656,7 @@ describe("syncAgentEnv", () => {
     expect(secretPush).toBeDefined();
     expect((secretPush!.body as { value: string }).value).toBe("sk-ant");
     // Non-secret PORT still matches and is not re-pushed.
-    expect(d.mar.calls.filter((c) => c.method === "POST" && (c.body as { key: string }).key === "PORT")).toHaveLength(0);
+    expect(d.mar.calls.filter((c) => c.method === "POST" && c.url.endsWith("/env") && (c.body as { key: string }).key === "PORT")).toHaveLength(0);
   });
 
   it("provisionUser re-syncs a ready agent's env without recreating the agent", async () => {
@@ -567,5 +671,43 @@ describe("syncAgentEnv", () => {
     // No agent-create or identity call went out — nothing was recreated.
     expect(d.mar.calls.some((c) => c.url.endsWith("/api/agents") && c.method === "POST")).toBe(false);
     expect(d.ink.calls).toEqual([]);
+  });
+
+  it("bounces the container after pushing changes so the store env reaches the agent", async () => {
+    const d = deps();
+    d.mar.env[ready.maritimeAgentId!] = [
+      { key: "PORT", value: String(MARITIME_AGENT_PORT) },
+      { key: "COMPOSIO_TOOLKITS", value: "gmail,googlecalendar" },
+    ];
+    const result = await syncAgentEnv(ready, { ...d.deps, template });
+    expect(result.refreshed).toBe(true);
+    const cycle = d.mar.calls
+      .filter((c) => c.method === "POST" && /\/api\/agents\/[^/]+\/(stop|start)$/.test(c.url))
+      .map((c) => new URL(c.url).pathname.split("/").pop());
+    expect(cycle).toEqual(["stop", "start"]);
+    expect(d.mar.agentStatus[ready.maritimeAgentId!]).toBe("active");
+  });
+
+  it("still cycles the container when the store already matched (secrets always re-push)", async () => {
+    const d = deps();
+    await syncAgentEnv(ready, { ...d.deps, template });
+    const before = d.mar.calls.length;
+    const second = await syncAgentEnv(ready, { ...d.deps, template });
+    // INKBOX_API_KEY and friends are secrets: they differ on every sync by design.
+    expect(second.synced).toBeGreaterThan(0);
+    expect(second.refreshed).toBe(true);
+    expect(d.mar.calls.slice(before).some((c) => c.method === "POST" && c.url.endsWith("/stop"))).toBe(true);
+  });
+
+  it("a failed container bounce does not fail the sync", async () => {
+    const d = deps();
+    d.mar.refreshFails = true;
+    d.mar.env[ready.maritimeAgentId!] = [{ key: "PORT", value: "1" }];
+    const result = await syncAgentEnv(ready, { ...d.deps, template });
+    expect(result.synced).toBeGreaterThan(0);
+    expect(result.refreshed).toBe(false);
+    // Both calls were attempted; the start failure only logs a warning.
+    expect(d.mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/stop"))).toBe(true);
+    expect(d.mar.calls.some((c) => c.method === "POST" && c.url.endsWith("/start"))).toBe(true);
   });
 });

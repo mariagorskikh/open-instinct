@@ -37,9 +37,11 @@ apps on in the server.
 | Gateway, many users | Set `COMPOSIO_API_KEY` on the gateway; it passes the key to every agent it creates |
 | Docker compose | Fill in `COMPOSIO_API_KEY` in [`deploy/.env.example`](../deploy/.env.example) |
 
-One warning. `config.json` wins over the environment after the first boot. If you
-exported the key after `init`, apps may still be off. `instinct dev` prints a warning
-in that case. Run `instinct init --name <you> --apps` and start again.
+One warning. `config.json` wins over the environment after the first boot, with
+two exceptions operators use without editing state: `INSTINCT_MODEL` and
+`COMPOSIO_TOOLKITS`. If you exported other settings after `init`, they may not
+apply. `instinct dev` prints a warning in that case. Run
+`instinct init --name <you> --apps` and start again.
 
 ## One session per person
 
@@ -166,10 +168,12 @@ instinct dev
 | `instinct deploy` | Copies `COMPOSIO_TOOLKITS` (or the list from `config.json`) into the agent |
 | Gateway | Sends `COMPOSIO_TOOLKITS` to every new agent, default list when unset |
 
-`COMPOSIO_TOOLKITS` only seeds `config.json` on an agent's first boot; after that the
-file wins. Changing the variable on a running agent, or on the gateway for agents it
-already created, does nothing. Edit `apps.toolkits` in that agent's `config.json` (or
-run `instinct init --toolkits ...` again) and restart it, or create a new agent.
+`COMPOSIO_TOOLKITS` seeds `config.json` on an agent's first boot and keeps
+winning after that: like `INSTINCT_MODEL`, the environment overrides the file on
+every load, so changing the variable on a running agent (or on the gateway for
+agents it already created) takes effect on the agent's next restart — the
+gateway's admin reprovision endpoint does that for you. Existing OAuth
+connections stay, because Composio stores them per user id, not per session.
 
 Each toolkit needs an auth config in your Composio project. Some, such as Gmail and
 Google Calendar, can use Composio's managed one; others, often Google Contacts in a

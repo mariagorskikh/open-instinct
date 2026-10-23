@@ -87,6 +87,18 @@ describe("config", () => {
     expect(cfg.apps.toolkits).toEqual(DEFAULT_TOOLKITS);
   });
 
+  it("COMPOSIO_TOOLKITS in env overrides the file's toolkits, without rewriting the file", () => {
+    const state = tempState();
+    loadConfig(state, { COMPOSIO_TOOLKITS: "gmail,googlecalendar" });
+    const overridden = loadConfig(state, { COMPOSIO_TOOLKITS: "gmail,googlecalendar,Custom_Postiz" });
+    expect(overridden.apps.toolkits).toEqual(["gmail", "googlecalendar", "custom_postiz"]);
+    expect(overridden.apps.enabled).toBe(true);
+    // The override is per process; the file keeps what was saved, and an
+    // environment without the variable reads the file as before.
+    expect(loadConfig(state, {}).apps.toolkits).toEqual(["gmail", "googlecalendar"]);
+    expect(state.readJson<{ apps: { toolkits: string[] } }>("config.json", { apps: { toolkits: [] } }).apps.toolkits).toEqual(["gmail", "googlecalendar"]);
+  });
+
   it("saveConfig round-trips", () => {
     const state = tempState();
     const cfg = defaultConfig();

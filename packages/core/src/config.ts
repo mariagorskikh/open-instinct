@@ -1,7 +1,8 @@
 /**
  * config.json: who the owner is, which model to use, feature flags. The file wins
- * over the environment after first boot; env only seeds it. The one exception is
- * INSTINCT_MODEL, which operators use to swap models without editing state.
+ * over the environment after first boot; env only seeds it. Two exceptions
+ * operators use without editing state: INSTINCT_MODEL and COMPOSIO_TOOLKITS
+ * (the gateway pushes per-person toolkit lists to already-deployed agents).
  */
 import { normalizeEmail, normalizeHandle, normalizePhone } from "./principal.js";
 import type { StateDir } from "./state.js";
@@ -98,6 +99,15 @@ export function loadConfig(state: StateDir, env: NodeJS.ProcessEnv): InstinctCon
   }
   const cfg = withDefaults(state.readJson<Partial<InstinctConfig>>(FILE, {}));
   if (env.INSTINCT_MODEL?.trim()) cfg.model.primary = env.INSTINCT_MODEL.trim();
+  // Like INSTINCT_MODEL, the toolkit list is an operator override: the gateway
+  // recomputes COMPOSIO_TOOLKITS per person (new toolkits, connection gating)
+  // and pushes it to running agents. The override is per process; the file
+  // keeps what was saved.
+  const toolkits = splitList(env.COMPOSIO_TOOLKITS).map((t) => t.toLowerCase());
+  if (toolkits.length > 0) {
+    cfg.apps.toolkits = toolkits;
+    cfg.apps.enabled = true;
+  }
   return cfg;
 }
 
