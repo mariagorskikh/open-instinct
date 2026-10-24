@@ -613,6 +613,98 @@ describe("admin reprovision api", () => {
   });
 });
 
+describe("admin delete user api", () => {
+  function del(base: string, token: string | undefined, userId: string) {
+    return fetch(`${base}/api/admin/users/${userId}`, {
+      method: "DELETE",
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+  }
+
+  it("answers 503 while the admin token is not configured", async () => {
+    const { base, store } = await boot({ seed: [readyUser()] });
+    expect((await del(base, "whatever", "usr_test")).status).toBe(503);
+    expect(store.get("usr_test")).toBeDefined();
+  });
+
+  it("rejects a bad bearer token with 401 before touching anything", async () => {
+    const { base, store, mar, ink } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    const res = await del(base, "wrong", "usr_test");
+    expect(res.status).toBe(401);
+    expect(mar.calls).toHaveLength(0);
+    expect(ink.calls.some((c) => c.startsWith("deleteIdentity"))).toBe(false);
+    expect(store.get("usr_test")).toBeDefined();
+  });
+
+  it("404s an unknown user", async () => {
+    const { base, mar } = await boot({ seed: [], adminToken: "adm_secret" });
+    expect((await del(base, "adm_secret", "usr_missing")).status).toBe(404);
+    expect(mar.calls).toHaveLength(0);
+  });
+
+  it("deletes the Maritime agent and the Inkbox identity, then drops the store record", async () => {
+    const { base, store, mar, ink } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    mar.agentStatus["agt_42"] = "active";
+    const res = await del(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({
+      ok: true,
+      removed: true,
+      identityDeleted: true,
+      agentDeleted: true,
+      identityError: null,
+      agentError: null,
+    });
+    const call = mar.calls.find((c) => c.method === "DELETE");
+    expect(call?.url).toBe("https://maritime.test/api/agents/agt_42");
+    expect(ink.calls).toContain("deleteIdentity maria");
+    expect(store.get("usr_test")).toBeUndefined();
+  });
+
+  it("treats an already-gone Maritime agent as success and still removes the user", async () => {
+    // No agentStatus entry and no existingAgents entry → Maritime answers 404.
+    const { base, store, mar } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    const res = await del(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.removed).toBe(true);
+    expect(body.agentDeleted).toBe(true);
+    expect(mar.calls.find((c) => c.method === "DELETE")?.url).toBe("https://maritime.test/api/agents/agt_42");
+    expect(store.get("usr_test")).toBeUndefined();
+  });
+
+  it("removes the user even when Maritime errors, and reports the error", async () => {
+    const { base, store, mar } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    mar.queue.push(500);
+    const res = await del(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.removed).toBe(true);
+    expect(body.agentDeleted).toBe(false);
+    expect(body.agentError).toMatch(/Maritime 500/);
+    expect(store.get("usr_test")).toBeUndefined();
+  });
+
+  it("removes a user with no agent id without calling Maritime", async () => {
+    const { base, store, mar } = await boot({
+      seed: [readyUser({ maritimeAgentId: undefined })],
+      adminToken: "adm_secret",
+    });
+    const res = await del(base, "adm_secret", "usr_test");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({ removed: true, agentDeleted: false, agentError: null });
+    expect(mar.calls).toHaveLength(0);
+    expect(store.get("usr_test")).toBeUndefined();
+  });
+
+  it("rejects non-DELETE methods with 405", async () => {
+    const { base } = await boot({ seed: [readyUser()], adminToken: "adm_secret" });
+    expect((await fetch(`${base}/api/admin/users/usr_test`, { method: "POST" })).status).toBe(405);
+  });
+});
+
 describe("oxygen connect flow", () => {
   it("sends the browser to Composio's hosted link and records the pending account", async () => {
     const initiated: Array<{ handle: string; callback: string }> = [];

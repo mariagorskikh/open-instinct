@@ -19,7 +19,7 @@ Set on the gateway (never on an agent):
 | `COMPOSIO_API_KEY` | for the executor | The project's Composio key. With `EXECUTOR_MCP_URL` + `EXECUTOR_MCP_TOKEN` present, the gateway registers the executor toolkit at boot. |
 | `EXECUTOR_MCP_URL` | for the executor | The executor's MCP endpoint, registered as the toolkit's `app_url`. |
 | `EXECUTOR_MCP_TOKEN` | for the executor | Bearer sent to the executor on every call. Lives only in Composio's auth config and connected-account state; never forwarded to agents. |
-| `GATEWAY_ADMIN_TOKEN` | for the admin API | Bearer for `POST /api/admin/desktop/<userId>` and `POST /api/admin/reprovision/<userId>`. Unset disables both endpoints (503). |
+| `GATEWAY_ADMIN_TOKEN` | for the admin API | Bearer for `POST /api/admin/desktop/<userId>`, `POST /api/admin/reprovision/<userId>` and `DELETE /api/admin/users/<userId>`. Unset disables all three endpoints (503). |
 | `MARITIME_COMPUTERS_API_KEY` | no | Operator-minted computer key; wins over the gateway's own mint. |
 | `GITHUB_TOKEN` | no | Fleet fallback token for brain pushes. A person's own token always wins; public repos need no token. |
 
@@ -255,6 +255,31 @@ Every `syncAgentEnv` therefore ends with that bounce (`refreshed` reports it;
 a failed bounce only warns — the store stays correct for the next sync). This
 is why an agent can look "synced" in the store while its runtime still reports
 `COMPOSIO_API_KEY missing`: check the *container*, not the store.
+
+## Admin: delete a user
+
+```
+DELETE /api/admin/users/<userId>
+Authorization: Bearer <GATEWAY_ADMIN_TOKEN>
+```
+
+Full teardown of one person, in this order:
+
+1. **Inkbox identity** (best-effort) — `deleteIdentity(handle)` cascades to the
+   mailbox, number and tunnel. A 404 counts as already gone; any other failure
+   is reported in `identityError` but never blocks the rest.
+2. **Maritime agent** (best-effort) — `DELETE /api/agents/<maritimeAgentId>`.
+   A 404 counts as already gone; other failures land in `agentError`.
+3. **Store record** — always removed. This is the authoritative step: a
+   downstream hiccup is reported, never fatal.
+
+Answers: `503` while `GATEWAY_ADMIN_TOKEN` is unset, `401` on a wrong bearer,
+`404` unknown user, `405` on a non-DELETE method. The response is
+`{ok: true, removed, identityDeleted, agentDeleted, identityError, agentError}`.
+
+The platform's **Delete** button (founder-synergy-agent-platform) calls this
+endpoint through the `delete-machine` edge function, which then drops the
+`agent_machines` row — the instinct gateway itself has no Supabase access.
 
 ## One owner, many agents
 

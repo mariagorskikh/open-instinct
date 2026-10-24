@@ -476,6 +476,68 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
   }
 
   /**
+   * DELETE /api/admin/users/<userId>
+   * Full teardown of one person: best-effort Inkbox identity delete (a 404
+   * counts as already gone), best-effort Maritime agent delete (same), then
+   * drop the record from the store. The store removal is authoritative — a
+   * downstream hiccup is reported in the body, never fatal. Bearer-protected
+   * by GATEWAY_ADMIN_TOKEN; 503 while unset, 401 on a bad token, 404 unknown
+   * user. The Inkbox identity delete is what keeps the fleet's identity cap
+   * free; skipping it would leak a mailbox/number per deleted agent.
+   */
+  async function handleAdminDeleteUser(req: IncomingMessage, res: ServerResponse, userId: string): Promise<void> {
+    if (!opts.adminToken) return json(res, 503, { error: "admin api is not configured" });
+    const auth = typeof req.headers["authorization"] === "string" ? req.headers["authorization"] : "";
+    const token = auth.replace(/^Bearer\s+/i, "");
+    if (!secretMatches(token, opts.adminToken)) {
+      log.warn("admin.unauthorized", { path: req.url });
+      return json(res, 401, { error: "unauthorized" });
+    }
+    const user = opts.store.get(userId);
+    if (!user) return json(res, 404, { error: "unknown user" });
+
+    // Best-effort Inkbox teardown. deleteIdentity already treats 404 as done
+    // (mailbox + number + tunnel cascade); anything else is reported, not fatal.
+    let identityDeleted = false;
+    let identityError: string | null = null;
+    if (opts.inkbox) {
+      try {
+        await opts.inkbox.deleteIdentity(user.handle);
+        identityDeleted = true;
+      } catch (err) {
+        identityError = err instanceof Error ? err.message : String(err);
+        log.warn("admin.delete.inkbox_failed", { userId: user.id, handle: user.handle, error: identityError });
+      }
+    }
+
+    // Best-effort Maritime teardown: a 404 means the agent is already gone,
+    // which is success. The caller is deleting the person, not negotiating.
+    let agentDeleted = false;
+    let agentError: string | null = null;
+    if (user.maritimeAgentId) {
+      try {
+        await maritimeRequest(
+          { maritime: opts.maritime, fetchImpl: opts.fetchImpl },
+          "DELETE",
+          `/api/agents/${encodeURIComponent(user.maritimeAgentId)}`,
+        );
+        agentDeleted = true;
+      } catch (err) {
+        if (err instanceof MaritimeApiError && err.status === 404) {
+          agentDeleted = true; // already gone — best-effort success
+        } else {
+          agentError = err instanceof Error ? err.message : String(err);
+          log.warn("admin.delete.maritime_failed", { userId: user.id, agentId: user.maritimeAgentId, error: agentError });
+        }
+      }
+    }
+
+    const removed = opts.store.remove(user.id);
+    log.info("admin.delete", { userId: user.id, handle: user.handle, identityDeleted, agentDeleted, removed });
+    return json(res, 200, { ok: true, removed, identityDeleted, agentDeleted, identityError, agentError });
+  }
+
+  /**
    * POST /connect/<userId> — the connect page's connections form (brain + Postiz).
    * Empty repo clears the brain (and its token); an empty token or Postiz key
    * keeps the saved one; the Postiz checkbox removes it. The brain push and the
@@ -723,6 +785,10 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     if (parts[0] === "api" && parts[1] === "admin" && parts[2] === "reprovision" && parts.length === 4) {
       if (method !== "POST") throw new HttpError(405, "method not allowed");
       return handleAdminReprovision(req, res, decodeURIComponent(parts[3] ?? ""));
+    }
+    if (parts[0] === "api" && parts[1] === "admin" && parts[2] === "users" && parts.length === 4) {
+      if (method !== "DELETE") throw new HttpError(405, "method not allowed");
+      return handleAdminDeleteUser(req, res, decodeURIComponent(parts[3] ?? ""));
     }
     if (parts[0] === "connect" && parts.length === 3 && parts[2] === "oxygen") {
       if (method !== "GET") throw new HttpError(405, "method not allowed");

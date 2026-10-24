@@ -101,7 +101,9 @@ export function fakeInkbox(opts: { subscriptionSigningKey?: string } = {}): Fake
     async createInvitation() {
       return { id: "inv_1" };
     },
-    async deleteIdentity() {},
+    async deleteIdentity(handle: string) {
+      calls.push(`deleteIdentity ${handle}`);
+    },
     // Every subscription is missing call.ended, as one made before the event existed would be.
     async ensureWebhookEvents(subscriptionId: string) {
       calls.push(`ensureWebhookEvents ${subscriptionId}`);
@@ -153,6 +155,15 @@ export function fakeMaritime(): FakeMaritime {
       return new Response(JSON.stringify(agent), { status: 201 });
     }
     if (method === "POST" && url.includes("/chat")) return new Response(JSON.stringify({ response: "ok" }), { status: 200 });
+    if (method === "DELETE" && /\/api\/agents\/[^/?]+$/.test(url)) {
+      const id = decodeURIComponent(url.split("/").pop() ?? "");
+      if (!(id in state.agentStatus) && !state.existingAgents.some((a) => a.id === id)) {
+        return new Response(JSON.stringify({ detail: "not found" }), { status: 404 });
+      }
+      delete state.agentStatus[id];
+      state.existingAgents = state.existingAgents.filter((a) => a.id !== id);
+      return new Response(null, { status: 204 });
+    }
     const cycleMatch = url.match(/\/api\/agents\/([^/?]+)\/(stop|start|restart)$/);
     if (cycleMatch) {
       const id = decodeURIComponent(cycleMatch[1] ?? "");
