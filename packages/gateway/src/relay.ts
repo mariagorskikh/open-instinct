@@ -1,4 +1,4 @@
-import { encodeEvent } from "@open-instinct/core";
+import { BUDGET_EXHAUSTED_PATTERN, encodeEvent } from "@open-instinct/core";
 import { verifyInkboxSignature } from "@open-instinct/inkbox";
 import { type Logger, silentLogger } from "./logger.js";
 import { DEFAULT_MARITIME_BASE_URL } from "./provision.js";
@@ -9,6 +9,8 @@ export type HeaderMap = Record<string, string | string[] | undefined>;
 export interface RelayResult {
   status: "forwarded" | "ignored" | "rejected";
   reason?: string;
+  /** "budget": Maritime refused because the agent's AI budget is spent. A retry helps only once it is raised. */
+  cause?: "budget";
 }
 
 export interface RelayDeps {
@@ -103,6 +105,13 @@ export function conversationIdOf(payload: Json): string {
 
 const RETRY_STATUSES = new Set([429, 502, 503, 504]);
 
+/**
+ * Maritime answers some failures as a 200 whose `response` is its own text, not the agent's:
+ * a VM that will not wake, a snapshot that is gone. Counting those as delivered loses the
+ * message, so they are failures the caller retries.
+ */
+const PLATFORM_REPLY = /couldn.t be woken|can.t be woken|VM not found|^fc-manager|Agent is AgentStatus|All connection attempts failed/i;
+
 export async function relayEvent(user: UserRecord, rawBody: Buffer, headers: HeaderMap, deps: RelayDeps): Promise<RelayResult> {
   const log = deps.logger ?? silentLogger;
   if (!verifyForUser(rawBody, headers, user)) {
@@ -128,10 +137,11 @@ export async function relayEvent(user: UserRecord, rawBody: Buffer, headers: Hea
 const AGENT_NOT_READY = new Set(["building", "deploying", "starting", "creating", "pending", "queued", "provisioning", "updating", "restarting"]);
 
 /**
- * A /chat sent while the VM is still being built is accepted with a 200 and lost: the
- * first message after signup lands in that window (the connect page even invites it).
- * Ask Maritime for the agent's state first and report "not ready" so the caller's retry
- * (the durable inbox) delivers it later. An unreadable status does not block the send.
+ * A /chat sent while the VM is still being built is accepted with a 200 and lost:
+ * the first message after signup, and the operator's prepare task, arrive in that
+ * window. Ask Maritime for the agent's state first and report "not ready" so the
+ * caller's retry (the durable inbox, the provisioning queue) delivers it later.
+ * An unreadable status does not block the send.
  */
 export async function agentNotReadyReason(user: Pick<UserRecord, "maritimeAgentId" | "createdAt">, deps: RelayDeps): Promise<string | undefined> {
   const agentId = user.maritimeAgentId;
@@ -226,9 +236,16 @@ async function postChat(agentId: string, body: { message: string; conversation_i
         const err = parsed && typeof parsed["error"] === "string" ? parsed["error"] : undefined;
         // A delivered /chat carries the agent's answer as a string (often "" or a JSON ack). A null or
         // missing response with no error is Maritime accepting a message it could not hand over.
-        if (!err && parsed && typeof parsed["response"] === "string") return { status: "forwarded" };
+        const reply = parsed && typeof parsed["response"] === "string" ? (parsed["response"] as string) : undefined;
+        // A spent budget (account credits or the agent's own monthly limit) is not transient: no retries,
+        // and the caller can tell the owner why the agent is quiet.
+        const platformText = err ?? (reply !== undefined && PLATFORM_REPLY.test(reply) ? reply : undefined);
+        if (platformText && BUDGET_EXHAUSTED_PATTERN.test(platformText)) {
+          return { status: "rejected", reason: `maritime: ${platformText.slice(0, 160)}`, cause: "budget" };
+        }
+        if (!err && reply !== undefined && !PLATFORM_REPLY.test(reply)) return { status: "forwarded" };
         if (!err && !parsed) return { status: "forwarded" };
-        lastReason = err ? `maritime: ${err}` : "maritime: accepted without a response (agent not running?)";
+        lastReason = err ? `maritime: ${err}` : reply !== undefined ? `maritime: ${reply.slice(0, 120)}` : "maritime: accepted without a response (agent not running?)";
       } else if (RETRY_STATUSES.has(res.status)) {
         lastReason = `maritime ${res.status}`;
       } else {

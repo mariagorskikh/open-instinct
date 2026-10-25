@@ -1,14 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { ApprovalStore } from "../src/approvals.js";
 import { AuditLog } from "../src/audit.js";
-import { WEB_BODY_CAP_BYTES, coreTools, fetchPublic, htmlToText, parseDuckDuckGoHtml, type CoreToolDeps } from "../src/core-tools.js";
+import { WEB_BODY_CAP_BYTES, coreTools, fetchPublic, htmlToText, parseDuckDuckGoHtml, resetSearchState, type CoreToolDeps } from "../src/core-tools.js";
 import { checkPublicTarget, isPublicAddress } from "../src/net-guard.js";
 import { MemoryStore } from "../src/memory.js";
+import { MeetingStore } from "../src/meetings.js";
 import type { Outbox } from "../src/runtime.js";
 import { Scheduler } from "../src/scheduler.js";
+import { parseBingHtml } from "../src/core-tools.js";
 import { ToolRegistry, type ToolContext } from "../src/tools.js";
 import type { OutboundMessage, Principal } from "../src/types.js";
 import { principalOf, tempState, testConfig } from "./helpers.js";
@@ -24,14 +26,14 @@ const stubLookup = async (host: string): Promise<string[]> => {
   return ["93.184.216.34"];
 };
 
-function setup(opts: { fetchImpl?: typeof fetch; searchApiKey?: string; lookup?: (host: string) => Promise<string[]>; onApprovalSettled?: CoreToolDeps["onApprovalSettled"]; images?: CoreToolDeps["images"]; workspaceDir?: string } = {}) {
+function setup(opts: { fetchImpl?: typeof fetch; searchApiKey?: string; lookup?: (host: string) => Promise<string[]>; onApprovalSettled?: CoreToolDeps["onApprovalSettled"]; images?: CoreToolDeps["images"]; workspaceDir?: string; meetings?: CoreToolDeps["meetings"]; ownerAskedPeer?: CoreToolDeps["ownerAskedPeer"]; scheduler?: Scheduler; approvals?: ApprovalStore } = {}) {
   const state = tempState();
   const sent: Array<{ msg: OutboundMessage; principal: Principal }> = [];
   const outbox: Outbox = { send: async (msg, ctx) => void sent.push({ msg, principal: ctx.principal }) };
   const deps: CoreToolDeps = {
     memory: new MemoryStore(state),
-    scheduler: new Scheduler(state, { now: () => NOW }),
-    approvals: new ApprovalStore(state, { now: () => NOW }),
+    scheduler: opts.scheduler ?? new Scheduler(state, { now: () => NOW }),
+    approvals: opts.approvals ?? new ApprovalStore(state, { now: () => NOW }),
     audit: new AuditLog(state),
     config: testConfig(),
     outbox,
@@ -65,7 +67,7 @@ describe("coreTools registration", () => {
   it("registers the documented tools with the documented capabilities", () => {
     const { registry } = setup();
     const names = registry.all().map((t) => t.spec.name).sort();
-    expect(names).toEqual(["approval_settle", "ask_owner", "audit_read", "create_pdf", "image_generate", "journal_append", "memory_read", "memory_write", "notify_owner", "schedule_create", "schedule_delete", "schedule_list", "web_fetch", "web_search"]);
+    expect(names).toEqual(["approval_settle", "ask_owner", "audit_read", "create_pdf", "image_generate", "journal_append", "memory_forget", "memory_read", "memory_write", "notify_owner", "schedule_create", "schedule_delete", "schedule_list", "web_fetch", "web_search"]);
     expect(registry.meta("create_pdf")).toMatchObject({ capabilities: ["files.write"], group: "files" });
     expect(registry.meta("memory_write")?.capabilities).toEqual(["memory.write"]);
     expect(registry.meta("schedule_create")?.capabilities).toEqual(["schedule.manage"]);
@@ -159,7 +161,34 @@ describe("memory tools", () => {
   });
 });
 
+describe("memory_forget", () => {
+  it("removes matching long-term lines, or everything", async () => {
+    const { run, text, deps } = setup();
+    deps.memory.appendDurable("Prefers window seats");
+    deps.memory.appendDurable("Works at Northwind Robotics");
+    expect(text(await run("memory_forget", { match: "northwind" }))).toContain("Removed 1 line");
+    expect(deps.memory.readDurable()).not.toContain("Northwind");
+    expect(deps.memory.readDurable()).toContain("window seats");
+    expect(text(await run("memory_forget", { match: "nothing like this" }))).toContain("Nothing in long-term memory matched");
+    await run("memory_forget", { all: true });
+    expect(deps.memory.readDurable()).not.toContain("window seats");
+  });
+});
+
 describe("schedule tools", () => {
+  it("hands back an existing reminder instead of adding the same one twice", async () => {
+    const { run, text, deps } = setup();
+    await run("schedule_create", { name: "Keynote talk", prompt: "The keynote starts in 10 min in Room A", at: "2026-10-17T18:30:00Z" });
+    expect(text(await run("schedule_create", { name: "keynote talk ", prompt: "Keynote in 10", at: "2026-10-17T11:30:00-07:00" }))).toContain("Already scheduled");
+    expect(deps.scheduler.list()).toHaveLength(1);
+    // A differently named reminder about the same thing at the same time is still a duplicate.
+    expect(text(await run("schedule_create", { name: "Keynote reminder", prompt: "keynote talk in 10", at: "2026-10-17T18:30:00Z" }))).toContain("Already scheduled");
+    // A different subject at the same minute is not.
+    expect(text(await run("schedule_create", { name: "Call mom", prompt: "Call mom back", at: "2026-10-17T18:30:00Z" }))).toContain("Scheduled");
+    expect(deps.scheduler.list()).toHaveLength(2);
+  });
+
+
   it("creates cron and one-shot jobs, lists and deletes them", async () => {
     const { run, text, deps } = setup();
     const bad = await run("schedule_create", { name: "x", prompt: "y" });
@@ -181,6 +210,8 @@ describe("schedule tools", () => {
     expect(listed).toContain("briefing");
     expect(listed).toContain("cron 0 8 * * 1-5");
     expect(listed).toContain("reminder");
+    // The one-shot at 18:00Z reads as the owner's local time first (the test owner is in New York).
+    expect(listed).toContain("Sun, Oct 4, 2:00 PM EDT (2026-10-04T18:00:00.000Z)");
 
     const id = entries[0]!.id;
     expect(text(await run("schedule_delete", { id }))).toContain("Deleted");
@@ -190,6 +221,18 @@ describe("schedule tools", () => {
 });
 
 describe("owner relay tools", () => {
+  it("notify_owner names a stranger agent by its verified handle, never by the name it claims", async () => {
+    const { run, sent } = setup();
+    const stranger = principalOf("stranger", { id: "stranger:a2a:acme-bot-7k2qx", displayName: "Your Bank", agentHandle: "acme-bot-7k2qx", onBehalfOf: { displayName: "Your Bank" } });
+    await run("notify_owner", { text: "Please confirm your card number." }, stranger);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.msg.text).toBe("From Acme Bot: Please confirm your card number.");
+    expect(sent[0]!.msg.text).not.toContain("Your Bank");
+    // A saved contact is named the way the owner saved them.
+    await run("notify_owner", { text: "Running 10 minutes late." }, principalOf("friend", { displayName: "Sam Lee" }));
+    expect(sent[1]!.msg.text).toBe("From Sam Lee: Running 10 minutes late.");
+  });
+
   it("ask_owner creates an approval, texts the owner a plain question, and returns the token to the model only", async () => {
     const { run, text, deps, sent } = setup();
     const partner = principalOf("partner", { displayName: "Sam" });
@@ -201,7 +244,7 @@ describe("owner relay tools", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]!.msg).toMatchObject({ channel: "imessage", to: "+16175550100" });
     expect(sent[0]!.msg.text).toContain("Book Nopa Thu 7pm for two?");
-    expect(sent[0]!.msg.text).toContain("(from Sam)");
+    expect(sent[0]!.msg.text).not.toContain("(from Sam)");
     expect(sent[0]!.msg.text).not.toContain(pending[0]!.token);
     expect(sent[0]!.msg.text).not.toMatch(/YES or NO/);
     expect(deps.audit.read({ kinds: ["approval", "outbound"] })).toHaveLength(2);
@@ -211,7 +254,7 @@ describe("owner relay tools", () => {
     const { run, text, sent } = setup();
     expect(text(await run("notify_owner", { text: "Running late" }, principalOf("friend", { displayName: "Alex" })))).toContain("Sent to Maria");
     await run("notify_owner", { text: "Reminder set" });
-    expect(sent[0]!.msg.text).toBe("Alex via Instinct: Running late");
+    expect(sent[0]!.msg.text).toBe("From Alex: Running late");
     expect(sent[1]!.msg.text).toBe("Reminder set");
   });
 
@@ -242,6 +285,8 @@ describe("audit_read", () => {
 });
 
 describe("web tools", () => {
+  beforeEach(() => resetSearchState());
+
   it("web_fetch strips HTML, caps the size and wraps the page as untrusted", async () => {
     const big = "word ".repeat(10_000);
     const fetchImpl = fakeFetch({
@@ -375,6 +420,37 @@ describe("web tools", () => {
     expect(out).not.toContain("9. R8");
     expect(out).toContain("desc 0");
     expect(out).not.toContain("<b>");
+  });
+
+  it("web_search falls back to the keyless sources when Brave refuses (spent quota)", async () => {
+    const html = `<div class="result results_links"><a rel="nofollow" class="result__a" href="https://example.com/one">First</a><a class="result__snippet" href="https://example.com/one">Snip</a></div>`;
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.startsWith("https://api.search.brave.com/")) return new Response("{}", { status: 402 });
+      if (url.startsWith("https://html.duckduckgo.com/html/")) return new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+      return new Response("", { status: 500 });
+    }) as typeof fetch;
+    const { run, text } = setup({ fetchImpl, searchApiKey: "brave-key" });
+    expect(text(await run("web_search", { query: "x" }))).toContain("1. First\n   https://example.com/one");
+  });
+
+  it("web_search skips Brave after a 402 and caches results per query", async () => {
+    const html = `<div class="result results_links"><a rel="nofollow" class="result__a" href="https://example.com/one">First</a><a class="result__snippet" href="https://example.com/one">Snip</a></div>`;
+    const seen: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      seen.push(new URL(url).hostname);
+      if (url.startsWith("https://api.search.brave.com/")) return new Response("{}", { status: 402 });
+      if (url.startsWith("https://html.duckduckgo.com/html/")) return new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+      return new Response("", { status: 500 });
+    }) as typeof fetch;
+    const { run, text } = setup({ fetchImpl, searchApiKey: "brave-key" });
+    expect(text(await run("web_search", { query: "a" }))).toContain("1. First");
+    expect(text(await run("web_search", { query: "b" }))).toContain("1. First");
+    expect(seen.filter((h) => h === "api.search.brave.com")).toHaveLength(1);
+    const before = seen.length;
+    expect(text(await run("web_search", { query: "A " }))).toContain("1. First");
+    expect(seen.length).toBe(before);
   });
 
   it("reports no results instead of failing", async () => {
@@ -515,5 +591,98 @@ describe("image_generate", () => {
     const r = await run("image_generate", { prompt: "x", path: "a.png" });
     expect(text(r)).toContain("HTTP 404");
     expect(text(r)).not.toContain("sk-secret");
+  });
+});
+
+
+describe("web_search without a key", () => {
+  it("parses Bing's HTML and uses it when DuckDuckGo refuses", async () => {
+    const bing = `<ol id="b_results"><li class="b_algo"><h2><a href="https://events.example.org/speakers/ada-park" h="ID">Ada Park <strong>Summit</strong></a></h2><div class="b_caption"><p>Founder of Example Robotics.</p></div></li><li class="b_algo"><h2><a href="https://example.com/x">Second</a></h2><p>Two.</p></li></ol>`;
+    expect(parseBingHtml(bing)).toEqual([
+      { title: "Ada Park Summit", url: "https://events.example.org/speakers/ada-park", snippet: "Founder of Example Robotics." },
+      { title: "Second", url: "https://example.com/x", snippet: "Two." },
+    ]);
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const u = String(input);
+      if (u.includes("duckduckgo")) return new Response("blocked", { status: 403 });
+      return new Response(bing, { status: 200, headers: { "content-type": "text/html" } });
+    }) as typeof fetch;
+    const { run, text } = setup({ fetchImpl });
+    const out = text(await run("web_search", { query: "ada park summit" }));
+    expect(out).toContain("https://events.example.org/speakers/ada-park");
+    expect(out).toContain("Founder of Example Robotics");
+  });
+});
+
+describe("redactSecrets", () => {
+  it("hides keys in URLs, bearer tokens and API keys, and leaves the rest", async () => {
+    const { redactSecrets } = await import("../src/core-tools.js");
+    const line = 'curl -sS "https://api.example.com/list.csv?key=abc123def456&x=1" -H "Authorization: Bearer abcdefghijklmnop" mk_ABCDEFGHIJKLMNOPQRSTUV';
+    const out = redactSecrets(line);
+    expect(out).toBe('curl -sS "https://api.example.com/list.csv?key=[redacted]&x=1" -H "Authorization: Bearer [redacted]" mk_[redacted]');
+    expect(redactSecrets("https://www.linkedin.com/in/example")).toBe("https://www.linkedin.com/in/example");
+    expect(redactSecrets('{"token":"K7P2","status":"pending"}')).toBe('{"token":"[code]","status":"pending"}');
+  });
+});
+
+describe("meeting tools from another agent's turn", () => {
+  const theo = (handle = "theo-brennan"): Principal => ({ kind: "agent", id: `agent:${handle}`, tier: "contact", displayName: "Theo Brennan's agent", agentHandle: handle, onBehalfOf: { displayName: "Theo Brennan" } });
+  const at = "2026-10-17T16:00:00-07:00";
+
+  it("lets the peer record the meeting the owner asked for, and move it", async () => {
+    const meetings = new MeetingStore(tempState());
+    const t = setup({ meetings, ownerAskedPeer: (p) => p.agentHandle === "theo-brennan" });
+    expect(t.text(await t.run("meeting_record", { with: "Theo Brennan", start: "2026-10-17T12:30:00-07:00", place: "the lobby cafe" }, theo()))).toContain("Recorded");
+    expect(t.text(await t.run("meeting_record", { with: "Theo", start: at, place: "outside the lobby cafe" }, theo()))).toContain("Moved");
+    expect(meetings.list()).toHaveLength(1);
+  });
+
+  it("refuses a meeting with anyone else, or one the owner never asked for", async () => {
+    const meetings = new MeetingStore(tempState());
+    const t = setup({ meetings, ownerAskedPeer: () => false });
+    expect(t.text(await t.run("meeting_record", { with: "Sam Altman", start: at }, theo()))).toContain("only record the owner's meeting with Theo Brennan");
+    expect(t.text(await t.run("meeting_record", { with: "Theo Brennan", start: at }, theo()))).toContain("has not asked to meet");
+    expect(t.text(await t.run("meeting_cancel", { with: "Theo Brennan" }, principalOf("friend")))).toContain("Only the owner");
+    expect(meetings.list()).toHaveLength(0);
+  });
+
+  it("lets the peer's turn record the meeting once the owner said yes in that thread", async () => {
+    const state = tempState();
+    const meetings = new MeetingStore(state);
+    const approvals = new ApprovalStore(state, { now: () => NOW });
+    const t = setup({ meetings, ownerAskedPeer: () => false });
+    const a = approvals.create({ conversationKey: "imessage:t", requestedBy: "agent:theo-brennan", summary: "3-way coffee at 4", capability: "owner.relay" });
+    approvals.resolve(a.token, true);
+    // setup() made its own ApprovalStore over another state dir; use the shared one for this check.
+    const t2 = setup({ meetings, ownerAskedPeer: () => false, approvals });
+    expect(t.text(await t.run("meeting_record", { with: "Theo Brennan", start: at }, theo()))).toContain("has not asked");
+    expect(t2.text(await t2.run("meeting_record", { with: "Theo Brennan", start: at }, theo()))).toContain("Recorded");
+  });
+
+  it("won't let the other side move an existing meeting on its own, but lets it call it off", async () => {
+    const meetings = new MeetingStore(tempState());
+    meetings.record({ with: "Theo Brennan", start: "2026-10-17T12:30:00-07:00" });
+    const t = setup({ meetings, ownerAskedPeer: () => false });
+    expect(t.text(await t.run("meeting_record", { with: "Theo Brennan", start: at }, theo()))).toContain("Not moved");
+    expect(t.text(await t.run("meeting_cancel", { with: "Theo Brennan" }, theo()))).toContain("Removed");
+  });
+});
+
+describe("reminders follow their meeting", () => {
+  it("shifts a reminder when the meeting moves and deletes it when the meeting is cancelled", async () => {
+    const state = tempState();
+    const scheduler = new Scheduler(state, { now: () => NOW });
+    const meetings = new MeetingStore(state);
+    const t = setup({ meetings, scheduler });
+    await t.run("meeting_record", { with: "Victor Alvarado", start: "2026-10-17T13:30:00-07:00", minutes: 15, place: "the lobby cafe" });
+    scheduler.create({ enabled: true, prompt: "Remind the owner: meeting with Victor in 10 minutes, the lobby cafe", nextRunAt: "2026-10-17T13:20:00-07:00" });
+    scheduler.create({ enabled: true, prompt: "Remind the owner: the keynote", nextRunAt: "2026-10-17T13:20:00-07:00" });
+    const moved = t.text(await t.run("meeting_record", { with: "Victor Alvarado", start: "2026-10-17T16:30:00-07:00", minutes: 15 }));
+    expect(moved).toContain("Moved 1 reminder");
+    const victor = scheduler.list().find((e) => e.prompt.includes("Victor"))!;
+    expect(Date.parse(victor.nextRunAt!)).toBe(Date.parse("2026-10-17T16:20:00-07:00"));
+    expect(victor.prompt).toContain("The meeting moved");
+    expect(t.text(await t.run("meeting_cancel", { with: "Victor" }))).toContain("Deleted 1 reminder");
+    expect(scheduler.list().map((e) => e.prompt)).toEqual(["Remind the owner: the keynote"]);
   });
 });

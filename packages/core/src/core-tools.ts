@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import type { ApprovalStore } from "./approvals.js";
 import type { AuditLog } from "./audit.js";
 import type { MemoryStore } from "./memory.js";
+import { meetingTime, samePerson, type Meeting, type MeetingStore } from "./meetings.js";
 import { checkPublicTarget, type Lookup } from "./net-guard.js";
 import { pdfPageCount, renderMarkdownToPdf } from "./pdf.js";
 import { wrapUntrusted } from "./prompt.js";
@@ -15,7 +16,7 @@ import type { Outbox } from "./runtime.js";
 import type { Scheduler } from "./scheduler.js";
 import { SPEND_CAPABILITIES } from "./policy.js";
 import { defineTool, textResult, type RegisteredTool, type ToolContext, type ToolResultLike } from "./tools.js";
-import type { Approval, AuditKind, InstinctConfig } from "./types.js";
+import type { Approval, AuditKind, InstinctConfig, Principal, ScheduleEntry } from "./types.js";
 
 export interface CoreToolDeps {
   memory: MemoryStore;
@@ -28,10 +29,22 @@ export interface CoreToolDeps {
   /** DNS lookup used to vet web_fetch targets; tests inject a stub. */
   lookup?: Lookup;
   searchApiKey?: string;
+  /** Return a reason to refuse a PDF (the host decides when), or undefined to allow it. */
+  pdfGuard?: (path: string, title: string | undefined) => string | undefined;
+  /** The owner's agreed meetings. Without it the meeting tools are not offered. */
+  meetings?: MeetingStore;
+  /** True when the owner asked this peer agent for something (an intro, a meeting). Lets that peer's turn record the agreed time. */
+  ownerAskedPeer?: (principal: Principal) => boolean;
   /** The owner's workspace directory. create_pdf writes under it; without it the tool refuses. */
   workspaceDir?: string;
   /** Called after approval_settle resolves an approval, so the runtime can wake the conversation that was waiting. */
   onApprovalSettled?: (approval: Approval, approved: boolean) => Promise<void> | void;
+  /**
+   * How ask_owner and notify_owner reach the owner. The runtime supplies this so those texts take the
+   * owner's current route (phone, last thread, or the dashboard chat) and its merge window; without it
+   * the tools text the owner's first phone directly.
+   */
+  sendToOwner?: (text: string, ctx: ToolContext, opts: { approvalToken?: string }) => Promise<boolean>;
   /** An OpenAI-compatible images endpoint (`POST {baseUrl}/images/generations`). Without it image_generate explains what to set. */
   images?: { apiKey: string; baseUrl?: string; model?: string };
 }
@@ -45,6 +58,16 @@ const WEB_TEXT_CAP = 20_000;
 /** Bytes read from a fetched page before giving up on the rest. */
 export const WEB_BODY_CAP_BYTES = 1024 * 1024;
 const FETCH_TIMEOUT_MS = 15_000;
+const KEYLESS_TIMEOUT_MS = 8_000;
+const BRAVE_BACKOFF_MS = 30 * 60_000;
+const SEARCH_CACHE_MS = 10 * 60_000;
+let braveDownUntil = 0;
+const searchCache = new Map<string, { at: number; hits: SearchHit[] }>();
+/** Tests reset the search state between cases. */
+export function resetSearchState(): void {
+  braveDownUntil = 0;
+  searchCache.clear();
+}
 const MAX_REDIRECTS = 3;
 const SEARCH_RESULTS = 8;
 
@@ -58,7 +81,125 @@ export function coreTools(deps: CoreToolDeps): RegisteredTool[] {
     webSearchTool(deps),
     createPdfTool(deps),
     imageGenerateTool(deps),
+    ...(deps.meetings ? meetingTools(deps.meetings, deps.config, deps.ownerAskedPeer, deps.scheduler, deps.approvals) : []),
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Meetings
+// ---------------------------------------------------------------------------
+
+/**
+ * Another agent's turn may record or cancel only the owner's meeting with that agent's own
+ * person, and only when that meeting exists or the owner asked for it. Otherwise the side
+ * that accepted a time over A2A had no way to write it down, and the two owners ended up
+ * with different plans.
+ */
+function peerMeetingRefusal(ctx: ToolContext, who: string, meetings: MeetingStore, ownerAskedPeer?: (p: Principal) => boolean, ownerApproved?: (conversationKey: string) => boolean, action: "record" | "cancel" = "record"): string | undefined {
+  const p = ctx.principal;
+  if (p.kind === "owner") return undefined;
+  if (p.kind !== "agent") return "Only the owner can change their meetings.";
+  const person = p.onBehalfOf?.displayName ?? p.displayName.replace(/[\u2019']s agent$/i, "");
+  if (!samePerson(who, person)) return `From this conversation you can only record the owner's meeting with ${person}.`;
+  const existing = meetings.list().some((m) => samePerson(m.with, person));
+  // The other side may always call a meeting off.
+  if (action === "cancel") return existing ? undefined : `No recorded meeting with ${person}.`;
+  // Recording or moving needs the owner: they asked this person, or said yes in this thread. A note or a
+  // question from the other agent once moved a meeting on its own (in testing, to a time nobody had agreed).
+  if (!ownerAskedPeer?.(p) && !ownerApproved?.(ctx.conversationKey)) {
+    return existing
+      ? `Not moved: the owner has not agreed to a new time with ${person}. Ask the owner first, then record it.`
+      : `The owner has not asked to meet ${person}; tell the owner instead of recording it.`;
+  }
+  return undefined;
+}
+
+/**
+ * One-shot reminders for a meeting: due in the 90 minutes before it starts and naming the person.
+ * Multi-agent testing moved and cancelled meetings while their reminders stayed at the
+ * old time, so the owner would have been sent to a meeting that no longer existed.
+ */
+function remindersFor(scheduler: Scheduler, m: Meeting): ScheduleEntry[] {
+  const start = Date.parse(m.start);
+  const first = m.with.split(/\s+/)[0]!.toLowerCase();
+  return scheduler.list().filter((e) => {
+    if (e.cron || !e.enabled || !e.nextRunAt) return false;
+    const at = Date.parse(e.nextRunAt);
+    if (!(at <= start && at >= start - 6 * 60 * 60_000)) return false;
+    const text = `${e.name ?? ""} ${e.prompt}`.toLowerCase();
+    return first.length >= 2 && new RegExp(`\\b${first.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(text);
+  });
+}
+
+/** Move (or, with no new meeting, delete) the reminders that belong to `old`. Returns how many. */
+function followMeeting(scheduler: Scheduler | undefined, old: Meeting, next: Meeting | undefined, tz: string | undefined): number {
+  if (!scheduler) return 0;
+  const found = remindersFor(scheduler, old);
+  for (const e of found) {
+    scheduler.delete(e.id);
+    if (!next) continue;
+    const shift = Date.parse(next.start) - Date.parse(old.start);
+    const { id: _id, createdAt: _c, lastRunAt: _l, ...rest } = e;
+    scheduler.create({ ...rest, nextRunAt: new Date(Date.parse(e.nextRunAt!) + shift).toISOString(), prompt: `${e.prompt} (The meeting moved: it is now ${meetingTime(next, tz)}${next.place ? `, ${next.place}` : ""}.)` });
+  }
+  return found.length;
+}
+
+function meetingTools(meetings: MeetingStore, config: InstinctConfig, ownerAskedPeer?: (p: Principal) => boolean, scheduler?: Scheduler, approvals?: ApprovalStore): RegisteredTool[] {
+  const tz = config.owner.timezone;
+  const record = defineTool({
+    name: "meeting_record",
+    label: "Record meeting",
+    description:
+      "Record a meeting the owner has agreed to, once both sides said yes to this exact time (an intro, a coffee, a dinner). Recording the same person again moves their meeting. Refuses a time that overlaps another meeting; then offer the next free slot instead. Every recorded meeting is shown to you on each turn.",
+    parameters: Type.Object({
+      with: Type.String({ description: "Who the owner meets, e.g. Victor Alvarado" }),
+      start: Type.String({ description: "Start time, ISO 8601 with the owner's UTC offset" }),
+      minutes: Type.Optional(Type.Number({ description: "Length in minutes (default 20)" })),
+      place: Type.Optional(Type.String({ description: "Where, e.g. the lobby cafe" })),
+      note: Type.Optional(Type.String({ description: "Short context, e.g. intro over lunch" })),
+    }),
+    meta: { capabilities: ["converse"], group: "memory", describe: (a) => `meeting with ${argText(a, "with")} at ${argText(a, "start")}` },
+    execute: async (args, ctx) => {
+      const refused = peerMeetingRefusal(ctx, args.with, meetings, ownerAskedPeer, (k) => approvals?.approvedIn(k) ?? false);
+      if (refused) return fail(refused);
+      const r = meetings.record(args);
+      if (r.error) return fail(r.error);
+      if (r.clash) return fail(`That overlaps the owner's meeting with ${r.clash.with} at ${meetingTime(r.clash, tz)}. Nothing was recorded; offer the next free slot instead.`);
+      const m = r.meeting!;
+      const when = `${meetingTime(m, tz)}${m.place ? `, ${m.place}` : ""}`;
+      const followed = r.moved && r.moved.start !== m.start ? followMeeting(scheduler, r.moved, m, tz) : 0;
+      return textResult(r.moved ? `Moved ${m.with} from ${meetingTime(r.moved, tz)} to ${when}.${followed ? ` Moved ${followed} reminder${followed === 1 ? "" : "s"} with it.` : ""}` : `Recorded: ${m.with}, ${when}.`);
+    },
+  });
+  const cancel = defineTool({
+    name: "meeting_cancel",
+    label: "Cancel meeting",
+    description: "Remove a recorded meeting when the owner or the other side calls it off. Give the person's name.",
+    parameters: Type.Object({ with: Type.String({ description: "The person's name (or the meeting id)" }) }),
+    meta: { capabilities: ["converse"], group: "memory", describe: (a) => `cancel meeting with ${argText(a, "with")}` },
+    execute: async ({ with: who }, ctx) => {
+      const refused = peerMeetingRefusal(ctx, who, meetings, ownerAskedPeer, (k) => approvals?.approvedIn(k) ?? false, "cancel");
+      if (refused) return fail(refused);
+      const m = meetings.cancel(who);
+      if (!m) return fail(`No recorded meeting with ${who}.`);
+      const followed = followMeeting(scheduler, m, undefined, tz);
+      return textResult(`Removed: ${m.with}, ${meetingTime(m, tz)}.${followed ? ` Deleted ${followed} reminder${followed === 1 ? "" : "s"} for it.` : ""}`);
+    },
+  });
+  const list = defineTool({
+    name: "meeting_list",
+    label: "List meetings",
+    description: "List the owner's recorded meetings, soonest first, in local time.",
+    parameters: Type.Object({}),
+    meta: { capabilities: ["memory.write"], group: "memory", describe: () => "list meetings" },
+    execute: async () => {
+      const all = meetings.upcoming();
+      if (all.length === 0) return textResult("No meetings recorded.");
+      return textResult(all.map((m) => `- ${m.with}: ${meetingTime(m, tz)} (${m.minutes} min)${m.place ? `, ${m.place}` : ""}`).join("\n"));
+    },
+  });
+  return [record, cancel, list];
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +240,25 @@ function memoryTools({ memory }: CoreToolDeps): RegisteredTool[] {
     },
   });
 
+  const memoryForget = defineTool({
+    name: "memory_forget",
+    label: "Forget memory",
+    description: "Delete from long-term memory when the owner asks you to forget something: every line containing `match`, or everything when all=true (\"delete everything you know about me\"). Say back what was removed.",
+    parameters: Type.Object({
+      match: Type.Optional(Type.String({ description: "Words that identify the lines to remove" })),
+      all: Type.Optional(Type.Boolean({ description: "true wipes long-term memory entirely" })),
+    }),
+    meta: { capabilities: ["memory.write"], group: "memory", describe: (a) => (a && (a as { all?: boolean }).all ? "forget everything" : `forget: ${argText(a, "match")}`) },
+    execute: async ({ match, all }) => {
+      if (all) {
+        memory.clearDurable();
+        return textResult("Long-term memory is now empty.");
+      }
+      const removed = memory.forgetDurable(match ?? "");
+      return textResult(removed.length ? `Removed ${removed.length} line(s):\n${removed.join("\n")}` : "Nothing in long-term memory matched.");
+    },
+  });
+
   const journalAppend = defineTool({
     name: "journal_append",
     label: "Journal",
@@ -111,7 +271,7 @@ function memoryTools({ memory }: CoreToolDeps): RegisteredTool[] {
     },
   });
 
-  return [memoryRead, memoryWrite, journalAppend];
+  return [memoryRead, memoryWrite, memoryForget, journalAppend];
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +295,16 @@ function scheduleTools({ scheduler, config }: CoreToolDeps): RegisteredTool[] {
     execute: async ({ name, prompt, cron, tz, at }) => {
       if (!cron && !at) return { content: [{ type: "text", text: "Give either cron or at." }], isError: true };
       if (at && Number.isNaN(Date.parse(at))) return { content: [{ type: "text", text: `Invalid timestamp: ${at}` }], isError: true };
+      // The same reminder twice means two texts at the same minute; hand back the one that exists.
+      const when = at ? new Date(at).toISOString() : undefined;
+      const words = (t: string) => new Set(t.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 4 && !["reminder", "remind", "minutes", "before"].includes(w)));
+      const overlaps = (a: string, b: string) => {
+        const wa = words(a);
+        return [...words(b)].some((w) => wa.has(w));
+      };
+      // Same time and the same subject ("Keynote talk" vs "Keynote reminder") is the same reminder.
+      const same = scheduler.list().find((e) => e.enabled && (cron ? e.cron === cron : e.nextRunAt === when) && ((e.name ?? "").trim().toLowerCase() === name.trim().toLowerCase() || overlaps(`${e.name ?? ""} ${e.prompt}`, `${name} ${prompt}`)));
+      if (same) return textResult(`Already scheduled: "${same.name ?? same.id}" (id ${same.id}), next run ${same.nextRunAt ? localTime(same.nextRunAt, config.owner.timezone) : "unknown"}. Nothing new was added.`);
       const entry = scheduler.create({
         name,
         prompt,
@@ -157,7 +327,8 @@ function scheduleTools({ scheduler, config }: CoreToolDeps): RegisteredTool[] {
       const entries = scheduler.list();
       if (entries.length === 0) return textResult("No schedules.");
       const lines = entries.map(
-        (e) => `${e.id}: ${e.name ?? "(unnamed)"} | ${e.cron ? `cron ${e.cron} ${e.tz ?? ""}`.trim() : `once at ${e.nextRunAt ?? "?"}`} | next ${e.nextRunAt ?? "-"} | ${e.enabled ? "on" : "off"}`,
+        // Local time first: agents read a bare UTC timestamp back to the owner as if it were local.
+        (e) => `${e.id}: ${e.name ?? "(unnamed)"} | ${e.cron ? `cron ${e.cron} ${e.tz ?? ""}`.trim() : "once"} | next ${e.nextRunAt ? `${localTime(e.nextRunAt, config.owner.timezone)} (${e.nextRunAt})` : "-"} | ${e.enabled ? "on" : "off"}`,
       );
       return textResult(lines.join("\n"));
     },
@@ -179,10 +350,11 @@ function scheduleTools({ scheduler, config }: CoreToolDeps): RegisteredTool[] {
 // Owner relay
 // ---------------------------------------------------------------------------
 
-function ownerTools({ approvals, config, outbox, audit, onApprovalSettled }: CoreToolDeps): RegisteredTool[] {
+function ownerTools({ approvals, config, outbox, audit, onApprovalSettled, sendToOwner }: CoreToolDeps): RegisteredTool[] {
   const ownerPhone = () => config.owner.phones[0];
 
-  const sendOwner = async (text: string, ctx: ToolContext): Promise<boolean> => {
+  const sendOwner = async (text: string, ctx: ToolContext, opts: { approvalToken?: string } = {}): Promise<boolean> => {
+    if (sendToOwner) return sendToOwner(text, ctx, opts);
     const phone = ownerPhone();
     if (!phone) return false;
     await outbox.send({ channel: "imessage", to: phone, text }, { principal: ctx.principal, conversationKey: ctx.conversationKey });
@@ -210,15 +382,17 @@ function ownerTools({ approvals, config, outbox, audit, onApprovalSettled }: Cor
         ...(amountUsd !== undefined ? { amountUsd } : {}),
       });
       audit.append({ kind: "approval", conversationKey: ctx.conversationKey, principal: ctx.principal.id, detail: { token: approval.token, status: "pending", summary } });
-      const who = ctx.principal.kind === "owner" ? "" : ` (from ${ctx.principal.displayName})`;
-      // The token stays internal: the owner reads a plain question and answers however they like.
-      const sent = await sendOwner(`${question}${who}`, ctx);
-      // The question is now the last thing the owner heard from us, so a bare "yes" is about it.
-      if (sent) approvals.markPrompted(approval.token);
+      // The token stays internal, and so is the plumbing: the question names who is asking in its own
+      // words; no "(from X's agent)" suffix.
+      const sent = await sendOwner(question, ctx, { approvalToken: approval.token });
+      // The question is now the last thing the owner heard from us, so a bare "yes" is about it. The
+      // runtime's sender marks this itself once the text is actually delivered (a chat-only owner's
+      // question only waits in a buffer until their next message), so only the direct text marks here.
+      if (sent && !sendToOwner) approvals.markPrompted(approval.token);
       return textResult(
         sent
           ? `Asked ${config.owner.name}. Token ${approval.token}, expires ${approval.expiresAt}. Wait for their answer.`
-          : `Approval ${approval.token} recorded but the owner has no phone on file; they can answer in chat.`,
+          : `Approval ${approval.token} recorded, but there is no way to reach the owner yet (no phone, no thread). It will show in their pending approvals; wait.`,
       );
     },
   });
@@ -230,11 +404,19 @@ function ownerTools({ approvals, config, outbox, audit, onApprovalSettled }: Cor
     parameters: Type.Object({ text: Type.String() }),
     meta: { capabilities: ["owner.relay"], group: "owner", describe: (a) => `notify owner: ${argText(a, "text")}` },
     execute: async ({ text }, ctx) => {
-      const prefix = ctx.principal.kind === "owner" ? "" : `${ctx.principal.displayName} via ${config.agent.name}: `;
+      // Say plainly who it is from; handles and "via <agent>" read as plumbing to the owner.
+      // A stranger's "on behalf of" name is whatever it claims; only its handle is verified, so that is what it is called.
+      const claimed = ctx.principal.kind === "stranger" && ctx.principal.agentHandle ? ctx.principal.agentHandle : (ctx.principal.onBehalfOf?.displayName ?? ctx.principal.displayName);
+      const raw = claimed.replace(/\s*\(@[^)]*\)/g, "").trim();
+      // "grace-liu-wxd83" reads as "Grace Liu".
+      const who = /^@?[a-z0-9]+(?:-[a-z0-9]+)+$/.test(raw)
+        ? raw.replace(/^@/, "").split("-").filter((p, i, a) => !(i === a.length - 1 && a.length > 1 && /^[a-z0-9]{4,6}$/.test(p) && /\d/.test(p))).map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ")
+        : raw;
+      const prefix = ctx.principal.kind === "owner" ? "" : `From ${who}: `;
       const sent = await sendOwner(`${prefix}${text}`, ctx);
       // Something other than an approval question is now the last message; a bare "yes" would be ambiguous.
       if (sent) approvals.clearPrompted();
-      return textResult(sent ? `Sent to ${config.owner.name}.` : "The owner has no phone on file; nothing was sent.");
+      return textResult(sent ? `Sent to ${config.owner.name}.` : "There is no way to reach the owner yet (no phone, no thread); nothing was sent.");
     },
   });
 
@@ -302,7 +484,7 @@ function auditTool({ audit }: CoreToolDeps): RegisteredTool {
       const from = since ?? new Date(ctx.now().getTime() - 24 * 3600 * 1000).toISOString();
       const entries = audit.read({ since: from, limit: limit ?? 50, ...(kinds?.length ? { kinds: kinds as AuditKind[] } : {}) });
       if (entries.length === 0) return textResult("Nothing in the audit log for that window.");
-      const lines = entries.map((e) => `${e.at} ${e.kind}${e.principal ? ` [${e.principal}]` : ""} ${clip(JSON.stringify(e.detail), 240)}`);
+      const lines = entries.map((e) => `${e.at} ${e.kind}${e.principal ? ` [${e.principal}]` : ""} ${clip(redactSecrets(JSON.stringify(e.detail)), 240)}`);
       return textResult(lines.join("\n"));
     },
   });
@@ -424,7 +606,38 @@ function webSearchTool({ fetchImpl, searchApiKey }: CoreToolDeps): RegisteredToo
     parameters: Type.Object({ query: Type.String() }),
     meta: { capabilities: ["web.read"], group: "web", describe: (a) => `search ${argText(a, "query")}` },
     execute: async ({ query }, _ctx, signal) => {
-      const hits = searchApiKey ? await braveSearch(doFetch, searchApiKey, query, signal) : await duckDuckGoSearch(doFetch, query, signal);
+      const key = query.trim().toLowerCase();
+      const cached = searchCache.get(key);
+      let hits: SearchHit[] = cached && cached.at > Date.now() - SEARCH_CACHE_MS ? cached.hits : [];
+      if (hits.length === 0) {
+        const errors: string[] = [];
+        // A spent quota (402) or a bad key must not slow every search: after one, skip Brave for a while.
+        if (searchApiKey && Date.now() >= braveDownUntil) {
+          try {
+            hits = await braveSearch(doFetch, searchApiKey, query, signal);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errors.push(msg);
+            if (/HTTP (401|402|403|429)/.test(msg)) braveDownUntil = Date.now() + BRAVE_BACKOFF_MS;
+          }
+        }
+        if (hits.length === 0) {
+          // The keyless sources race with a short timeout; replies have about 20 seconds in all.
+          const quick = signal ?? AbortSignal.timeout(KEYLESS_TIMEOUT_MS);
+          const tries = [duckDuckGoSearch(doFetch, query, quick), bingSearch(doFetch, query, quick)].map((p) =>
+            p.then((h) => (h.length > 0 ? h : Promise.reject(new Error("no results"))), (e: unknown) => Promise.reject(e instanceof Error ? e : new Error(String(e)))),
+          );
+          try {
+            hits = await Promise.any(tries);
+          } catch (err) {
+            const reasons = err instanceof AggregateError ? err.errors.map((e: unknown) => (e instanceof Error ? e.message : String(e))) : [String(err)];
+            const real = reasons.filter((r) => r !== "no results");
+            if (real.length === 2) return fail(`Web search is unavailable right now (${[...errors, ...real].join("; ")}). Say so; do not guess.`);
+          }
+        }
+        if (hits.length > 0) searchCache.set(key, { at: Date.now(), hits });
+        if (searchCache.size > 200) searchCache.delete(searchCache.keys().next().value as string);
+      }
       if (hits.length === 0) return textResult(`No results for "${query}".`);
       const lines = hits.map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}${h.snippet ? `\n   ${h.snippet}` : ""}`);
       return textResult(wrapUntrusted(lines.join("\n"), `web search results for ${query}`));
@@ -457,6 +670,35 @@ async function duckDuckGoSearch(doFetch: typeof fetch, query: string, signal?: A
   });
   if (!res.ok) throw new Error(`DuckDuckGo search failed: HTTP ${res.status}`);
   return parseDuckDuckGoHtml(await res.text()).slice(0, SEARCH_RESULTS);
+}
+
+async function bingSearch(doFetch: typeof fetch, query: string, signal?: AbortSignal): Promise<SearchHit[]> {
+  const url = new URL("https://www.bing.com/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(SEARCH_RESULTS));
+  const res = await doFetch(url.toString(), {
+    signal: signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    headers: { "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36", accept: "text/html", "accept-language": "en-US,en;q=0.9" },
+  });
+  if (!res.ok) throw new Error(`Bing search failed: HTTP ${res.status}`);
+  return parseBingHtml(await res.text()).slice(0, SEARCH_RESULTS);
+}
+
+/** Bing's HTML page: each hit is an `<li class="b_algo">` with an `<h2><a href>` and a `<p>` snippet. */
+export function parseBingHtml(html: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/g;
+  for (let m = blockRe.exec(html); m; m = blockRe.exec(html)) {
+    const block = m[1] ?? "";
+    const link = /<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/.exec(block);
+    if (!link) continue;
+    const href = decodeEntities(link[1] ?? "");
+    const title = htmlToText(link[2] ?? "");
+    if (!/^https?:\/\//.test(href) || !title) continue;
+    const para = /<p[^>]*>([\s\S]*?)<\/p>/.exec(block);
+    hits.push({ title, url: href, snippet: htmlToText(para?.[1] ?? "") });
+  }
+  return hits;
 }
 
 /** DuckDuckGo's HTML endpoint: one `result__a` link and one `result__snippet` per hit. */
@@ -543,7 +785,7 @@ export function resolveWorkspacePath(workspaceDir: string, requested: string): s
   return undefined;
 }
 
-function createPdfTool({ workspaceDir, config }: CoreToolDeps): RegisteredTool {
+function createPdfTool({ workspaceDir, config, pdfGuard }: CoreToolDeps): RegisteredTool {
   return defineTool({
     name: "create_pdf",
     label: "Create PDF",
@@ -558,6 +800,8 @@ function createPdfTool({ workspaceDir, config }: CoreToolDeps): RegisteredTool {
     execute: async ({ path: requested, markdown, title }) => {
       if (!workspaceDir) return fail("No workspace is configured, so PDFs cannot be written.");
       if (!/\.pdf$/i.test(requested.trim())) return fail(`The path must end in .pdf: ${requested}`);
+      const refused = pdfGuard?.(requested, title);
+      if (refused) return fail(refused);
       const target = resolveWorkspacePath(workspaceDir, requested.trim());
       if (!target) return fail(`Refused: "${requested}" is outside the workspace.`);
       const pdf = await renderMarkdownToPdf(markdown, {
@@ -654,4 +898,25 @@ function argText(args: unknown, key: string): string {
 function argNumber(args: unknown, key: string): number | undefined {
   const v = (args as Record<string, unknown> | undefined)?.[key];
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Hide credentials that sit in URLs or commands (?key=..., token=..., Bearer ...) before a log is shown to anyone. */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/([?&](?:key|token|secret|sig|signature|api_key|apikey|access_token)=)[^&\s"'\\]+/gi, "$1[redacted]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/g, "$1[redacted]")
+    .replace(/\b(mk|sk|pk|rk)_(?:live_|test_)?[A-Za-z0-9]{16,}\b/g, "$1_[redacted]")
+    // An approval code read back from the log could be pasted to someone who then "approves" with it.
+    .replace(/("token":")[A-Z0-9]{4}(")/g, "$1[code]$2");
+}
+
+/** "Sat, Oct 17, 11:30 AM PDT" in the owner's zone. */
+function localTime(iso: string, tz: string | undefined): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: tz || "UTC", weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(d);
+  } catch {
+    return iso;
+  }
 }

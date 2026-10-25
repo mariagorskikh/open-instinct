@@ -15,6 +15,10 @@ import {
   AuditLog,
   ContactStore,
   MemoryStore,
+  MeetingStore,
+  meetingTime,
+  samePerson,
+  clashInText,
   PolicyEngine,
   Scheduler,
   StateDir,
@@ -25,6 +29,7 @@ import {
   ownerClaimStatus,
   syncInstructions,
   loadPolicy,
+  savePolicy,
   resolveDataDir,
   resolveModel,
 } from "@open-instinct/core";
@@ -99,21 +104,28 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       ? `owner claim open: the first 1:1 iMessage/SMS carrying the one-time code becomes the owner${config.owner.claimExpiresAt ? ` (until ${config.owner.claimExpiresAt})` : ""}`
       : `WARNING: owner claim is disabled: ${claim.reason}. Nobody can claim this agent until a valid code is set`);
   }
+  // Journal dates and other local-time reads use the process zone; the VM runs in UTC, the owner does not.
+  if (config.owner.timezone && !env.TZ) process.env.TZ = config.owner.timezone;
   // PERSONA.md is the owner's file; INSTINCT_PERSONA seeds it on first boot only.
   if (ensurePersona(state, env.INSTINCT_PERSONA)) log(`wrote ${state.path("PERSONA.md")}${env.INSTINCT_PERSONA?.trim() ? " from INSTINCT_PERSONA" : " (default persona)"}`);
   // AGENTS.md is the owner's standing-instructions file. INSTINCT_INSTRUCTIONS seeds it, and a changed seed
   // replaces it as long as the owner never edited the file; an edited file is theirs.
-  const instructions = syncInstructions(state, env.INSTINCT_INSTRUCTIONS);
+  const instructions = syncInstructions(state, env.INSTINCT_INSTRUCTIONS, { adoptUnmarked: /^(1|true|yes)$/i.test((env.INSTINCT_INSTRUCTIONS_ADOPT ?? "").trim()) });
   if (instructions === "created" || instructions === "updated") log(`${instructions} ${state.path("AGENTS.md")} from INSTINCT_INSTRUCTIONS`);
 
   const audit = new AuditLog(state);
-  const policy = new PolicyEngine(loadPolicy(state), {
+  const loadedPolicy = loadPolicy(state);
+  // An agent that meets many agents it does not know yet (at a meetup, say) can have its host raise the daily cap on new stranger conversations.
+  const strangerCap = Number(env.INSTINCT_STRANGER_CONVERSATIONS_PER_DAY);
+  if (Number.isFinite(strangerCap) && strangerCap > 0) loadedPolicy.strangerLimits.conversationsPerDay = Math.max(loadedPolicy.strangerLimits.conversationsPerDay, Math.floor(strangerCap));
+  const policy = new PolicyEngine(loadedPolicy, {
     spentTodayUsd: () => audit.spentTodayUsd(config.owner.timezone),
   });
   const approvals = new ApprovalStore(state);
   const scheduler = new Scheduler(state);
   const contacts = new ContactStore(state, { warn: log });
   const memory = new MemoryStore(state);
+  const meetings = new MeetingStore(state);
   const a2aStore = new A2AStore(state);
 
   const model = opts.model ?? resolveModel(config.model.primary, env);
@@ -163,6 +175,8 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   registry.registerMany(
     coreTools({
       memory,
+      meetings,
+      ownerAskedPeer: (p) => Boolean(p.agentHandle && a2aStore.ownerAsksTo(p.agentHandle).length > 0),
       scheduler,
       approvals,
       audit,
@@ -170,6 +184,7 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       outbox,
       workspaceDir: state.path("workspace"),
       onApprovalSettled: (approval, approved) => runtime.afterApproval(approval, approved),
+      sendToOwner: (text, ctx, opts) => runtime.relayToOwner(text, ctx.conversationKey, { ...opts, principal: ctx.principal }),
       // Image generation rides on an OpenAI-compatible key: a dedicated IMAGE_API_KEY, else the model key
       // (an OpenAI-compatible proxy that forwards /images/generations works too). The shell never sees either.
       ...(env.IMAGE_API_KEY || env.OPENAI_API_KEY
@@ -198,7 +213,7 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   // Messaging needs Inkbox. send_file does not: without a wire it still hands files
   // to the dashboard chat, which is how `instinct chat` and the smoke test get them.
   const callOrigination = callOriginationFrom(env);
-  if (channel) registry.registerMany(messagingTools({ channel, contacts, config, dataDir: state.root, ...(callOrigination ? { callOrigination } : {}) }));
+  if (channel) registry.registerMany(messagingTools({ channel, contacts, config, dataDir: state.root, sendToOwner: (text, ctx) => runtime.relayToOwner(text, ctx.conversationKey), ...(callOrigination ? { callOrigination } : {}) }));
   else registry.register(sendFileTool({ contacts, config, dataDir: state.root }));
   // Voice AI speaks as the owner's assistant. Only a chosen voice (INKBOX_VOICE or config.json agent.voice)
   // triggers the write: the config is a full replace on Inkbox, and an unset voice keeps the org default.
@@ -329,10 +344,23 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     networkTools({
       contacts,
       policy,
+      // Grants and tier overrides live in policy.json; without this they vanish on the next restart or redeploy.
+      onPolicyChange: (p) => savePolicy(state, p),
       config,
       audit,
       outbox,
       a2aStore,
+      meetingStartWith: (name: string) => meetings.upcoming().find((x) => samePerson(x.with, name))?.start,
+      clashWith: (text: string, peer: string) => {
+        const m = clashInText(meetings.upcoming(), text, peer, config.owner.timezone);
+        return m ? `${m.with} at ${meetingTime(m, config.owner.timezone)}${m.place ? `, ${m.place}` : ""}` : undefined;
+      },
+      meetingWith: (name: string) => {
+        const m = meetings.upcoming().find((x) => samePerson(x.with, name));
+        return m ? `${meetingTime(m, config.owner.timezone)}${m.place ? `, ${m.place}` : ""}` : undefined;
+      },
+      // People an agent may message only when its owner names them (comma-separated names).
+      ...(env.INSTINCT_RESERVED_CONTACTS?.trim() ? { reservedNames: env.INSTINCT_RESERVED_CONTACTS.split(",").map((n) => n.trim()).filter(Boolean) } : {}),
       ...(a2a ? { a2a } : {}),
       ...(env.INKBOX_ADMIN_API_KEY
         ? {
@@ -407,6 +435,7 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     scheduler,
     contacts,
     memory,
+    meetings,
     registry,
     model,
     outbox,
@@ -426,6 +455,8 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
         wallet: wallet ? { connected: wallet.isConnected() } : undefined,
       }),
     ...(env.INSTINCT_REPLY_BUDGET_MS ? { replyBudgetMs: Number(env.INSTINCT_REPLY_BUDGET_MS) } : {}),
+    // Owner texts from a burst of agent replies go out as one message. INSTINCT_OWNER_MERGE_MS=0 turns it off.
+    ownerMergeMs: env.INSTINCT_OWNER_MERGE_MS !== undefined ? Number(env.INSTINCT_OWNER_MERGE_MS) : 6_000,
   });
 
   const stopScheduler = scheduler.start((entry) => runtime.runScheduled(entry));

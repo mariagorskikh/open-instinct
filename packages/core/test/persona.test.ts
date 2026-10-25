@@ -122,4 +122,15 @@ describe("syncInstructions", () => {
     expect(state.readText(AGENTS_SEED_FILE, "")).toBe("# Old seed\n");
     expect(syncInstructions(state, "# New seed")).toBe("updated");
   });
+
+  it("adopts an unmarked file at once when adoptUnmarked is set, then follows the normal rule", () => {
+    const state = tempState();
+    expect(ensureInstructions(state, "# Old seed")).toBe(true);
+    expect(syncInstructions(state, "# New seed", { adoptUnmarked: true })).toBe("updated");
+    expect(readAgentsInstructions(state)).toBe("# New seed");
+    expect(state.readText(AGENTS_SEED_FILE, "")).toBe("# New seed\n");
+    state.writeText(AGENTS_FILE, "# New seed\n\nMine.\n");
+    expect(syncInstructions(state, "# Newer seed", { adoptUnmarked: true })).toBe("kept");
+  });
 });
+

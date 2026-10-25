@@ -29,6 +29,12 @@ export interface SendFileDeps {
 
 export interface MessagingDeps extends SendFileDeps {
   channel: InkboxChannel;
+  /**
+   * Where a reply goes when the current conversation cannot carry one (the dashboard chat
+   * has no outbound side). The runtime stashes it for the owner's next turn. Omitted: the
+   * tool reports that it cannot reply there.
+   */
+  sendToOwner?: (text: string, ctx: { conversationKey: string }) => Promise<unknown>;
   /** Force where calls go out from (INKBOX_CALL_ORIGINATION). Omitted: the identity's iMessage line. */
   callOrigination?: CallOrigination;
 }
@@ -245,6 +251,10 @@ export function messagingTools(deps: MessagingDeps): RegisteredTool[] {
         if (key.channel === "a2a") {
           throw new Error("This is an agent-to-agent conversation. Use reply_instinct to answer the other agent.");
         }
+        if (key.channel === "chat" && ctx.principal.kind === "owner" && deps.sendToOwner) {
+          await deps.sendToOwner(text, { conversationKey: ctx.conversationKey });
+          return textResult("Queued for the owner; it shows in their chat with your next reply.");
+        }
         if (key.channel !== "imessage" && key.channel !== "sms" && key.channel !== "email") {
           throw new Error(`Cannot reply on "${ctx.conversationKey}". Give \`to\` to pick a recipient.`);
         }
@@ -267,7 +277,7 @@ export function messagingTools(deps: MessagingDeps): RegisteredTool[] {
       }
       if (!isOwner(ctx) && wantsOwner) {
         // The owner must always know who a relayed message came from.
-        msg.text = `From ${ctx.principal.displayName}: ${text}`;
+        msg.text = `From ${readableName(ctx.principal.displayName)}: ${text}`;
       }
       await deps.channel.send(msg, { principal: ctx.principal, conversationKey: ctx.conversationKey });
       return textResult(`Sent to ${target.label} via ${target.channel}.`);
@@ -431,4 +441,12 @@ export function sendFileTool(deps: SendFileDeps): RegisteredTool {
       return textResult(`Sent ${file.name} to ${target.label} via ${target.channel}.`);
     },
   });
+}
+
+/** "grace-liu-wxd83" reads as "Grace Liu"; a real name is left alone. */
+export function readableName(name: string): string {
+  if (!/^@?[a-z0-9]+(?:-[a-z0-9]+)+$/.test(name)) return name;
+  const parts = name.replace(/^@/, "").split("-");
+  if (parts.length > 1 && /^[a-z0-9]{4,6}$/.test(parts[parts.length - 1]!) && /\d/.test(parts[parts.length - 1]!)) parts.pop();
+  return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
 }

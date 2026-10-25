@@ -242,6 +242,20 @@ describe("PolicyEngine grants", () => {
     expect(engine.toJSON().grants).toHaveLength(1);
   });
 
+  it("folds a reworded grant with an overlapping window into the existing one", () => {
+    const engine = new PolicyEngine(defaultPolicy(), { now: () => now });
+    const first = engine.addGrant({ to: "contact:sam", capabilities: ["calendar.freebusy"], scope: { purpose: "Saturday free/busy", window: { from: "2026-10-17T00:00:00-07:00", to: "2026-10-17T23:59:59-07:00" } }, expiresAt: "2026-10-18T07:00:00Z" });
+    const again = engine.addGrant({ to: "contact:sam", capabilities: ["calendar.freebusy"], scope: { purpose: "free/busy for Saturday at the summit", window: { from: "2026-10-17T08:00:00-07:00", to: "2026-10-18T02:00:00-07:00" } }, expiresAt: "2026-10-18T09:00:00Z" });
+    expect(again.id).toBe(first.id);
+    expect(engine.toJSON().grants).toHaveLength(1);
+    expect(again.scope?.window).toEqual({ from: "2026-10-17T00:00:00-07:00", to: "2026-10-18T02:00:00-07:00" });
+    expect(again.expiresAt).toBe("2026-10-18T09:00:00Z");
+    // A different day or capability is its own grant.
+    engine.addGrant({ to: "contact:sam", capabilities: ["calendar.freebusy"], scope: { window: { from: "2026-10-20T00:00:00-07:00", to: "2026-10-20T23:59:59-07:00" } } });
+    engine.addGrant({ to: "contact:sam", capabilities: ["calendar.write"] });
+    expect(engine.toJSON().grants).toHaveLength(3);
+  });
+
   it("applies grants addressed to the contact when an agent acts for them", () => {
     const engine = new PolicyEngine(defaultPolicy(), { now: () => now });
     engine.addGrant({ to: "contact:sam", capabilities: ["plans.commit"] });
@@ -306,6 +320,14 @@ describe("PolicyEngine grants", () => {
     expect(uncapped.evaluate(friend, purchaseMeta, { amountUsd: 75, item: "shoes" }).outcome).toBe("ask");
   });
 
+  it("does not stack an identical grant twice", () => {
+    const engine = new PolicyEngine(defaultPolicy(), { now: () => now });
+    const a = engine.addGrant({ to: "contact:sam", capabilities: ["calendar.freebusy"], expiresAt: "2026-10-18T06:59:59Z" });
+    const b = engine.addGrant({ to: "contact:sam", capabilities: ["calendar.freebusy"], expiresAt: "2026-10-18T06:59:59Z" });
+    expect(b.id).toBe(a.id);
+    expect(engine.listGrants("contact:sam")).toHaveLength(1);
+  });
+
   it("ignores expired grants and grants outside their window", () => {
     const engine = new PolicyEngine(defaultPolicy(), { now: () => now });
     engine.addGrant({ to: "contact:sam", capabilities: ["calendar.write"], expiresAt: "2026-10-01T00:00:00Z" });
@@ -315,7 +337,8 @@ describe("PolicyEngine grants", () => {
     expect(engine.evaluate(friend, meta(["calendar.read"]), {}).outcome).toBe("deny");
     // The window's last day is inclusive.
     expect(engine.evaluate(friend, meta(["email.send"]), {}).outcome).toBe("allow");
-    expect(engine.listGrants("contact:sam").map((g) => g.capabilities[0])).toEqual(["email.send"]);
+    // Listing shows what is in effect and what is still to come; only ended grants drop out.
+    expect(engine.listGrants("contact:sam").map((g) => g.capabilities[0])).toEqual(["calendar.read", "email.send"]);
   });
 
   it("expires with time", () => {

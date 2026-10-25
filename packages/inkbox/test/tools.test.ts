@@ -82,6 +82,16 @@ describe("send_message", () => {
     expect(JSON.stringify(r)).toContain("imessage");
   });
 
+  it("hands a chat reply to the owner relay when one is wired, and refuses otherwise", async () => {
+    const relayed: string[] = [];
+    const withRelay = messagingTools({ channel, contacts, config, sendToOwner: async (text) => { relayed.push(text); } }).find((x) => x.spec.name === "send_message")!;
+    const r = await withRelay.spec.execute({ text: "On it" }, ctxFor(owner, "chat:chat:sim-1"));
+    expect(relayed).toEqual(["On it"]);
+    expect(JSON.stringify(r)).toContain("Queued for the owner");
+    expect(sent).toHaveLength(0);
+    await expect(tool("send_message").execute({ text: "On it" }, ctxFor(owner, "chat:chat:sim-1"))).rejects.toThrow(/Cannot reply on/);
+  });
+
   it("uses the delivery conversation and reply reference instead of the internal session key", async () => {
     await tool("send_message").execute({ text: "Hi everyone" }, {
       ...ctxFor(owner, "imessage:group_1:owner"), deliveryKey: "imessage:group_1",

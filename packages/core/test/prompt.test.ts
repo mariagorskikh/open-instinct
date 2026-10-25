@@ -21,10 +21,20 @@ function input(overrides: Partial<PromptInput> = {}): PromptInput {
 }
 
 describe("buildSystemPrompt", () => {
+  it("gives the owner the trust habits, and nobody else", () => {
+    const owner = buildSystemPrompt(input());
+    expect(owner).toContain("# Habits that keep the owner's trust");
+    expect(owner).toContain("Never type a URL from memory or send a placeholder like [link]");
+    expect(owner).toContain("check audit_read and name every person");
+    expect(owner).toContain("Never ask Maria to approve what they just asked you to do.");
+    expect(buildSystemPrompt(input({ principal: principalOf("friend") }))).not.toContain("# Habits that keep the owner's trust");
+    expect(buildSystemPrompt(input({ channel: "system" }))).not.toContain("# Habits that keep the owner's trust");
+  });
+
   it("tells the agent when it may phone someone and what it may say afterwards", () => {
     const p = buildSystemPrompt(input());
     expect(p).toContain(
-      "8. A phone call needs Maria's explicit yes first, with the number you will call and what you will say; a general request is not a yes. Every phone_call is held for Maria's own yes to that exact number and brief, even when Maria asked for the call, so call the tool once and wait rather than asking twice. After a call, report only what its transcript shows, never what you expect was said. Never call Maria's own contacts unless Maria asked for that call.",
+      "10. A phone call needs Maria's explicit yes first, with the number you will call and what you will say; a general request is not a yes. Every phone_call is held for Maria's own yes to that exact number and brief, even when Maria asked for the call, so call the tool once and wait rather than asking twice. After a call, report only what its transcript shows, never what you expect was said. Never call Maria's own contacts unless Maria asked for that call.",
     );
   });
 
@@ -40,7 +50,18 @@ describe("buildSystemPrompt", () => {
     expect(p).toContain("Tool groups available: memory, web");
     expect(p).toContain("Capabilities in effect: converse, memory.write");
     expect(p).toContain("America/New_York");
-    expect(p).toContain(now.toISOString());
+    expect(p).toContain("Today is Saturday, October 3; tomorrow is Sunday, October 4");
+  });
+
+  it("states the owner's local today and tomorrow, never a UTC date that is already tomorrow", () => {
+    const config = testConfig();
+    config.owner.timezone = "America/Los_Angeles";
+    // Thursday 8 PM in Los Angeles is already Friday in UTC.
+    const p = buildSystemPrompt(input({ config, now: new Date("2026-10-16T03:00:00Z") }));
+    expect(p).toContain("Thursday, October 15, 2026");
+    expect(p).toContain("UTC-07:00");
+    expect(p).toContain("Today is Thursday, October 15; tomorrow is Friday, October 16");
+    expect(p).not.toContain("2026-10-16T03");
   });
 
   it("hides owner.about, phones and emails from everyone but the owner", () => {

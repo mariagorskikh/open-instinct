@@ -149,7 +149,9 @@ function harness(opts: HarnessOptions = {}): Harness {
     },
     ...(opts.typing ? { typing: opts.typing } : {}),
   };
-  if (opts.withCoreTools) registry.registerMany(coreTools({ memory, scheduler, approvals, audit, config, outbox }));
+  // eslint-disable-next-line prefer-const
+  let runtime: AgentRuntime;
+  if (opts.withCoreTools) registry.registerMany(coreTools({ memory, scheduler, approvals, audit, config, outbox, sendToOwner: (text, ctx, o) => runtime.relayToOwner(text, ctx.conversationKey, o) }));
   const deps: RuntimeDeps = {
     state,
     config,
@@ -166,7 +168,8 @@ function harness(opts: HarnessOptions = {}): Harness {
     replyBudgetMs: opts.replyBudgetMs ?? 5_000,
     ...(opts.deps ?? {}),
   };
-  return { runtime: new AgentRuntime(deps), faux, sent, deps, calls, ownerTurns, gate };
+  runtime = new AgentRuntime(deps);
+  return { runtime, faux, sent, deps, calls, ownerTurns, gate };
 }
 
 const replyInstinctTool = defineTool({
@@ -323,14 +326,14 @@ describe("AgentRuntime.handleInbound", () => {
 
     it("drops the echo when a text queued behind the answer gets the same answer", async () => {
       const h = harness();
-      h.faux.setResponses([toolTurn("slow", {}), textTurn("11:40 AM in Hahn Auditorium."), textTurn("11:40 AM in Hahn Auditorium.")]);
+      h.faux.setResponses([toolTurn("slow", {}), textTurn("11:40 AM in Room A Auditorium."), textTurn("11:40 AM in Room A Auditorium.")]);
       const first = h.runtime.handleInbound(text("m1", "when is shishir"), { waitForCompletion: true });
       await vi.waitFor(() => expect(h.calls).toHaveLength(1));
       const second = h.runtime.handleInbound(text("m2", "when is shishir speaking"), { waitForCompletion: true });
       await flush();
       h.gate.open();
       await Promise.all([first, second]);
-      expect(h.sent.map((s) => s.msg.text)).toEqual(["11:40 AM in Hahn Auditorium."]);
+      expect(h.sent.map((s) => s.msg.text)).toEqual(["11:40 AM in Room A Auditorium."]);
       expect(h.deps.audit.read({ kinds: ["outbound"] }).filter((e) => e.detail["skipped"] === "duplicate reply")).toHaveLength(1);
     });
 
@@ -564,6 +567,7 @@ describe("AgentRuntime.handleInbound", () => {
     expect(conv.busy).toBe(true);
     const second = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "also do this", id: "b" }));
     expect(second).toMatchObject({ acked: true });
+    // Waiting behind the first job: the owner hears what is going on, not a bare "on it".
     expect(second.reply).toMatch(/On it/);
     expect(conv.agent.peekQueuedMessages()).toHaveLength(0);
     expect(h.runtime.stats().busy).toBe(1);
@@ -588,13 +592,14 @@ describe("AgentRuntime.handleInbound", () => {
     expect(first.reply).not.toMatch(/text you/);
 
     h.gate.open();
-    await vi.waitFor(() => expect(h.runtime.pendingReplies("chat:main")).toEqual(["Here is the slow result"]));
+    // The late answer is labelled with the question it answers.
+    await vi.waitFor(() => expect(h.runtime.pendingReplies("chat:main")).toEqual(['About "research this":\nHere is the slow result']));
     expect(h.sent).toHaveLength(0);
     expect(h.deps.audit.read({ kinds: ["error"] })).toHaveLength(0);
 
     h.faux.setResponses([textTurn("You're welcome")]);
     const second = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "thanks" }));
-    expect(second.reply).toBe("Here is the slow result\n\nYou're welcome");
+    expect(second.reply).toBe('About "research this":\nHere is the slow result\n\nYou\'re welcome');
     expect(h.runtime.pendingReplies("chat:main")).toEqual([]);
     expect(h.sent).toHaveLength(0);
     // A different key does not pick up the stash.
@@ -686,6 +691,49 @@ describe("AgentRuntime.handleInbound", () => {
     expect(seen).toContain("owner");
   });
 
+  it("tells the model when the owner already asked to reach the agent that is now asking", async () => {
+    const h = harness();
+    h.deps.contacts.upsert({ name: "Sam Lee", tier: "friend", agentHandle: SAM_HANDLE });
+    new A2AStore(h.deps.state).begin({ messageId: "m-out", peer: SAM_HANDLE, taskId: "t-out", principal: h.runtime.ownerPrincipal(), conversationKey: "chat:main", deliveryKey: "chat:main", at: "2026-10-16T03:10:00Z", summary: "Maria would love to meet Sam at the summit" });
+    h.faux.setResponses([textTurn("Lunch at 12:30 it is.")]);
+    await h.runtime.handleInbound(a2aFrom(SAM_HANDLE, "Sam would like to meet Maria. Lunch at 12:30?"));
+    const conv = h.runtime.conversation("a2a:ctx1:task:task_1", { kind: "agent", id: `agent:${SAM_HANDLE}`, tier: "friend", displayName: "x" });
+    const prompt = userTexts(conv.agent.state.messages)[0]!;
+    expect(prompt).toContain("already asked you to reach");
+    expect(prompt).toContain("Maria would love to meet Sam");
+    // The note is trusted context, outside the sender's untrusted block.
+    expect(prompt.indexOf("already asked you to reach")).toBeLessThan(prompt.indexOf("<untrusted"));
+  });
+
+  it("treats an incoming move as agreed when the owner asked that peer for the same move", async () => {
+    const h = harness();
+    h.deps.contacts.upsert({ name: "Sam Lee", tier: "friend", agentHandle: SAM_HANDLE });
+    new A2AStore(h.deps.state).begin({ messageId: "m-move", peer: SAM_HANDLE, taskId: "t-move", principal: h.runtime.ownerPrincipal(), conversationKey: "chat:main", deliveryKey: "chat:main", summary: "Maria asks to move the meetup to 4:30 PM" });
+    h.faux.setResponses([textTurn("4:30 it is.")]);
+    await h.runtime.handleInbound(a2aFrom(SAM_HANDLE, "Sam would like to move the meetup to 4:30 PM instead"));
+    const conv = h.runtime.conversation("a2a:ctx1:task:task_1", { kind: "agent", id: `agent:${SAM_HANDLE}`, tier: "friend", displayName: "x" });
+    expect(userTexts(conv.agent.state.messages)[0]).toContain("already asked you to reach");
+  });
+
+  it("doesn't treat a note to that agent, or an incoming move, as the owner's yes", async () => {
+    const h = harness();
+    h.deps.contacts.upsert({ name: "Sam Lee", tier: "friend", agentHandle: SAM_HANDLE });
+    new A2AStore(h.deps.state).begin({ messageId: "m-late", peer: SAM_HANDLE, taskId: "t-late", principal: h.runtime.ownerPrincipal(), conversationKey: "chat:main", deliveryKey: "chat:main", summary: "Maria is running 10 minutes late" });
+    h.faux.setResponses([textTurn("Let me check with Maria."), textTurn("Let me check with Maria.")]);
+    await h.runtime.handleInbound(a2aFrom(SAM_HANDLE, "Sam would like to meet Maria. Lunch at 12:30?"));
+    const conv = h.runtime.conversation("a2a:ctx1:task:task_1", { kind: "agent", id: `agent:${SAM_HANDLE}`, tier: "friend", displayName: "x" });
+    expect(userTexts(conv.agent.state.messages)[0]).not.toContain("already asked you to reach");
+  });
+
+  it("adds no such note for an agent the owner never asked to reach", async () => {
+    const h = harness();
+    h.deps.contacts.upsert({ name: "Sam Lee", tier: "friend", agentHandle: SAM_HANDLE });
+    h.faux.setResponses([textTurn("Let me check with Maria.")]);
+    await h.runtime.handleInbound(a2aFrom(SAM_HANDLE, "Can Maria meet Sam?"));
+    const conv = h.runtime.conversation("a2a:ctx1:task:task_1", { kind: "agent", id: `agent:${SAM_HANDLE}`, tier: "friend", displayName: "x" });
+    expect(userTexts(conv.agent.state.messages)[0]).not.toContain("already asked you to reach");
+  });
+
   it("keeps the live transcript bounded across many turns in one process", async () => {
     const h = harness();
     const turns = SESSION_KEEP_MESSAGES / 2 + 10;
@@ -757,12 +805,50 @@ describe("AgentRuntime.handleInbound", () => {
     expect(h.sent).toHaveLength(2);
   });
 
+  it("tells another agent when the stranger cap turns it away, and keeps a preview of what agents ask", async () => {
+    const policy = defaultPolicy();
+    policy.strangerLimits = { conversationsPerDay: 1, messagesPerConversation: 10 };
+    const h = harness({ policy });
+    h.faux.setResponses([textTurn("Checking with Maria.")]);
+    await h.runtime.handleInbound(inbound({ channel: "a2a", from: "kim-agent", conversationKey: "a2a:k1", text: "Can Maria meet Kim?", replyRef: { taskId: "t-k1", contextId: "k1" }, id: "k1" }));
+    const blocked = await h.runtime.handleInbound(inbound({ channel: "a2a", from: "lee-agent", conversationKey: "a2a:l1", text: "Can Maria meet Lee?", replyRef: { taskId: "t-l1", contextId: "l1" }, id: "l1" }));
+    expect(blocked.blocked).toMatch(/conversations per day/);
+    const fail = h.sent.find((s) => s.msg.channel === "a2a" && s.msg.a2a?.taskId === "t-l1");
+    expect(fail?.msg.a2a?.intent).toBe("fail");
+    const previews = h.deps.audit.read({ kinds: ["inbound"] }).map((e) => e.detail.preview);
+    expect(previews).toContain("Can Maria meet Kim?");
+  });
+
   it("reports model failures to the owner instead of swallowing them", async () => {
     const h = harness();
     h.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "rate limited" })]);
     const result = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "hi" }));
     expect(result.reply).toContain("rate limited");
     expect(h.deps.audit.read({ kinds: ["error"] })).toHaveLength(1);
+  });
+
+  it("tells the owner plainly when the model budget is spent", async () => {
+    const h = harness();
+    h.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "402 LLM credits exhausted ($1081.68 of $1080.00 used)" })]);
+    const result = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "hi" }));
+    expect(result.reply).toBe("I'm paused for now: my AI budget for this month is used up. Once it's raised or the month resets, I'll pick up right where we left off.");
+  });
+
+  it("tells the owner plainly when the agent's own monthly spend limit is reached", async () => {
+    const h = harness();
+    h.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "429 This agent reached its monthly AI spend limit ($10.03 of $10.00). The limit resets on 2026-11-01 (UTC). Raise the limit in the agent settings or with PUT /api/agents/{id}/llm-spend-limit." })]);
+    const result = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "hi" }));
+    expect(result.reply).toBe("I'm paused for now: my AI budget for this month is used up. Once it's raised or the month resets, I'll pick up right where we left off.");
+    expect(result.reply).not.toContain("try that again");
+  });
+
+  it("names who can raise the budget when INSTINCT_BUDGET_CONTACT is set", async () => {
+    const config = testConfig();
+    config.features.budgetContact = "help@example.com";
+    const h = harness({ deps: { config } });
+    h.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "429 This agent reached its monthly AI spend limit ($10.03 of $10.00)." })]);
+    const result = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "hi" }));
+    expect(result.reply).toBe("I'm paused for now: my AI budget for this month is used up. Email help@example.com to raise it and I'll pick up right where we left off.");
   });
 });
 
@@ -870,7 +956,7 @@ describe("approval flow", () => {
     // where the retried call now passes the guard.
     h.faux.setResponses([toolTurn("calendar_add", { title: "Dinner Thu 7pm" }), textTurn("Booked. Dinner is on Maria's calendar.")]);
     const ownerResult = await h.runtime.handleInbound(inbound({ channel: "imessage", from: OWNER_PHONE, conversationKey: "imessage:owner", text: "yes" }));
-    expect(ownerResult.reply).toMatch(/^Approved: /);
+    expect(ownerResult.reply).toMatch(/^Got it, that's a (yes|no): /);
     expect(h.deps.approvals.pending()).toHaveLength(0);
     expect(h.deps.approvals.get(pending[0]!.token)?.status).toBe("approved");
 
@@ -892,11 +978,48 @@ describe("approval flow", () => {
 
     h.faux.setResponses([textTurn("Sorry, Maria said no.")]);
     const ownerResult = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: `no ${token}` }));
-    expect(ownerResult.reply).toMatch(/^Denied: /);
+    expect(ownerResult.reply).toMatch(/^Got it, that's a no: /);
     await vi.waitFor(() => expect(h.sent.some((s) => s.msg.conversationKey === "imessage:sam" && s.msg.text === "Sorry, Maria said no.")).toBe(true));
     expect(h.calls).toHaveLength(0);
     const samUser = h.runtime.conversation("imessage:sam", { kind: "contact", id: "contact:sam-lee", tier: "partner", displayName: "Sam Lee" }).agent.state.messages.filter((m) => m.role === "user");
     expect(JSON.stringify(samUser.at(-1)!.content)).toContain("Owner denied:");
+  });
+
+  it("aborts a run stuck past the limit when the next message comes, instead of acking forever", { timeout: 15_000 }, async () => {
+    const h = harness({ replyBudgetMs: 20, deps: { maxRunMs: 50 } });
+    // The first run calls a tool that never returns.
+    h.faux.setResponses([toolTurn("slow", {})]);
+    const first = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "do the slow thing", id: "s1" }));
+    expect(first.acked).toBe(true);
+    await vi.waitFor(() => expect(h.calls.some((c) => c.tool === "slow")).toBe(true));
+    await new Promise((r) => setTimeout(r, 80));
+    h.faux.setResponses([textTurn("Fresh answer."), textTurn("Still here.")]);
+    const next = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "hello?", id: "s2" }));
+    expect(next.acked).toBe(true);
+    await vi.waitFor(() => expect(h.deps.audit.read({ kinds: ["error"] }).some((e) => String(e.detail.message).includes("Aborted a run"))).toBe(true), { timeout: 5000 });
+    // The new message gets a real answer instead of waiting behind the dead run.
+    const after = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "anything new?", id: "s3" }));
+    await vi.waitFor(() => expect(JSON.stringify(after) + JSON.stringify(h.runtime.pendingReplies("chat:main"))).toContain("Fresh answer."), { timeout: 5000 });
+    h.gate.open();
+  });
+
+  it("a bare yes on the dashboard chat answers the chat's own question, not an approval asked earlier", async () => {
+    const h = harness();
+    h.deps.contacts.upsert({ name: "Sam Lee", tier: "partner", phones: [SAM_PHONE] });
+    h.faux.setResponses([toolTurn("calendar_add", { title: "Dinner Thu 7pm" }), textTurn("Let me check with Maria.")]);
+    await h.runtime.handleInbound(inbound({ channel: "imessage", from: SAM_PHONE, conversationKey: "imessage:sam", text: "put dinner on her calendar" }));
+    const token = h.deps.approvals.pending()[0]!.token;
+    expect(h.deps.approvals.promptedToken()).toBe(token);
+
+    // The owner talks about something else on the chat, and the agent ends with a question of its own.
+    h.faux.setResponses([textTurn("Two talks at 2pm. Want me to turn off the 4pm reminder?")]);
+    await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "whats on at 2?", id: "c1" }));
+    expect(h.deps.approvals.promptedToken()).toBeUndefined();
+
+    h.faux.setResponses([textTurn("Done, the 4pm reminder is off.")]);
+    const yes = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "yes", id: "c2" }));
+    expect(yes.reply).toBe("Done, the 4pm reminder is off.");
+    expect(h.deps.approvals.get(token)?.status).toBe("pending");
   });
 
   it("queues the follow-up when the waiting conversation is still busy", async () => {
@@ -930,7 +1053,7 @@ describe("approval scoping", () => {
     // Maria answers the question. Sam's thread resumes and the model tries to spend on the back of it.
     h.faux.setResponses([toolTurn("buy", { item: "two flights to Lisbon", merchant: "TAP", amountUsd: 1400 }), textTurn("I need to check with Maria about the flights.")]);
     const owner = await h.runtime.handleInbound(inbound({ channel: "imessage", from: OWNER_PHONE, conversationKey: "imessage:owner", text: "yes" }));
-    expect(owner.reply).toMatch(/^Approved: Sam asks if you got his message/);
+    expect(owner.reply).toMatch(/^Got it, that's a yes: Sam asks if you got his message/);
     await vi.waitFor(() => expect(h.sent.some((s) => s.msg.conversationKey === "imessage:sam" && s.msg.text.includes("check with Maria about the flights"))).toBe(true));
     expect(h.calls.filter((c) => c.tool === "buy")).toHaveLength(0);
     const pending = h.deps.approvals.pending();
@@ -954,7 +1077,7 @@ describe("approval scoping", () => {
     // Approved, but the retry changes merchant and amount: blocked again, new approval.
     h.faux.setResponses([toolTurn("buy", { item: "flowers", merchant: "Petal", amountUsd: 78 }), textTurn("Petal needs a separate ok.")]);
     const yes = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: "yes" }));
-    expect(yes.reply).toMatch(/^Approved: /);
+    expect(yes.reply).toMatch(/^Got it, that's a (yes|no): /);
     await vi.waitFor(() => expect(h.runtime.pendingReplies("chat:main")).toContain("Petal needs a separate ok."));
     expect(h.calls).toHaveLength(0);
     const second = h.deps.approvals.pending();
@@ -1027,7 +1150,7 @@ describe("approval scoping", () => {
     const other = { toNumber: "+14155550199", reason: "Book a table for 4 at 7pm under Maria" };
     h.faux.setResponses([toolTurn("phone_call", other), textTurn("That number needs its own ok.")]);
     const yes = await h.runtime.handleInbound(inbound({ channel: "imessage", from: OWNER_PHONE, conversationKey: "imessage:owner", text: "yes" }));
-    expect(yes.reply).toMatch(/^Approved: /);
+    expect(yes.reply).toMatch(/^Got it, that's a yes/);
     await vi.waitFor(() => expect(h.sent.some((s) => s.msg.conversationKey === "imessage:owner" && s.msg.text === "That number needs its own ok.")).toBe(true));
     expect(dialed).toHaveLength(0);
     const second = h.deps.approvals.pending();
@@ -1085,7 +1208,7 @@ describe("approval scoping", () => {
     // With the token the verdict is unambiguous.
     h.faux.setResponses([toolTurn("calendar_add", { title: "Dinner" }), textTurn("Booked.")]);
     const r2 = await h.runtime.handleInbound(owner(`yes ${token}`));
-    expect(r2.reply).toMatch(/^Approved: /);
+    expect(r2.reply).toMatch(/^Got it, that's a (yes|no): /);
     expect(h.deps.approvals.pending()).toHaveLength(0);
     await vi.waitFor(() => expect(h.calls).toEqual([{ tool: "calendar_add", args: { title: "Dinner" } }]));
   });
@@ -1104,7 +1227,7 @@ describe("approval scoping", () => {
     const ownerRun = h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:main", text: `yes ${token} and move the mom reminder to 7` }), { waitForCompletion: true });
     h.gate.open();
     const r = await ownerRun;
-    expect(r.reply).toMatch(/^Approved: .*\n\nMom reminder moved to 7\.$/);
+    expect(r.reply).toMatch(/^Got it, that's a yes: .*\n\nMom reminder moved to 7\.$/);
     expect(h.deps.approvals.pending()).toHaveLength(0);
     const main = h.runtime.conversation("chat:main", h.runtime.ownerPrincipal());
     expect(userTexts(main.agent.state.messages).some((t) => t.includes("move the mom reminder to 7") && !t.includes(token))).toBe(true);
@@ -1401,7 +1524,7 @@ describe("A2A delivery", () => {
     const again = new AgentRuntime({ ...h.deps });
     h.faux.setResponses([toolTurn("calendar_add", { title: "Dinner Thu 7pm" }), textTurn("Done. Dinner Thursday 7pm is on Maria's calendar.")]);
     const yes = await again.handleInbound(inbound({ channel: "imessage", from: OWNER_PHONE, conversationKey: "imessage:owner", text: "yes" }));
-    expect(yes.reply).toMatch(/^Approved: /);
+    expect(yes.reply).toMatch(/^Got it, that's a (yes|no): /);
     await vi.waitFor(() => expect(h.calls).toEqual([{ tool: "calendar_add", args: { title: "Dinner Thu 7pm" } }]));
     await vi.waitFor(() => expect(h.sent.filter((s) => s.msg.channel === "a2a")).toHaveLength(2));
     const done = h.sent.filter((s) => s.msg.channel === "a2a").at(-1)!;
@@ -1677,5 +1800,371 @@ describe("runSystemTask", () => {
     await expect(h.runtime.runSystemTask({ id: "boom", prompt: "fail" })).rejects.toThrow();
     expect(h.deps.audit.read({ kinds: ["error"] }).length).toBeGreaterThan(0);
     expect(h.sent).toHaveLength(0);
+  });
+});
+
+describe("owner notification merge", () => {
+  it("joins owner texts that arrive within the merge window into one message, dropping superseded ones", async () => {
+    const h = harness({ deps: { ownerMergeMs: 80 } });
+    h.faux.setResponses([textTurn("Sam's in."), textTurn("Sam's in. Pick a time: 12:15 lunch in the lobby cafe or the 4:00 break.")]);
+    await Promise.all([h.runtime.runSystemTask({ id: "a", prompt: "x" }), h.runtime.runSystemTask({ id: "b", prompt: "y" })]);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]!.msg.text).toBe("Sam's in. Pick a time: 12:15 lunch in the lobby cafe or the 4:00 break.");
+  });
+
+  it("mergeOwnerTexts keeps distinct updates and drops repeats", async () => {
+    const { mergeOwnerTexts } = await import("../src/runtime.js");
+    expect(mergeOwnerTexts(["Here you go.", "here you go"])).toBe("here you go");
+    expect(mergeOwnerTexts(["Priya is in for lunch.", "Sam can do the coffee break Saturday."])).toBe("Priya is in for lunch.\n\nSam can do the coffee break Saturday.");
+    expect(mergeOwnerTexts(["", "  "])).toBe("");
+  });
+});
+
+describe("stashed late answers", () => {
+  it("does not show a late answer twice", async () => {
+    const { joinOwnerParts } = await import("../src/runtime.js");
+    const late = 'About "who is Ana Ruiz":\nAna Ruiz runs Example Fund.';
+    expect(joinOwnerParts([late, late], "Lunch is at 12:00.")).toBe(`${late}\n\nLunch is at 12:00.`);
+    expect(joinOwnerParts([late], "Ana Ruiz runs Example Fund. Want more?")).toBe("Ana Ruiz runs Example Fund. Want more?");
+    expect(joinOwnerParts([undefined, "Approved."], undefined)).toBe("Approved.");
+  });
+});
+
+describe("quiet hours", () => {
+  it("holds an unprompted owner text during quiet hours", async () => {
+    const config = testConfig();
+    config.features.quietHours = { start: 0, end: 24 };
+    const h = harness({ deps: { config } });
+    h.faux.setResponses([textTurn("Reminder: the keynote is at 9.")]);
+    await h.runtime.runSystemTask({ id: "keynote-reminder", name: "Keynote", prompt: "Remind the owner about the keynote." });
+    expect(h.sent).toHaveLength(0);
+  });
+});
+
+describe("stray script", () => {
+  it("drops a stray Armenian word from an English reply", async () => {
+    const { tidyOwnerReply } = await import("../src/runtime.js");
+    expect(tidyOwnerReply("What's your email հասցե?")).toBe("What's your email?");
+    expect(tidyOwnerReply("Բարեւ, ինչպես ես")).toBe("Բարեւ, ինչպես ես");
+  });
+});
+
+describe("send claims", () => {
+  it("spots a reply that says a message went out", async () => {
+    const { claimsSend } = await import("../src/runtime.js");
+    expect(claimsSend("Sent to Victor's agent: Saturday at 1:30 PM")).toBe(true);
+    expect(claimsSend("Told Nadia you're running 10 minutes late")).toBe(true);
+    expect(claimsSend("I asked her agent what she's working on")).toBe(true);
+    expect(claimsSend("Done — sent it")).toBe(true);
+    expect(claimsSend("Sent earlier, still waiting on Victor")).toBe(false);
+    expect(claimsSend("Nothing from Victor yet")).toBe(false);
+    expect(claimsSend("Saturday at 1:30 PM in the lobby cafe")).toBe(false);
+  });
+
+  it("asks the model again when it claims a send that did not happen", async () => {
+    const h = harness();
+    h.faux.setResponses([textTurn("Sent to Victor's agent, waiting on his reply"), textTurn("I haven't sent it yet. Want me to send it now?")]);
+    await h.runtime.handleInbound(inbound({ id: "c1", channel: "imessage", from: OWNER_PHONE, conversationKey: "imessage:claim", text: "tell victor I'm late" }), { waitForCompletion: true });
+    expect(h.sent.map((s) => s.msg.text).join("\n")).toContain("I haven't sent it yet");
+    expect(h.sent.map((s) => s.msg.text).join("\n")).not.toContain("Sent to Victor");
+  });
+});
+
+describe("long gap between owner texts", () => {
+  it("marks a text that arrives hours after the last one, and not the next one", async () => {
+    const h = harness();
+    h.faux.setResponses([textTurn("Call script ready, say yes"), textTurn("Hey."), textTurn("Sure")]);
+    const send = (id: string, text: string) => h.runtime.handleInbound(inbound({ id, channel: "imessage", from: OWNER_PHONE, conversationKey: "imessage:gap", text }), { waitForCompletion: true });
+    await send("g1", "call me with a test script");
+    const file = h.deps.state.readJson<Record<string, string>>("last-owner-turn.json", {});
+    const keys = Object.keys(file);
+    expect(keys).toHaveLength(1);
+    h.deps.state.writeJson("last-owner-turn.json", { [keys[0]!]: new Date(Date.now() - 13 * 3_600_000).toISOString() });
+    await send("g2", "hi");
+    await send("g3", "what's next?");
+    const all = userTexts(h.runtime.conversation(keys[0]!, { kind: "owner", id: "owner", tier: "owner", displayName: "Maria" }).agent.state.messages);
+    expect(all.find((t) => t.includes("hi"))).toContain("about 13 hours after the previous one");
+    expect(all.find((t) => t.includes("what's next?"))).not.toContain("hours after");
+    expect(all.find((t) => t.includes("call me with a test script"))).not.toContain("hours after");
+  });
+});
+
+describe("owner on the dashboard chat only", () => {
+  it("a yes typed before a queued chat ask is shown does not settle that ask", async () => {
+    const config = testConfig({ phones: [] });
+    const h = harness({ withCoreTools: true, deps: { config } });
+    h.faux.setResponses([textTurn("Want me to block those talks?"), toolTurn("ask_owner", { question: "Sam wants to meet you at lunch Saturday. Want me to say yes?", summary: "intro with Sam" }), textTurn("Checking with Maria."), textTurn("Blocked.")]);
+    await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:cli", text: "plan my day", id: "p1" }));
+    await h.runtime.handleInbound(a2aFrom(SAM_HANDLE, "Can Maria meet Sam at lunch Saturday?"));
+    expect(h.deps.approvals.pending()).toHaveLength(1);
+    // The owner answers the calendar question; Sam's ask is still waiting in the chat buffer, unseen.
+    const yes = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:cli", text: "yes", id: "p2" }));
+    expect(h.deps.approvals.pending()).toHaveLength(1);
+    expect(yes.reply).toContain("Sam wants to meet you at lunch Saturday");
+  });
+
+  it("an ask_owner from another agent waits in the owner's chat thread and arrives with their next message", async () => {
+    const config = testConfig({ phones: [] });
+    const h = harness({ withCoreTools: true, deps: { config } });
+    h.faux.setResponses([textTurn("Hey, what do you need?"), toolTurn("ask_owner", { question: "Sam wants to meet you at lunch Saturday. Want me to say yes?", summary: "intro with Sam" }), textTurn("Checking with Maria."), textTurn("Nothing else new.")]);
+    await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:cli", text: "hi" }));
+    await h.runtime.handleInbound(a2aFrom(SAM_HANDLE, "Can Maria meet Sam at lunch Saturday?"));
+    expect(h.deps.approvals.pending()).toHaveLength(1);
+    expect(h.sent.filter((s) => s.msg.channel === "imessage")).toHaveLength(0);
+    const next = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:cli", text: "anything new?" }));
+    expect(next.reply).toContain("Sam wants to meet you at lunch Saturday. Want me to say yes?");
+    expect(next.reply).toContain("Nothing else new.");
+    // The model saw the question it is printed under, so it can build on it instead of contradicting it.
+    const ownerConv = h.runtime.conversation("chat:cli", next.principal);
+    const lastUser = ownerConv.agent.state.messages.filter((m) => m.role === "user").at(-1)!;
+    expect(JSON.stringify(lastUser.content)).toContain("Shown to the owner just before this message");
+    expect(JSON.stringify(lastUser.content)).toContain("Sam wants to meet you at lunch Saturday");
+    expect(JSON.stringify(lastUser.content)).toContain("anything new?");
+  });
+});
+
+describe("restoreMessages on a long tool loop", () => {
+  it("never starts the kept slice at a tool result when no user turn is left in the window", () => {
+    const now = new Date("2026-10-16T02:00:00Z");
+    const user = (i: number): AgentMessage => ({ role: "user", content: [{ type: "text", text: `ask ${i}` }], timestamp: i });
+    const call = (i: number): AgentMessage => ({ role: "assistant", content: [{ type: "toolCall", id: `c${i}`, name: "computer", arguments: { action: "screenshot" } }], api: "faux", provider: "faux", model: "m", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: i });
+    const result = (i: number): AgentMessage => ({ role: "toolResult", toolCallId: `c${i}`, toolName: "computer", content: [{ type: "text", text: `shot ${i}` }], isError: false, timestamp: i });
+    const msgs: AgentMessage[] = [user(0)];
+    for (let i = 1; i <= 40; i++) msgs.push(call(i), result(i));
+    const kept = restoreMessages(msgs, now, 20);
+    expect(kept[0]!.role).toBe("user"); // the summary
+    expect(kept[1]!.role).toBe("assistant");
+    for (let i = 1; i < kept.length; i++) {
+      if (kept[i]!.role === "toolResult") expect(kept[i - 1]!.role === "assistant" || kept[i - 1]!.role === "toolResult").toBe(true);
+    }
+  });
+});
+
+describe("restoreMessages with screenshots", () => {
+  const now = new Date("2026-10-16T03:00:00Z");
+  const user = (i: number): AgentMessage => ({ role: "user", content: [{ type: "text", text: `ask ${i}` }], timestamp: i });
+  const call = (i: number): AgentMessage => ({ role: "assistant", content: [{ type: "toolCall", id: `c${i}`, name: "computer", arguments: { action: "screenshot" } }], api: "faux", provider: "faux", model: "m", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: i });
+  const shot = (i: number, bytes: number): AgentMessage => ({ role: "toolResult", toolCallId: `c${i}`, toolName: "computer", content: [{ type: "image", data: "x".repeat(bytes), mimeType: "image/png" }, { type: "text", text: `{"ok":true,"n":${i}}` }], isError: false, timestamp: i });
+
+  it("never starts the kept slice at a tool result when the newest screenshot alone is over budget", () => {
+    // What the browser step hit: one screenshot is bigger than the whole char budget, so the
+    // old fold walked forward until it sat on the tool result and the API rejected the turn.
+    const msgs: AgentMessage[] = [user(0), call(1), shot(1, 50_000), call(2), shot(2, 50_000)];
+    const kept = restoreMessages(msgs, now, 60, 10_000);
+    expect(kept[0]!.role).not.toBe("toolResult");
+    for (let i = 0; i < kept.length; i++) {
+      if (kept[i]!.role === "toolResult") expect(kept[i - 1]!.role === "assistant" || kept[i - 1]!.role === "toolResult").toBe(true);
+    }
+    // The newest screenshot is still there for the model to look at.
+    expect(kept.some((m) => m.role === "toolResult" && m.content.some((c) => c.type === "image"))).toBe(true);
+  });
+
+  it("swaps older screenshots for a placeholder and keeps the newest two", () => {
+    const msgs: AgentMessage[] = [user(0)];
+    for (let i = 1; i <= 5; i++) msgs.push(call(i), shot(i, 100));
+    const kept = restoreMessages(msgs, now, 60, 1_000_000);
+    const withImages = kept.filter((m) => m.role === "toolResult" && m.content.some((c) => c.type === "image"));
+    expect(withImages.map((m) => (m as { toolCallId: string }).toolCallId)).toEqual(["c4", "c5"]);
+    const dropped = kept.find((m) => m.role === "toolResult" && (m as { toolCallId: string }).toolCallId === "c1")!;
+    expect(dropped.content[0]).toEqual({ type: "text", text: "(an earlier screenshot, dropped to save space)" });
+    expect(dropped.content[1]).toEqual({ type: "text", text: '{"ok":true,"n":1}' });
+  });
+});
+
+describe("quiet hours and stale asks", () => {
+  it("holds a relay at 2 AM owner time and delivers it as one text in the morning", async () => {
+    const config = testConfig();
+    config.owner.timezone = "America/Los_Angeles";
+    config.features.quietHours = { start: 22, end: 8 };
+    let clock = new Date("2026-10-17T09:00:00Z"); // 02:00 Pacific
+    const h = harness({ deps: { config, now: () => clock, housekeeping: false } });
+    expect(await h.runtime.relayToOwner("Rachel's agent asks about 2:50 PM near the lobby cafe", "a2a:rachel")).toBe(true);
+    expect(await h.runtime.relayToOwner("Tom's agent is in for lunch", "a2a:tom")).toBe(true);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.sent).toHaveLength(0);
+    expect(h.deps.audit.read({ kinds: ["outbound"] }).filter((e) => e.detail["held"] === "quiet-hours")).toHaveLength(2);
+    clock = new Date("2026-10-17T16:05:00Z"); // 09:05 Pacific
+    await h.runtime.housekeeping();
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]!.msg.text).toContain("While you were asleep:");
+    expect(h.sent[0]!.msg.text).toContain("Rachel's agent asks");
+    expect(h.sent[0]!.msg.text).toContain("Tom's agent is in");
+  });
+
+  it("lists an owner's ask that no peer answered within two hours, once", async () => {
+    const clock = new Date("2026-10-17T20:00:00Z");
+    const h = harness({ deps: { now: () => clock, housekeeping: false } });
+    h.deps.state.writeJson("a2a-delegations.json", {
+      m1: { messageId: "m1", peer: "@sam-instinct", conversationKey: "imessage:owner", deliveryKey: "imessage:owner", principal: { id: "owner", kind: "owner", tier: "owner", displayName: "Owner" }, at: new Date(clock.getTime() - 3 * 3_600_000).toISOString(), summary: "lunch Saturday 12:30" },
+      m2: { messageId: "m2", peer: "@ida-55f6v", conversationKey: "imessage:owner", deliveryKey: "imessage:owner", principal: { id: "owner", kind: "owner", tier: "owner", displayName: "Owner" }, at: new Date(clock.getTime() - 20 * 60_000).toISOString() },
+    });
+    expect(h.runtime.staleAsks().map((d) => d.messageId)).toEqual(["m1"]);
+  });
+});
+
+describe("owner text never carries network plumbing", () => {
+  it("strips A2A headers, sender tags and approval tokens", async () => {
+    const { stripModelArtifacts } = await import("../src/runtime.js");
+    expect(stripModelArtifacts("priya-natarajan-wjzg2 via Instinct: Tom is in for lunch")).toBe("Tom is in for lunch");
+    expect(stripModelArtifacts("Ida wants coffee Saturday (from ida-55f6v)")).toBe("Ida wants coffee Saturday");
+    expect(stripModelArtifacts("Sam asks about lunch. Reply YES or NO. Token MMAJ")).toBe("Sam asks about lunch.");
+  });
+});
+
+describe("agent-to-agent flood control", () => {
+  it("drops a peer's messages unread after the hourly ceiling", async () => {
+    const { A2A_PEER_HOURLY_LIMIT } = await import("../src/runtime.js");
+    const h = harness();
+    h.faux.setResponses(Array.from({ length: A2A_PEER_HOURLY_LIMIT + 3 }, () => textTurn("noted")));
+    const results = [];
+    for (let i = 0; i < A2A_PEER_HOURLY_LIMIT + 3; i++) {
+      results.push(await h.runtime.handleInbound(inbound({ id: `a2a-${i}`, channel: "a2a", from: "@sam-instinct", conversationKey: `a2a:sam:task:t${i}`, text: `ping ${i}` })));
+    }
+    expect(results.slice(0, A2A_PEER_HOURLY_LIMIT).some((r) => r.blocked === "rate-limited")).toBe(false);
+    expect(results.slice(A2A_PEER_HOURLY_LIMIT).every((r) => r.blocked === "rate-limited")).toBe(true);
+    expect(h.deps.audit.read({ kinds: ["policy"] }).some((e) => e.detail["blocked"] === "a2a-rate-limit")).toBe(true);
+  });
+
+  it("makes an agent that wrote first a contact once the owner says yes to it", async () => {
+    const h = harness();
+    h.faux.setResponses([textTurn("Grace is in, telling her agent.")]);
+    const approval = h.deps.approvals.create({ conversationKey: "a2a:g:task:g1", requestedBy: "stranger:a2a:grace-liu-wxd83", summary: "coffee with Grace at 4:00 PM", capability: "plans.commit" });
+    h.deps.approvals.resolve(approval.token, true);
+    await h.runtime.afterApproval({ ...approval, status: "approved" }, true);
+    const c = h.deps.contacts.findByHandle("grace-liu-wxd83");
+    expect(c?.name).toBe("Grace Liu");
+    expect(c?.tier).toBe("contact");
+  });
+
+  it("never limits a peer the owner asked something", async () => {
+    const { A2A_PEER_HOURLY_LIMIT } = await import("../src/runtime.js");
+    const { A2AStore } = await import("../src/a2a-state.js");
+    const h = harness();
+    new A2AStore(h.deps.state).begin({ messageId: "m-ask", peer: "@sam-instinct", conversationKey: "imessage:o", deliveryKey: "imessage:o", principal: { kind: "owner", id: "owner", tier: "owner", displayName: "Maria" } });
+    h.faux.setResponses(Array.from({ length: A2A_PEER_HOURLY_LIMIT + 3 }, () => textTurn("noted")));
+    const results = [];
+    for (let i = 0; i < A2A_PEER_HOURLY_LIMIT + 3; i++) {
+      results.push(await h.runtime.handleInbound(inbound({ id: `a2a-k${i}`, channel: "a2a", from: "@sam-instinct", conversationKey: `a2a:sam:task:k${i}`, text: `update ${i}` })));
+    }
+    expect(results.some((r) => r.blocked === "rate-limited")).toBe(false);
+  });
+});
+
+describe("scrubUnverifiedLinks", () => {
+  it("keeps connect links only when a tool produced them", async () => {
+    const { scrubUnverifiedLinks } = await import("../src/runtime.js");
+    const sources = "Open https://connect.composio.dev/link/lk_abc123 to connect Gmail";
+    expect(scrubUnverifiedLinks("Connect here: https://connect.composio.dev/link/lk_abc123", sources)).toBe("Connect here: https://connect.composio.dev/link/lk_abc123");
+    // A missing connect link is dropped with its label line; nothing promises a link later.
+    expect(scrubUnverifiedLinks("Two talks fit you.\nConnect Google Calendar: https://app.composio.dev/oauth/googlecalendar.", sources)).toBe("Two talks fit you.");
+    expect(scrubUnverifiedLinks("Try https://example.com/apps/gmail", "")).toBe("");
+    // The sentence built around a dropped link goes whole; no "block them once you" stub.
+    expect(scrubUnverifiedLinks("Two picks for you. I can block them once you connect here: https://app.composio.dev/oauth/x. Want that?", sources)).toBe("Two picks for you. Want that?");
+    expect(scrubUnverifiedLinks("Sign in at https://example.com and https://foo.invalid/x", "")).not.toContain("example.com");
+  });
+
+  it("drops a citation nobody produced, with its label, and keeps ones from tools, instructions or the owner", async () => {
+    const { scrubUnverifiedLinks } = await import("../src/runtime.js");
+    const tools = '{"title":"Ana Ruiz","url":"https://example-fund.com/team/ana-ruiz"}';
+    const context = "The directory is at https://events.example.org/directory. Agenda: https://events.example.org/agenda";
+    const reply = ["She co-founded Example Fund. Source: https://example-fund.com/team/ana-ruiz/", "She speaks at 3:30. Source: https://events.example.org/anaruiz/", "Directory: https://events.example.org/directory"].join("\n");
+    expect(scrubUnverifiedLinks(reply, tools, context)).toBe(["She co-founded Example Fund. Source: https://example-fund.com/team/ana-ruiz/", "She speaks at 3:30.", "Directory: https://events.example.org/directory"].join("\n"));
+    // A line that was only an invented link goes away.
+    expect(scrubUnverifiedLinks("Here you go.\nhttps://made.up/page", "", "")).toBe("Here you go.");
+  });
+
+  it("is applied to owner replies and to texts relayed through the tools", async () => {
+    const h = harness({ withCoreTools: true });
+    h.faux.setResponses([textTurn("Connect Calendar here: https://app.composio.dev/oauth/googlecalendar")]);
+    const r = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:cli", text: "connect my calendar" }));
+    expect(r.reply).toBeUndefined();
+  });
+
+  it("keeps pages under a folder the instructions name, and tidies a dangling 'and'", async () => {
+    const { scrubUnverifiedLinks } = await import("../src/runtime.js");
+    const context = "People pages: https://events.example.org/people/<first-last>. Agenda: https://events.example.org/agenda";
+    expect(scrubUnverifiedLinks("Profile: https://events.example.org/people/ana-ruiz", "", context)).toBe("Profile: https://events.example.org/people/ana-ruiz");
+    expect(scrubUnverifiedLinks("Sources: https://events.example.org/agenda and https://made.up/x", "", context)).toBe("Sources: https://events.example.org/agenda");
+    expect(scrubUnverifiedLinks("See https://events.example.org/anaruiz/", "", context)).toBe("");
+  });
+
+  it("drops the label line above a link it removed", async () => {
+    const { scrubUnverifiedLinks } = await import("../src/runtime.js");
+    expect(scrubUnverifiedLinks("Hugo Barra is VP of Product at Meta.\nSource:\nhttps://made.up/hugo", "")).toBe("Hugo Barra is VP of Product at Meta.");
+    expect(scrubUnverifiedLinks("Two picks for you. Connect Calendar so I can block them:\nhttps://app.composio.dev/oauth/x", "")).toBe("Two picks for you.");
+    expect(scrubUnverifiedLinks("Sessions:\n- 10:10 AM Room B", "")).toBe("Sessions:\n- 10:10 AM Room B");
+  });
+
+  it("drops angle-bracket placeholders and made-up LinkedIn links", async () => {
+    const { scrubUnverifiedLinks } = await import("../src/runtime.js");
+    expect(scrubUnverifiedLinks("Great to meet you\nHere's my LinkedIn: <your link>", "")).toBe("Great to meet you");
+    expect(scrubUnverifiedLinks("Great to meet you. Connect: linkedin.com/in/your-linkedin", "")).toBe("Great to meet you.");
+    expect(scrubUnverifiedLinks("Great to meet you. I'm at linkedin.com/in/ada-lovelace-ai", "")).toBe("Great to meet you.");
+    expect(scrubUnverifiedLinks("Her profile: linkedin.com/in/mayachen-ai", "", "card: linkedin.com/in/mayachen-ai")).toBe("Her profile: https://linkedin.com/in/mayachen-ai");
+  });
+
+  it("tidies what the owner reads: error next to an answer, repeats, 'nothing new' over news", async () => {
+    const { tidyOwnerReply } = await import("../src/runtime.js");
+    expect(tidyOwnerReply("Hit a snag on my end (Connection error.). Give me a minute and try that again.\n\nDinner is set for 7:30")).toBe("Dinner is set for 7:30");
+    expect(tidyOwnerReply("Hit a snag on my end. Give me a minute and try that again.")).toBe("Hit a snag on my end. Give me a minute and try that again.");
+    expect(tidyOwnerReply("On it, making the sheet\n\nOn it, making the sheet\n\nHere it is")).toBe("On it, making the sheet\n\nHere it is");
+    expect(tidyOwnerReply("Nothing new yet\nRachel is in\nPriyanka declined")).toBe("Rachel is in\nPriyanka declined");
+    expect(tidyOwnerReply("Nothing new since Victor confirmed.\n\nYou're set for 12:30 PM")).toBe("You're set for 12:30 PM");
+    expect(tidyOwnerReply("Nothing new yet")).toBe("Nothing new yet");
+    expect(tidyOwnerReply("Hi Maya, great to meet you.\nHere's my LinkedIn:\nBest, Ada")).toBe("Hi Maya, great to meet you.\nBest, Ada");
+    expect(tidyOwnerReply("Her LinkedIn: https://linkedin.com/in/maya")).toBe("Her LinkedIn: https://linkedin.com/in/maya");
+  });
+
+  it("adds back a file block the reply left out", async () => {
+    const { withFileFences } = await import("../src/runtime.js");
+    const fence = "```maritime-file\n{\"path\":\"/data/workspace/notes.pdf\",\"name\":\"notes.pdf\"}\n```";
+    expect(withFileFences("Your notes", [fence])).toBe(`Your notes\n\n${fence}`);
+    expect(withFileFences(`Your notes\n${fence}`, [fence])).toBe(`Your notes\n${fence}`);
+    expect(withFileFences("", [fence])).toBe(fence);
+    expect(withFileFences("Plain", [])).toBe("Plain");
+    const pasted = "```maritime-file\n{ \"path\": \"/data/workspace/notes.pdf\" }\n```".replace('{ "path": "', '{"path":"');
+    expect(withFileFences(`Here\n${pasted}`, [fence])).toBe(`Here\n${pasted}`);
+  });
+
+  it("labels a late answer with the question it answers", async () => {
+    const { lateAnswer } = await import("../src/runtime.js");
+    expect(lateAnswer("research workos in 3 lines", "WorkOS sells enterprise auth.")).toBe('About "research workos in 3 lines":\nWorkOS sells enterprise auth.');
+    expect(lateAnswer("x".repeat(80), "ok").startsWith(`About "${"x".repeat(57)}…":`)).toBe(true);
+    expect(lateAnswer("", "ok")).toBe("ok");
+  });
+
+  it("describes a busy owner thread in words", async () => {
+    const { busyStatus } = await import("../src/runtime.js");
+    const now = new Date("2026-10-17T15:00:00Z");
+    expect(busyStatus({ busySince: now.getTime() - 6.5 * 60_000, activity: "web_search" }, now)).toBe("Still on your earlier request (about 6 min in, searching the web). Got this one too; I'll answer it right after.");
+    expect(busyStatus({ busySince: now.getTime() - 10_000, activity: "mystery_tool" }, now)).toBe("Still on your earlier request. Got this one too; I'll answer it right after.");
+    expect(busyStatus({ busySince: undefined, activity: undefined }, now)).toBeUndefined();
+  });
+
+  it("cuts a leaked tool-call channel and everything after it", async () => {
+    const { stripModelArtifacts } = await import("../src/runtime.js");
+    expect(stripModelArtifacts('Jessica runs Pilot. to=functions.load_skill commentary 彩票总代理 {"name":"x"}')).toBe("Jessica runs Pilot.");
+    expect(stripModelArtifacts("Plain answer.")).toBe("Plain answer.");
+    expect(stripModelArtifacts("Hit a snag on my end (<!DOCTYPE html>). Trying again")).toBe("Hit a snag on my end. Trying again");
+    expect(stripModelArtifacts("Great to meet you, Maya. Here's my site [your link]\nBest, Ada")).toBe("Great to meet you, Maya. Here's my site\nBest, Ada");
+    expect(stripModelArtifacts("See [Name](https://x.test/a) and [1]")).toBe("See [Name](https://x.test/a) and [1]");
+    expect(stripModelArtifacts("Your plan: 2:15 Room A. <PRIVATE>guess: namesake at Meadow</PRIVATE>")).toBe("Your plan: 2:15 Room A.");
+  });
+
+  it("keeps a link the owner sent in their own message", async () => {
+    const h = harness();
+    h.faux.setResponses([textTurn("Got it, saved https://example.org/deck.pdf for later.")]);
+    const r = await h.runtime.handleInbound(inbound({ channel: "chat", from: "owner", conversationKey: "chat:cli", text: "keep this https://example.org/deck.pdf" }));
+    expect(r.reply).toBe("Got it, saved https://example.org/deck.pdf for later.");
+  });
+});
+
+describe("runScheduled framing", () => {
+  it("tells the model the prompt is the job's own instruction, not a new request", async () => {
+    const h = harness();
+    h.faux.setResponses([textTurn("Coffee time.")]);
+    await h.runtime.runScheduled({ id: "s1", name: "coffee", enabled: true, prompt: "remind me in 2 minutes to grab a coffee", createdAt: new Date().toISOString() });
+    expect(h.sent.at(-1)?.msg.text).toBe("Coffee time.");
+    expect(h.deps.audit.read({ kinds: ["schedule"] }).some((e) => e.detail["fired"] === true)).toBe(true);
   });
 });

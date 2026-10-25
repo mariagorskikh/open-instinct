@@ -58,6 +58,9 @@ describe("config", () => {
     expect(swapped.model.primary).toBe("openai-compatible/gpt-5");
     // The override is per process; the file keeps what was saved.
     expect(state.readJson<{ model: { primary: string } }>("config.json", { model: { primary: "" } }).model.primary).toBe(DEFAULT_MODEL);
+    // The budget contact is an operator setting too: env wins on every boot, nothing is written.
+    expect(loadConfig(state, { INSTINCT_BUDGET_CONTACT: " help@example.com " }).features.budgetContact).toBe("help@example.com");
+    expect(loadConfig(state, {}).features.budgetContact).toBeUndefined();
   });
 
   it("seeds owner.claimOnFirstContact from INSTINCT_CLAIM_OWNER_ON_FIRST_CONTACT only when set", () => {

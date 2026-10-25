@@ -16,6 +16,7 @@ import type {
   ToolContext,
   ToolResultLike,
 } from "@open-instinct/core";
+import { mayShareOwnerContact, ownerContactIn, utcOffset } from "@open-instinct/core";
 import type { InkboxA2A, InkboxProvisioner } from "@open-instinct/inkbox";
 import { ASSIGNABLE_TIERS, CAPABILITIES, TIERS, parseCapabilities } from "./capabilities.js";
 import { defineTool, textResult } from "./define.js";
@@ -39,6 +40,17 @@ export interface NetworkToolDeps {
   /** Called after a grant or tier override changes so the host can persist the policy (savePolicy). */
   onPolicyChange?: (policy: Policy) => void;
   now?: () => Date;
+  /**
+   * People an agent must not message on its own initiative (INSTINCT_RESERVED_CONTACTS, for example organizers). ask_instinct
+   * refuses them unless the call says the owner asked for that person by name.
+   */
+  reservedNames?: string[];
+  /** The owner's recorded meeting with this person, as "Sat, Oct 17, 12:30 PM, lobby cafe", if any. */
+  meetingWith?: (name: string) => string | undefined;
+  /** Start (ISO) of the owner's recorded meeting with this person, if any. */
+  meetingStartWith?: (name: string) => string | undefined;
+  /** The owner's meeting with someone other than `peer` at a time the text names, as "Victor Alvarado at Sat, Oct 17, 1:30 PM", if any. */
+  clashWith?: (text: string, peer: string) => string | undefined;
 }
 
 const REPLY_INTENTS = ["progress", "complete", "ask_caller", "fail"] as const;
@@ -260,10 +272,14 @@ export function networkTools(deps: NetworkToolDeps): RegisteredTool[] {
       if ((args.from && !args.to_date) || (!args.from && args.to_date)) return refuse("Give both from and to_date for a window, or neither.");
 
       const scope: Grant["scope"] = {};
+      const tz = config.owner.timezone || "UTC";
+      // "Saturday only" means the owner's Saturday: plain days become local midnight to local end of day.
+      const from = args.from ? startOfDayIso(args.from, tz) : undefined;
+      const toDate = args.to_date ? endOfDayIso(args.to_date, tz) : undefined;
       if (args.purpose) scope.purpose = args.purpose;
-      if (args.from && args.to_date) scope.window = { from: args.from, to: args.to_date };
+      if (from && toDate) scope.window = { from, to: toDate };
       if (args.maxUsd !== undefined) scope.maxUsd = args.maxUsd;
-      const expiresAt = args.expiresAt ?? (args.to_date ? endOfDayIso(args.to_date) : undefined);
+      const expiresAt = args.expiresAt ?? toDate;
 
       const grant = policy.addGrant({ to, capabilities: valid, scope: Object.keys(scope).length ? scope : undefined, expiresAt, note: args.note });
       changed();
@@ -332,6 +348,8 @@ export function networkTools(deps: NetworkToolDeps): RegisteredTool[] {
       payload: Type.Optional(PayloadSchema),
       contextId: Type.Optional(Type.String({ description: "A2A context to continue; only with a single contact. Omit to start a new topic" })),
       taskId: Type.Optional(Type.String({ description: "An existing delegated task to answer when the other agent asks for more input. Only with a single contact." })),
+      owner_named: Type.Optional(Type.Boolean({ description: "true only when the owner asked for this exact person by name in this conversation" })),
+      move: Type.Optional(Type.Boolean({ description: "true when the owner asked to move or change a meeting already set with this person" })),
     }),
     meta: {
       capabilities: ["network.ask"],
@@ -350,13 +368,68 @@ export function networkTools(deps: NetworkToolDeps): RegisteredTool[] {
       const results: AskResult[] = [];
       const seen = new Set<string>();
       for (const ref of refs) {
-        const found = resolveAskTarget(ref, ctx.principal);
+        let found = resolveAskTarget(ref, ctx.principal);
+        if (!found.contact && isOwner(ctx.principal) && /^@[a-z0-9][a-z0-9-]{2,}$/i.test(ref.trim()) && !/^Several contacts match/.test(found.error)) {
+          // A bare handle from a directory is enough: the contact is created on the spot.
+          const handle = ref.trim().replace(/^@/, "").toLowerCase();
+          const created = contacts.upsert({ name: nameFromHandle(handle), agentHandle: `@${handle}`, tier: "contact" });
+          found = { contact: created, error: "" };
+        }
         if (!found.contact) {
           results.push({ ref, ok: false, text: `${ref}: ${found.error}` });
           continue;
         }
         if (seen.has(found.contact.id)) continue;
         seen.add(found.contact.id);
+        // Reserved people (organizers, say) got messages from agents whose owners never named them.
+        // By name or by handle: a contact saved under another name can still carry a reserved person's handle.
+        const reserved = (deps.reservedNames ?? []).find((n) => sameName(n, found.contact!.name) || handleOf(n, found.contact!.agentHandle));
+        // A repeat "introduce me" re-proposed meetings that were already set, and the two sides drifted apart.
+        // Only a new scheduling ask is held back; a question, a note or a share about something else goes through.
+        // A note or question that only mentions the meeting ("running 10 min late to our meeting",
+        // "what are you working on before we meet?") is not a new booking: testing refused 12 of 16 of them.
+        const note = args.intent === "ask" && /\b(running late|running behind|late to|minutes late|min late|on my way|be there in|working on|what (?:do|does|are|is|was)|how (?:is|are|was)|who (?:is|are) (?:they|he|she)|tell (?:me|us) about|one-line intro|short intro|a bit about|thank|thanks|my email|my phone|my number|my linkedin|send(?:ing)? (?:you|them|him|her) my|here is my|here's my)\b/i.test(args.text);
+        const scheduling = ["propose_times", "request_freebusy", "book_request"].includes(args.intent) || (args.intent === "ask" && !note && /\b(meet|meetup|intro|introduce|coffee|lunch|dinner|catch up|slot|time to)\b/i.test(`${args.subject ?? ""} ${args.text}`));
+        // A group plan (a 3-way coffee) is a new meeting even with someone the owner already meets one-to-one.
+        const group = refs.length > 1 || /\b(3-way|three-way|4-way|group|all three|all of us|the three of us|together with)\b/i.test(`${args.subject ?? ""} ${args.text}`);
+        const existing = isOwner(ctx.principal) && scheduling && !group && !args.move && !args.taskId ? deps.meetingWith?.(found.contact.name) : undefined;
+        // A "move" to the start already held changes nothing and confuses both sides.
+        const held = args.move ? deps.meetingStartWith?.(found.contact.name) : undefined;
+        const asked = args.move ? requestedStart(args.payload) : undefined;
+        if (held && asked && Date.parse(held) === Date.parse(asked)) {
+          results.push({ ref, ok: false, text: `The owner's meeting with ${found.contact.name} is already at that time${deps.meetingWith ? ` (${deps.meetingWith(found.contact.name) ?? ""})` : ""}. Nothing was sent; tell the owner it is already set then.` });
+          continue;
+        }
+        if (existing) {
+          results.push({ ref, ok: false, text: `The owner is already meeting ${found.contact.name}: ${existing}. Nothing was sent. Tell the owner that; if they asked to move it, call again with move: true.` });
+          continue;
+        }
+        // "Send Ethan my email" once went out as the words "my email", and the owner was told it was sent.
+        if (isOwner(ctx.principal) && /\bmy (email|e-mail|phone|number|linkedin)\b/i.test(args.text) && !/@|\d{3}|linkedin\.com/i.test(args.text)) {
+          results.push({ ref, ok: false, text: `Nothing sent to ${found.contact.name}: the message says "my ${/\bmy (\w+)/i.exec(args.text)?.[1] ?? "details"}" but not the actual detail. Ask the owner for it, then send it.` });
+          continue;
+        }
+        // The owner's "yes" to one person went out while the same slot was already given to another
+        // (testing: Rafael confirmed Leo three times while set with Ingrid). Check before sending.
+        const timed = `${args.text} ${JSON.stringify(args.payload ?? {})}`;
+        const clash = isOwner(ctx.principal) && !note ? deps.clashWith?.(timed, found.contact.name) : undefined;
+        const clashFirst = clash ? clash.split(" ")[0]!.toLowerCase() : "";
+        const counter = /\b(taken|busy|clash|conflict|can't|cannot|won't|isn't free|not free)\b/i.test(args.text);
+        const sameGroup = group && clashFirst.length > 1 && args.text.toLowerCase().includes(clashFirst);
+        if (clash && !counter && !sameGroup) {
+          results.push({ ref, ok: false, text: `Nothing sent to ${found.contact.name}: the owner already meets ${clash}. Offer ${found.contact.name} the next free slot instead; ask the owner only if they want to swap.` });
+          continue;
+        }
+        // An ask to meet with no time in it opens a negotiation that rarely closes; one concrete slot does.
+        const slotsGiven = Array.isArray((args.payload as { slots?: unknown[] } | undefined)?.slots) && ((args.payload as { slots: unknown[] }).slots.length > 0);
+        if (scheduling && isOwner(ctx.principal) && !args.move && !args.taskId && !args.contextId && !slotsGiven && !/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(args.text) && !/\b(?:noon|midday)\b/i.test(args.text)) {
+          results.push({ ref, ok: false, text: `${ref}: nothing sent. A meeting ask must name one concrete time and place (for example "Saturday October 17 at 12:30 PM, lunch in the lobby cafe"); the other side says yes or offers another slot.` });
+          continue;
+        }
+        if (reserved && !args.owner_named && !args.taskId && !args.contextId) {
+          results.push({ ref, ok: false, text: `${found.contact.name} is on the reserved list. Message them only when the owner asked for ${found.contact.name} by name; if so, call again with owner_named: true. Otherwise suggest someone else and do not tell the owner you reached out.` });
+          continue;
+        }
         results.push(await askOne(found.contact, args, ctx));
       }
 
@@ -377,6 +450,29 @@ export function networkTools(deps: NetworkToolDeps): RegisteredTool[] {
       return { content: [{ type: "text", text: lines.join("\n") }], isError: okCount === 0, details: { results } };
     },
   });
+
+  function requestedStart(payload: Record<string, unknown> | undefined): string | undefined {
+    if (!payload) return undefined;
+    if (typeof payload.start === "string") return payload.start;
+    const slots = payload.slots;
+    if (Array.isArray(slots) && slots.length === 1 && slots[0] && typeof (slots[0] as { start?: unknown }).start === "string") return (slots[0] as { start: string }).start;
+    return undefined;
+  }
+
+  /** "Sam Lee" matches handles like "sam-lee-k7p2x"; "@sam-lee-k7p2x" matches exactly. */
+  function handleOf(entry: string, handle: string | undefined): boolean {
+    if (!handle) return false;
+    const h = handle.toLowerCase().replace(/^@/, "");
+    const e = entry.trim().toLowerCase();
+    if (e.startsWith("@")) return h === e.slice(1);
+    const slug = e.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    return slug !== "" && (h === slug || h.startsWith(`${slug}-`));
+  }
+
+  function sameName(a: string, b: string): boolean {
+    const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, " ").replace(/\s+/g, " ").trim();
+    return norm(a) !== "" && norm(a) === norm(b);
+  }
 
   /**
    * Who a principal may address through ask_instinct. The owner: anyone in contacts. Anyone
@@ -409,7 +505,7 @@ export function networkTools(deps: NetworkToolDeps): RegisteredTool[] {
         return { ...base, ok: false, text: "That task was not delegated to this contact from this conversation." };
       }
       const messageId = randomUUID();
-      deps.a2aStore?.begin({ messageId, peer: c.agentHandle, conversationKey: ctx.conversationKey, deliveryKey: ctx.deliveryKey ?? ctx.conversationKey, principal: ctx.principal, ...(ctx.replyRef ? { replyRef: { ...ctx.replyRef } } : {}), ...(args.taskId ? { taskId: args.taskId } : {}) });
+      deps.a2aStore?.begin({ messageId, peer: c.agentHandle, conversationKey: ctx.conversationKey, deliveryKey: ctx.deliveryKey ?? ctx.conversationKey, principal: ctx.principal, ...(ctx.replyRef ? { replyRef: { ...ctx.replyRef } } : {}), ...(args.taskId ? { taskId: args.taskId } : {}), at: new Date().toISOString(), summary: args.text.slice(0, 200) });
       const res = await deps.a2a.send(c.agentHandle, text, encodeOip(oip), {
         messageId,
         ...(args.contextId ? { contextId: args.contextId } : {}),
@@ -466,6 +562,16 @@ export function networkTools(deps: NetworkToolDeps): RegisteredTool[] {
       const taskId = ctx.replyRef?.taskId;
       if (!taskId || !ctx.assertA2AActive) return refuse("No active inbound A2A task is bound to this conversation.");
       await ctx.assertA2AActive();
+      if (!mayShareOwnerContact(ctx.principal.tier) && ownerContactIn(`${args.text} ${JSON.stringify(args.payload ?? {})}`, config.owner).length > 0) {
+        audit.append({ kind: "policy", conversationKey: ctx.conversationKey, principal: ctx.principal.id, detail: { outcome: "deny", tool: "reply_instinct", reason: "owner contact details to a non-partner agent" } });
+        return refuse(`Not sent: that reply contains ${config.owner.name}'s phone or email, which only a partner may get. Decline that part, and tell ${config.owner.name} what was asked.`);
+      }
+      // Saying yes to a time already given to someone else double-books the owner; catch it before it is sent.
+      const peerName = ctx.principal.onBehalfOf?.displayName ?? ctx.principal.displayName.replace(/[\u2019']s agent$/i, "");
+      const taken = args.intent !== "fail" ? deps.clashWith?.(`${args.text} ${JSON.stringify(args.payload ?? {})}`, peerName) : undefined;
+      if (taken && !/\b(taken|busy|booked with|clash|conflict|not free|isn't free|can't|cannot)\b/i.test(args.text)) {
+        return refuse(`Not sent: ${config.owner.name} already meets ${taken}. Tell ${peerName}'s agent that time is taken and offer the next free slot instead.`);
+      }
       const data = buildReplyData(args, config);
       try {
         await deps.a2a.reply(taskId, args.intent as ReplyIntent, args.text, data);
@@ -563,7 +669,19 @@ function buildReplyData(
 }
 
 /** A window's last day should still be usable, so the grant expires at the end of it. */
-function endOfDayIso(date: string): string {
-  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) return `${date}T23:59:59`;
-  return date;
+const PLAIN_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+function startOfDayIso(date: string, tz: string): string {
+  return PLAIN_DAY.test(date) ? `${date}T00:00:00${utcOffset(new Date(`${date}T12:00:00Z`), tz)}` : date;
+}
+
+function endOfDayIso(date: string, tz: string): string {
+  return PLAIN_DAY.test(date) ? `${date}T23:59:59${utcOffset(new Date(`${date}T12:00:00Z`), tz)}` : date;
+}
+
+/** "priya-natarajan-wjzg2" becomes "Priya Natarajan": a trailing random suffix is dropped. */
+export function nameFromHandle(handle: string): string {
+  const parts = handle.replace(/^@/, "").split("-").filter(Boolean);
+  if (parts.length > 1 && /^[a-z0-9]{4,6}$/.test(parts[parts.length - 1]!) && /\d/.test(parts[parts.length - 1]!)) parts.pop();
+  return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
 }

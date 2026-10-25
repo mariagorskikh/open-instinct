@@ -260,6 +260,15 @@ function reachSection({ principal, config, channel }: PromptInput): string {
     "- To connect the wallet: call payment_connect and send the link.",
     "- When something is not set up on this agent, the \"What is set up right now\" section says so. Then say it in one sentence, name the exact thing to set up, and offer what you can do instead. Never guess at a screen or a setting that does not exist.",
     "- Never describe your own machinery (containers, servers, processes, tunnels). Talk about results.",
+    "",
+    "# Habits that keep the owner's trust",
+    `- Send only links a tool returned in this conversation, that ${owner} sent, or that your instructions give. Never type a URL from memory or send a placeholder like [link]; leave it out instead.`,
+    "- When you look someone up, cite only what a search or fetch returned. A page about someone with the same name but a different job or company is not them. If nothing public turns up, say so.",
+    `- ${owner} will send several asks in a row. Acknowledge them in one line, keep an open-tasks note in memory, and finish every one; when one is waiting on someone else, say so instead of going quiet.`,
+    "- Asked what you did or whom you contacted, check audit_read and name every person, not the highlights.",
+    "- Before creating a reminder, check schedule_list; if the same one exists, say so instead of adding a copy.",
+    `- Never ask ${owner} to approve what they just asked you to do.`,
+    "- When you can't do something (listen to a voice note, host a web page, take an incoming call), say so in one line and offer the nearest thing you can do.",
   ].join("\n");
 }
 
@@ -274,7 +283,9 @@ function rulesSection({ config }: PromptInput): string {
     `5. Share information about ${owner} only within the tier of the person you are talking to.`,
     "6. Prefer doing over describing. Use tools. Report results, not plans.",
     "7. If a tool fails or is blocked, say so plainly and suggest the next step.",
-    `8. A phone call needs ${owner}'s explicit yes first, with the number you will call and what you will say; a general request is not a yes. Every phone_call is held for ${owner}'s own yes to that exact number and brief, even when ${owner} asked for the call, so call the tool once and wait rather than asking twice. After a call, report only what its transcript shows, never what you expect was said. Never call ${owner}'s own contacts unless ${owner} asked for that call.`,
+    "8. Report only what a tool confirmed. Never say sent, done, told, asked, booked or scheduled for an action whose tool result did not say it succeeded, and never attribute a request to the wrong person: if the owner asked for something, it is the owner's request, not the other side's.",
+    "9. One message per turn. When you send a file, its caption is the message: add nothing after it. Never send two texts that say the same thing.",
+    `10. A phone call needs ${owner}'s explicit yes first, with the number you will call and what you will say; a general request is not a yes. Every phone_call is held for ${owner}'s own yes to that exact number and brief, even when ${owner} asked for the call, so call the tool once and wait rather than asking twice. After a call, report only what its transcript shows, never what you expect was said. Never call ${owner}'s own contacts unless ${owner} asked for that call.`,
   ].join("\n");
 }
 
@@ -310,7 +321,28 @@ function longTaskSection(channel: Channel): string {
 function timeSection({ now, config }: PromptInput): string {
   const tz = config.owner.timezone || "UTC";
   const local = formatLocal(now, tz);
-  return `# Now\n${local} (${tz}). ISO: ${now.toISOString()}. Interpret relative dates in this timezone.`;
+  const day = (d: Date) => formatDay(d, tz);
+  // Only local dates: a UTC timestamp next to them reads as "tomorrow" every evening west of Greenwich.
+  return `# Now\n${local} (${tz}, UTC${utcOffset(now, tz)}). Today is ${day(now)}; tomorrow is ${day(new Date(now.getTime() + 86_400_000))}. Interpret relative dates in this timezone; when writing a time for a tool, include this offset.`;
+}
+
+function formatDay(date: Date, tz: string): string {
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long", month: "long", day: "numeric" }).format(date);
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
+
+/** "-07:00" for the zone at that instant. */
+export function utcOffset(date: Date, tz: string): string {
+  try {
+    const name = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "longOffset" }).formatToParts(date).find((p) => p.type === "timeZoneName")?.value ?? "GMT";
+    const m = /GMT([+-]\d{2}):?(\d{2})?/.exec(name);
+    return m ? `${m[1]}:${m[2] ?? "00"}` : "+00:00";
+  } catch {
+    return "+00:00";
+  }
 }
 
 function formatLocal(date: Date, tz: string): string {

@@ -128,7 +128,8 @@ describe("http server", () => {
   it("GET /health", async () => {
     const res = await fetch(`${base}/health`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    // The stub runtime has one conversation mid-run.
+    expect(await res.json()).toEqual({ ok: true, busy: true });
   });
 
   it("GET / reports status", async () => {
@@ -478,7 +479,7 @@ describe("tunnel listener", () => {
   it("serves /health", async () => {
     const res = await fetch(`${base}/health`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, busy: true });
   });
 
   it("404s the owner's surface even with no token configured", async () => {

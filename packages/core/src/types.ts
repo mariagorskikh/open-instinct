@@ -258,6 +258,10 @@ export interface InstinctConfig {
     journal: boolean;
     /** Text a one-line "on it" on iMessage/SMS when a reply passes the budget, instead of silence until it is done. */
     ackSlowReplies?: boolean;
+    /** Owner texts that are not replies wait out these local hours (default 22 to 8). false turns the hold off. */
+    quietHours?: { start: number; end: number } | false;
+    /** Who the owner should ask when the agent's AI budget is spent (an email address, usually). Named in the paused reply. */
+    budgetContact?: string;
   };
 }
 

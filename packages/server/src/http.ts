@@ -336,7 +336,8 @@ export function createHttpServer(app: HttpApp, opts: HttpServerOptions = {}): ht
 
     if (tunnelOnly && !TUNNEL_ROUTES.has(`${method} ${path}`)) return sendJson(res, 404, { error: "not found" });
 
-    if (method === "GET" && path === "/health") return sendJson(res, 200, { ok: true });
+    // busy: a run is still going (the host should not idle-sleep the VM under it). A boolean only; /health is public.
+    if (method === "GET" && path === "/health") return sendJson(res, 200, { ok: true, busy: app.runtime.stats().busy > 0 });
 
     if (method === "POST" && path === "/webhooks/inkbox") {
       const key = signingKey();

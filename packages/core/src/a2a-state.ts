@@ -10,6 +10,10 @@ export interface A2ADelegation {
   replyRef?: Record<string, string | undefined>;
   taskId?: string;
   contextId?: string;
+  /** When it was sent (ISO). */
+  at?: string;
+  /** The first words of the request, for context when the peer writes back on a new task. */
+  summary?: string;
 }
 
 interface TaskRecord {
@@ -53,6 +57,14 @@ export class A2AStore {
 
   byMessage(messageId: string): A2ADelegation | undefined {
     return this.state.readJson<Record<string, A2ADelegation>>("a2a-delegations.json", {})[messageId];
+  }
+
+  /** Requests the owner had this agent send to `peer`, newest first. */
+  ownerAsksTo(peer: string): A2ADelegation[] {
+    const want = peer.replace(/^@/, "").toLowerCase();
+    return Object.values(this.state.readJson<Record<string, A2ADelegation>>("a2a-delegations.json", {}))
+      .filter((d) => d.principal.kind === "owner" && d.peer.replace(/^@/, "").toLowerCase() === want)
+      .reverse();
   }
 
   hasPending(): boolean {

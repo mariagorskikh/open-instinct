@@ -110,6 +110,15 @@ describe("ApprovalStore", () => {
     expect(store.matchReply("yes")?.approval.token).toBe(money.token);
   });
 
+  it("won't let a bare yes settle the owner's own request once it is stale", () => {
+    let now = new Date("2026-10-17T10:00:00Z");
+    const store = new ApprovalStore(tempState(), { now: () => now });
+    store.create({ ...base, requestedBy: "owner" });
+    now = new Date("2026-10-17T10:30:00Z");
+    expect(store.matchReply("yes")).toBeUndefined();
+    expect(store.pending()).toHaveLength(1);
+  });
+
   it("leaves the approval alone when the owner is talking about something else", () => {
     const store = new ApprovalStore(tempState());
     const a = store.create(base);

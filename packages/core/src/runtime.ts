@@ -14,10 +14,12 @@ import { dirname, join } from "node:path";
 import { Agent, type AgentMessage, type AgentTool, type BeforeToolCallResult, type StreamFn } from "@earendil-works/pi-agent-core";
 import { createInitialSystemMessage, toToolDeclaration, type ImageContent, type Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
+import { BUDGET_EXHAUSTED_PATTERN, budgetExhaustedReply } from "./budget.js";
 import type { ApprovalMatch, ApprovalStore } from "./approvals.js";
 import type { AuditLog } from "./audit.js";
 import type { ContactStore } from "./contacts.js";
 import type { MemoryStore } from "./memory.js";
+import { busySection, meetingsSection, type MeetingStore } from "./meetings.js";
 import { OwnerNotifier } from "./notifier.js";
 import { DEFAULT_TIER_TABLE, SPEND_CAPABILITIES, type PolicyEngine } from "./policy.js";
 import { looksLikePhone, normalizePhone, resolvePrincipal } from "./principal.js";
@@ -25,7 +27,8 @@ import { saveConfig } from "./config.js";
 import { CLAIM_WELCOME_TEXT, MAX_CLAIM_ATTEMPTS, matchClaimCode, ownerClaimStatus } from "./owner-claim.js";
 import { readAgentsInstructions, readPersona } from "./persona.js";
 import { buildSystemPrompt, wrapUntrusted } from "./prompt.js";
-import { A2AStore, a2aState, a2aTerminal } from "./a2a-state.js";
+import { A2AStore, a2aState, a2aTerminal, type A2ADelegation } from "./a2a-state.js";
+import { mayShareOwnerContact, ownerContactIn } from "./privacy.js";
 import type { Scheduler } from "./scheduler.js";
 import type { StateDir } from "./state.js";
 import type { RegisteredTool, ToolContext, ToolRegistry } from "./tools.js";
@@ -50,6 +53,8 @@ export interface Outbox {
 
 export interface RuntimeDeps {
   state: StateDir;
+  /** false disables the five-minute housekeeping timer (quiet-hours flush, stale-ask nudges). Tests. */
+  housekeeping?: boolean;
   config: InstinctConfig;
   policy: PolicyEngine;
   approvals: ApprovalStore;
@@ -57,6 +62,8 @@ export interface RuntimeDeps {
   scheduler: Scheduler;
   contacts: ContactStore;
   memory: MemoryStore;
+  /** The owner's agreed meetings; shown on every turn so no one re-proposes or double-books them. */
+  meetings?: MeetingStore;
   registry: ToolRegistry;
   model: Model<any>;
   outbox: Outbox;
@@ -69,6 +76,10 @@ export interface RuntimeDeps {
   streamFn?: StreamFn;
   now?: () => Date;
   replyBudgetMs?: number;
+  /** A run older than this is aborted when the next message arrives (default 15 minutes). */
+  maxRunMs?: number;
+  /** Owner texts that arrive within this many ms (replies from several agents, a burst of updates) go out as one message. 0 sends at once. */
+  ownerMergeMs?: number;
   sessionsDir?: string;
   /** API key lookup handed to Pi; needed for "openai-compatible/..." models. Core never reads env. */
   getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
@@ -100,6 +111,8 @@ export const KEEP_RECENT_IMAGES = 2;
 export const APPROVAL_USE_WINDOW_MS = 15 * 60 * 1000;
 const SEEN_IDS_MAX = 500;
 const DEFAULT_REPLY_BUDGET_MS = 20_000;
+/** A run older than this is treated as stuck when the next message arrives. Long browser work fits well inside it. */
+const DEFAULT_MAX_RUN_MS = 15 * 60_000;
 const TYPING_TIMEOUT_MS = 2_000;
 const SEEN_FILE = "seen-ids.json";
 const STRANGERS_FILE = "strangers.json";
@@ -114,6 +127,39 @@ const REPLY_TOOL = "reply_instinct";
 const PROCESSING_FILE = "processing-events.json";
 const CLAIM_ATTEMPTS_FILE = "owner-claim-attempts.json";
 const CARRIER_CHANNELS: ReadonlySet<Channel> = new Set(["imessage", "sms"]);
+interface OwnerQueue {
+  texts: string[];
+  principal: Principal;
+  originKey: string;
+  approvalToken?: string;
+  done: Promise<void>;
+}
+
+/** An owner's ask that proposes meeting someone (as opposed to a note, a question or a share). */
+const MEETING_ASK = /\b(meet|meetup|coffee|lunch|dinner|intro|introduce|catch up|chat|slot|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i;
+
+/** An agent's message that is really for the owner: a heads-up, a question about them, a detail they sent. */
+const OWNER_NOTE = /\b(running (?:\d+ (?:min(?:ute)?s? )?)?late|running behind|minutes late|min late|on (?:my|their|his|her) way|heads[- ]up|what (?:is|are|does|do) (?:\w+ )?(?:working on|building|doing)|working on|here(?:'s| is) (?:my|their|his|her) (?:email|phone|number|linkedin)|@[\w.-]+\.[a-z]{2,}|linkedin\.com|thank(?:s| you))\b/i;
+
+/** Tools whose success means a message reached someone other than the owner. */
+const SEND_TOOLS = new Set(["ask_instinct", "send_message", "reply_instinct", "send_file", "invite", "invite_to_network", "phone_call"]);
+/** OpenAI-compatible proxies reject more tools than this in one request. */
+export const MAX_MODEL_TOOLS = 128;
+/** Inbound agent-to-agent messages from one peer above this many per hour are dropped unread. */
+export const A2A_PEER_HOURLY_LIMIT = 30;
+/** Owner texts that are not replies to the owner wait out these local hours (start inclusive, end exclusive). */
+export const QUIET_HOURS = { start: 22, end: 8 };
+/** An owner who texted this recently is awake; quiet hours do not hold texts for them. */
+const OWNER_AWAKE_MS = 15 * 60_000;
+const QUIET_HOLD_FILE = "quiet-hold.json";
+/** An owner's ask to another agent with no answer after this long gets one nudge. */
+export const STALE_ASK_MS = 2 * 60 * 60_000;
+const NUDGED_FILE = "a2a-nudged.json";
+/** An owner message this long after the previous one in the thread is answered as a fresh start. */
+const GAP_NOTE_MS = 3 * 60 * 60_000;
+const LAST_OWNER_TURN_FILE = "last-owner-turn.json";
+
+
 
 /** Work may already have caused an external effect; automatic replay is not safe. */
 export class InboundUncertainError extends Error {
@@ -161,6 +207,132 @@ interface ConversationOptions {
   now: () => Date;
 }
 
+/**
+ * Some models leak their tool-call channel into the text ("to=functions.load_skill commentary
+ * {...}", "<|channel|>"), sometimes followed by junk tokens. Nothing from that point on is meant
+ * for the owner.
+ */
+export function stripModelArtifacts(text: string): string {
+  const m = /(\bto=functions\.|<\|(?:channel|message|start|end|call|constrain)\|>|\bassistant to=|\bcommentary\s*\{")/i.exec(text);
+  const cut = m ? text.slice(0, m.index).trimEnd() : text;
+  // Memory markup such as <PRIVATE>...</PRIVATE> is for the model, never the owner.
+  return cut
+    // Network plumbing the model copies from inbound A2A text: "<handle> via Instinct:", "(from <handle>)",
+    // approval tokens. None of it means anything to a person reading a text.
+    .replace(/\b[a-z0-9][a-z0-9-]{2,} via Instinct:\s*/gi, "")
+    .replace(/\s*\(from [a-z0-9][a-z0-9-]{2,}(?:'s agent)?\)/gi, "")
+    .replace(/\s*Reply YES or NO\.?(?:\s*Token\s+\w+\.?)?/g, "")
+    .replace(/<(PRIVATE|INTERNAL|NOTES?)>[\s\S]*?<\/\1>/gi, "")
+    .replace(/<\/?(PRIVATE|INTERNAL|NOTES?)>/gi, "")
+    // An error page pasted from a failed fetch ("Hit a snag (<!DOCTYPE html>)") means nothing to the owner.
+    .replace(/<html[\s\S]*?<\/html>/gi, "")
+    .replace(/\s*\(?<!DOCTYPE[^)\n]*\)?/gi, "")
+    // Template placeholders in a draft ("[your link]", "[Name]") would be sent as typed.
+    // A label goes with its placeholder ("Here's my LinkedIn: <your link>").
+    .replace(/[ \t]*(?:[\w'’ ]{0,30}:[ \t]*)?<(?:your|insert|their)\b[^>\n]{0,40}>/gi, "")
+    .replace(/[ \t]*(?:[\w'’ ]{0,30}:[ \t]*)?(?:https?:\/\/)?(?:www\.)?linkedin\.com\/in\/(?:your|my|insert)[-\w]*\/?/gi, "")
+    .replace(/[ \t]*\[(?:your|insert|their|add|name|link|company|role|title|date|time|number|phone|email|question|exact|venue)\b[^\]\n]{0,40}\](?!\()/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Links only a tool can mint: connect and sign-in pages, app-platform domains, placeholders. */
+const MINTED_LINK_HOSTS = /(^|\.)(composio\.dev|example\.com)$|\.invalid$/i;
+const MINTED_LINK_PATHS = /\/(connect|oauth|link|auth|authorize|login)(\/|$|\?)/i;
+const MARITIME_APP_PATHS = /^\/(apps?|connect|dashboard)(\/|$)/i;
+const URL_IN_TEXT = /https?:\/\/[^\s<>()\]"']+/g;
+
+/** A URL reduced to what matters for "have we seen this link": host without www, path without trailing slash, query. */
+function linkKey(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.hostname.toLowerCase().replace(/^www\./, "")}${u.pathname.replace(/\/+$/, "")}${u.search}`;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Keep only links the owner can trust. A model asked for a connect link or a source it does
+ * not have will type one. A connect or sign-in link must come from a tool result (`sources`);
+ * any other link must appear in a tool result or in `context` (the agent's instructions and
+ * the owner's own messages). A missing connect link becomes a plain admission; any other
+ * unverified link is dropped, with a "Source:" label it leaves dangling.
+ */
+export function scrubUnverifiedLinks(text: string, sources: string, context = ""): string {
+  // A bare "linkedin.com/in/..." is checked like any link; models build these from a name.
+  const bareLinkedIn = /(^|[\s(:"])((?:www\.)?linkedin\.com\/in\/[\w%-]+\/?)/gi;
+  text = stripModelArtifacts(text).replace(bareLinkedIn, "$1https://$2");
+  sources = sources.replace(bareLinkedIn, "$1https://$2");
+  context = context.replace(bareLinkedIn, "$1https://$2");
+  const fromTools = new Set((sources.match(URL_IN_TEXT) ?? []).map((u) => linkKey(u.replace(/[.,;:!?]+$/, ""))));
+  const contextUrls = (context.match(URL_IN_TEXT) ?? []).map((u) => u.replace(/[.,;:!?]+$/, ""));
+  const known = new Set([...fromTools, ...contextUrls.map(linkKey)]);
+  const knownFolders = new Set(contextUrls.filter((u) => /\/$/.test(u) && linkKey(u).includes("/")).map((u) => `${linkKey(u)}/`));
+  const out = text.replace(URL_IN_TEXT, (url) => {
+    const clean = url.replace(/[.,;:!?]+$/, "");
+    const tail = url.slice(clean.length);
+    let host = "", pathname = "";
+    try {
+      const u = new URL(clean);
+      host = u.hostname;
+      pathname = u.pathname;
+    } catch {
+      return url;
+    }
+    const key = linkKey(clean);
+    const minted = MINTED_LINK_HOSTS.test(host) || MINTED_LINK_PATHS.test(pathname) || (/(^|\.)maritime\.sh$/i.test(host) && MARITIME_APP_PATHS.test(pathname));
+    if (minted) return fromTools.has(key) || sources.includes(clean) ? url : "\u0000" + tail;
+    if (known.has(key) || sources.includes(clean) || context.includes(clean)) return url;
+    // A page under a folder the instructions name (".../people/<first-last>" arrives as ".../people/").
+    return [...knownFolders].some((f) => key.startsWith(f)) ? url : "\u0000" + tail;
+  });
+  if (!out.includes("\u0000")) return out;
+  const lines: string[] = [];
+  for (const raw of out.split("\n")) {
+    if (!raw.includes("\u0000")) {
+      lines.push(raw);
+      continue;
+    }
+    // A sentence built around the dropped link ("block them once you connect here: <link>") is
+    // half a sentence without it, so it goes whole, unless it still carries another link (a list of sources).
+    const sentences = raw.split(/(?<=[.!?])\s+/);
+    const line = sentences.filter((s) => !s.includes("\u0000") || /https?:\/\//.test(s)).join(" ");
+    if (!line.includes("\u0000")) {
+      if (/[\p{L}\p{N}]/u.test(line)) lines.push(line.trimEnd());
+      else dropDanglingLabel(lines);
+      continue;
+    }
+    const tidy = line
+      .replace(/\b(sources?|links?|more|see|via|connect[^:]{0,40})\s*:\s*\u0000/gi, "\u0000")
+      .replace(/\s*(,|\band\b|\bor\b)\s*\u0000/gi, "\u0000")
+      .replace(/\u0000\s*(,|\band\b|\bor\b)\s*/gi, "\u0000")
+      .replace(/\s*\(\s*\u0000\s*\)/g, "")
+      .replace(/\s*\u0000/g, "")
+      .replace(/\s+([.,;:!?])/g, "$1")
+      .trimEnd();
+    // A line that held only the link, or a label whose link is gone, says nothing now.
+    if (/[\p{L}\p{N}]/u.test(tidy) && !/[:：]$/.test(tidy.trim())) lines.push(tidy);
+    else dropDanglingLabel(lines);
+  }
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
+ * The link a line led into is gone, so the line above that announced it ("Source:", "Connect
+ * Calendar so I can block them:") points at nothing: drop a bare label, or the trailing clause
+ * that ends in the colon.
+ */
+function dropDanglingLabel(lines: string[]): void {
+  while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
+  const last = lines[lines.length - 1];
+  if (last === undefined || !/[:：]\s*$/.test(last)) return;
+  const sentences = last.trimEnd().split(/(?<=[.!?。])\s+/);
+  sentences.pop();
+  if (sentences.length === 0) lines.pop();
+  else lines[lines.length - 1] = sentences.join(" ");
+}
+
 export class Conversation {
   /** Runtime key: which Agent and transcript. */
   readonly key: string;
@@ -175,6 +347,28 @@ export class Conversation {
   repliedViaTool = false;
   /** True while the current run was started by the owner's own direct message (see ToolContext.ownerTurn). */
   ownerTurn = false;
+  /** A tool that reaches someone else (ask_instinct, send_message, reply_instinct) succeeded in the current run. */
+  sentThisRun = false;
+  /** notify_owner or ask_owner succeeded in the current run. */
+  relayedThisRun = false;
+  /** Text of the last tool results, the only place a link the owner can act on can come from. */
+  recentToolText(limit = 80): string {
+    const parts: string[] = [];
+    for (const m of this.agent.state.messages.slice(-limit)) {
+      if (m.role !== "toolResult") continue;
+      for (const c of m.content) if (c.type === "text") parts.push(c.text);
+    }
+    for (const link of this.links) parts.push(link);
+    return parts.join("\n");
+  }
+  /** Text whose links the owner can trust besides tool results: the agent's instructions and the owner's own messages. */
+  knownText(): string {
+    const parts = [this.agent.state.systemPrompt ?? ""];
+    for (const m of this.agent.state.messages) if (m.role === "user") parts.push(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    return parts.join("\n");
+  }
+  /** Every link a tool result produced in this thread. The fold drops old results; this does not. */
+  readonly links = new Set<string>();
   busy = false;
   private readonly sessionFile: string;
   private readonly refreshPrompt: () => string;
@@ -196,7 +390,39 @@ export class Conversation {
   async run(text: string, images?: ImageContent[]): Promise<string> {
     if (this.busy) throw new Error(`Conversation ${this.key} is busy; use steer() or followUp()`);
     this.busy = true;
+    this.busySince = this.now().getTime();
     this.repliedViaTool = false;
+    this.sentThisRun = false;
+    this.relayedThisRun = false;
+    this.fileFences = [];
+    const current = this.runOnce(text, images);
+    this.current = current.then(() => undefined, () => undefined);
+    return current;
+  }
+
+  /** When the current run started (ms), or undefined when idle. */
+  busySince: number | undefined;
+  /** The tool the current run last started, for a status line while it is busy. */
+  activity: string | undefined;
+  /** Dashboard file blocks a tool produced this run; the reply must carry them or the file never arrives. */
+  fileFences: string[] = [];
+  private current: Promise<void> = Promise.resolve();
+
+  /**
+   * A run that never ends (a tool that hangs, a stuck model call) would answer every later
+   * message with "on it" forever. Abort a run older than `maxMs` and wait briefly for it to
+   * unwind; returns true when it did.
+   */
+  async abortIfStuck(maxMs: number): Promise<boolean> {
+    if (!this.busy || this.busySince === undefined || this.now().getTime() - this.busySince < maxMs) return false;
+    this.agent.abort();
+    await Promise.race([this.current, new Promise((r) => setTimeout(r, 2000))]);
+    this.busy = false;
+    this.busySince = undefined;
+    return true;
+  }
+
+  private async runOnce(text: string, images?: ImageContent[]): Promise<string> {
     try {
       this.applySystemPrompt();
       // The transcript grows between restarts too, so the fold runs before every turn.
@@ -211,6 +437,8 @@ export class Conversation {
       return finalAssistantText(fresh);
     } finally {
       this.busy = false;
+      this.busySince = undefined;
+      this.activity = undefined;
     }
   }
 
@@ -265,6 +493,7 @@ export class AgentRuntime {
   private readonly a2aAdmissions = new Map<string, Promise<unknown>>();
   private readonly backgroundReplies = new Set<string>();
   private ownerLast?: { conversationKey: string; channel: Channel };
+  private ownerQueue?: OwnerQueue;
 
   constructor(deps: RuntimeDeps) {
     this.deps = deps;
@@ -272,6 +501,10 @@ export class AgentRuntime {
     this.sessionsDir = deps.sessionsDir ?? deps.state.path("sessions");
     deps.state.ensure();
     this.a2aStore = deps.a2aStore ?? new A2AStore(deps.state);
+    if (deps.housekeeping !== false) {
+      const t = setInterval(() => void this.housekeeping().catch(() => undefined), 5 * 60_000);
+      (t as { unref?: () => void }).unref?.();
+    }
     const savedRoute = deps.state.readJson<{ conversationKey?: unknown; channel?: unknown }>("owner-route.json", {});
     if (typeof savedRoute.conversationKey === "string" && ["imessage", "sms"].includes(String(savedRoute.channel))) {
       this.ownerLast = { conversationKey: savedRoute.conversationKey, channel: savedRoute.channel as Channel };
@@ -377,9 +610,17 @@ export class AgentRuntime {
 
   async handleInbound(incoming: InboundMessage, opts: { waitForCompletion?: boolean } = {}): Promise<HandleResult> {
     let msg = incoming;
+    const arrivedAt = this.now().getTime();
     const originalPrincipal = resolvePrincipal(msg, this.deps.config, this.deps.contacts);
     let base = { principal: originalPrincipal, conversationKey: msg.conversationKey, acked: true as const };
     if (this.seenBefore(msg.id)) return { ...base, blocked: "duplicate" };
+    if (msg.channel === "a2a" && !this.peerExempt(msg, originalPrincipal) && this.peerOverLimit(originalPrincipal.agentHandle ?? msg.from, arrivedAt)) {
+      // One agent on a cron can flood every agent it knows (45 pings per ten minutes was seen);
+      // beyond the hourly ceiling its messages are dropped unread, so the owner never hears them.
+      this.markSeen(msg.id);
+      this.deps.audit.append({ kind: "policy", conversationKey: msg.conversationKey, principal: originalPrincipal.id, detail: { blocked: "a2a-rate-limit", peer: originalPrincipal.agentHandle ?? msg.from } });
+      return { ...base, blocked: "rate-limited" };
+    }
     if (msg.channel === "a2a" && msg.meta?.eventType === "a2a.task.canceled") {
       this.cancelA2A(msg);
       this.markSeen(msg.id);
@@ -397,8 +638,9 @@ export class AgentRuntime {
       this.inboundRuns.set(msg.id, run);
       void run.finally(() => this.inboundRuns.delete(msg.id)).catch(() => undefined);
     }
+    const budgetMs = this.deps.replyBudgetMs ?? DEFAULT_REPLY_BUDGET_MS;
     if (opts.waitForCompletion) return run;
-    const outcome = await withinBudget(run.then((result) => ({ result }), (error: unknown) => ({ error })), this.deps.replyBudgetMs ?? DEFAULT_REPLY_BUDGET_MS);
+    const outcome = await withinBudget(run.then((result) => ({ result }), (error: unknown) => ({ error })), budgetMs);
     if (outcome.state !== "done") {
       this.backgroundReplies.add(msg.id);
       // A carrier thread gets its texted "on it" from runInbound (ackSlowReplies), on every path.
@@ -472,14 +714,23 @@ export class AgentRuntime {
     const queueKey = key ?? runtimeKey(msg, principal ?? resolvePrincipal(msg, this.deps.config, this.deps.contacts));
     // Waiting behind another message in the same conversation: that run already owns the "on it".
     const queued = this.inboundQueues.has(queueKey);
-    const before = this.inboundQueues.get(queueKey) ?? Promise.resolve();
+    let before = this.inboundQueues.get(queueKey) ?? Promise.resolve();
+    // A run that never ends would hold every later message for this conversation behind it.
+    const holding = this.conversations.get(queueKey);
+    const maxRunMs = this.deps.maxRunMs ?? DEFAULT_MAX_RUN_MS;
+    if (holding?.busy && (await holding.abortIfStuck(maxRunMs))) {
+      this.deps.audit.append({ kind: "error", conversationKey: holding.key, principal: holding.principal.id, detail: { message: `Aborted a run that had been going for over ${Math.round(maxRunMs / 60_000)} minutes; starting fresh with the new message` } });
+      // A tool that ignores the abort keeps that Agent "processing" forever; rebuild the conversation from its saved transcript.
+      this.conversations.delete(queueKey);
+      before = Promise.resolve();
+    }
     const work = before.catch(() => undefined).then(async () => {
       if (this.seenBefore(original.id)) return { acked: true as const, principal: principal ?? resolvePrincipal(msg, this.deps.config, this.deps.contacts), conversationKey: msg.conversationKey, blocked: "duplicate" };
       const active = this.deps.state.readJson<string[]>(PROCESSING_FILE, []);
       this.deps.state.writeJson(PROCESSING_FILE, [...active, original.id]);
       try {
         const result = await this.runInbound(msg, principal, key, { arrivedSeq, queued });
-        if (this.backgroundReplies.delete(original.id) && !DELIVERABLE.has(msg.channel) && result.reply) this.stash(queueKey, result.reply);
+        if (this.backgroundReplies.delete(original.id) && !DELIVERABLE.has(msg.channel) && result.reply) this.stash(queueKey, lateAnswer(msg.text, result.reply));
         this.markSeen(original.id);
         this.deps.state.writeJson(PROCESSING_FILE, this.deps.state.readJson<string[]>(PROCESSING_FILE, []).filter((id) => id !== original.id));
         return result;
@@ -517,13 +768,19 @@ export class AgentRuntime {
       kind: "inbound",
       conversationKey: msg.conversationKey,
       principal: principal.id,
-      detail: { id: msg.id, channel: msg.channel, from: msg.from, chars: msg.text.length, source: msg.source, ...(group ? { group: true, tier: principal.tier } : {}) },
+      // What someone other than the owner asked is kept in a short preview, so "what have other agents asked about me" has an answer.
+      detail: { id: msg.id, channel: msg.channel, from: msg.from, chars: msg.text.length, source: msg.source, ...(principal.kind !== "owner" ? { preview: msg.text.replace(/\s+/g, " ").trim().slice(0, 160) } : {}), ...(group ? { group: true, tier: principal.tier } : {}) },
     });
 
     if (principal.kind === "stranger") {
       const limit = this.strangerLimit(msg.conversationKey, policy.toJSON().strangerLimits);
       if (limit) {
         audit.append({ kind: "policy", conversationKey: msg.conversationKey, principal: principal.id, detail: { blocked: limit } });
+        // Another agent would otherwise wait forever on a request nobody will answer.
+        if (msg.channel === "a2a" && msg.replyRef?.taskId) {
+          const text = `${this.deps.config.owner.name}'s agent can't take new requests from agents it doesn't know right now. Try again later, or reach ${this.deps.config.owner.name} directly.`;
+          await this.safeSend({ channel: "a2a", conversationKey: msg.conversationKey, text, replyRef: msg.replyRef, a2a: { taskId: msg.replyRef.taskId, intent: "fail" } }, principal, msg.conversationKey);
+        }
         return { ...base, acked: true, blocked: limit };
       }
     }
@@ -531,7 +788,9 @@ export class AgentRuntime {
     let text = msg.text;
     let approvalNote: string | undefined;
     if (principal.kind === "owner" && !group && !msg.meta?.delegatedResult) {
-      if (DELIVERABLE.has(msg.channel) && msg.channel !== "a2a") {
+      // The dashboard chat counts too: an owner with no phone yet still has a place where a
+      // question can wait for them (see sendToOwnerNow).
+      if ((DELIVERABLE.has(msg.channel) && msg.channel !== "a2a") || msg.channel === "chat") {
         this.ownerLast = { conversationKey: msg.conversationKey, channel: msg.channel };
         this.deps.state.writeJson("owner-route.json", this.ownerLast);
       }
@@ -547,15 +806,51 @@ export class AgentRuntime {
     // Everything the sender controls (text, attachment names, data parts) sits inside the
     // untrusted boundary when the sender is not the owner.
     const body = withData(withAttachments(text, msg), msg, this.deps.describeData);
-    const prompt = principal.kind === "owner" && !msg.meta?.delegatedResult ? body : wrapUntrusted(body, untrustedLabel(msg, principal));
+    const wrapped = principal.kind === "owner" && !msg.meta?.delegatedResult ? body : wrapUntrusted(body, untrustedLabel(msg, principal));
+    // Two owners who ask for the same intro send two requests that cross; each side then asks its
+    // owner to approve what that owner already asked for, and the intro deadlocks. Say so.
+    // Only an open meeting ask from the owner counts as their yes: a late note or a question to that peer
+    // once committed owners to new proposals, moves and 3-ways (testing). Moves and group asks always go to the owner.
+    const incomingMove = /\b(move|moving|reschedul|push (?:it|back)|instead of|3-way|three-way|group)\b/i.test(msg.text ?? "");
+    // A move counts only when the owner asked that same peer for a move too: both owners asking at once
+    // stalled every move in testing (each agent asked its owner to approve what the owner had asked for).
+    const MOVE_ASK = /\b(move|moving|reschedul|push (?:it|back)|instead|change (?:it|the time))\b/i;
+    const ownerMeetingAsks = principal.kind === "agent" && msg.channel === "a2a" && principal.agentHandle
+      ? this.a2aStore.ownerAsksTo(principal.agentHandle).filter((d) => MEETING_ASK.test(d.summary ?? "") && !OWNER_NOTE.test(d.summary ?? ""))
+      : [];
+    const groupAsk = /\b(3-way|three-way|group)\b/i.test(msg.text ?? "");
+    const mutual = groupAsk ? undefined : incomingMove ? ownerMeetingAsks.find((d) => MOVE_ASK.test(d.summary ?? "")) : ownerMeetingAsks[0];
+    const replyTo = principal.kind === "agent" && msg.channel === "a2a" && msg.replyRef?.taskId ? this.a2aStore.delegation(msg.replyRef.taskId) : undefined;
+    const closeNote = replyTo && replyTo.principal.kind === "owner" && !mutual
+      ? `This is ${principal.displayName}'s agent answering the ask you sent for ${this.deps.config.owner.name}${replyTo.summary ? ` ("${replyTo.summary}")` : ""}. Close it now: if it accepts a time and place, call meeting_record and text ${this.deps.config.owner.name} one line (who, when, where). If it offers a different time that is free, accept it with reply_instinct, record it, and tell ${this.deps.config.owner.name} in one line. Ask ${this.deps.config.owner.name} only if it clashes with a recorded meeting. Never ask them to approve what they already asked for.`
+      : undefined;
+    const userText = mutual ? `${mutualAskNote(this.deps.config.owner.name, principal.displayName, mutual)}\n\n${wrapped}` : closeNote ? `${closeNote}\n\n${wrapped}` : wrapped;
     const conv = this.conversation(routedKey ?? runtimeKey(msg, principal), principal, { deliveryKey: msg.conversationKey, replyRef: msg.replyRef });
     if (conv.channel === "a2a" && !this.a2aStore.active(conv.replyRef.taskId ?? "", conv.replyRef.messageId)) return { ...base, acked: true, blocked: "inactive-task" };
-    const stashed = this.takeStash(conv.key);
-    const joinReply = (reply: string | undefined) => [approvalNote, ...stashed, reply].filter((t): t is string => Boolean(t)).join("\n\n") || undefined;
+    // Owner texts for a chat-only owner are stashed under the route's conversation key, which
+    // is the delivery key, not the runtime key, so both are drained here.
+    const stashed = [...this.takeStash(conv.key), ...(conv.deliveryKey !== conv.key ? this.takeStash(conv.deliveryKey) : []), ...(principal.kind === "owner" ? this.takeQuietHold().map((h) => h.text) : [])];
+    const joinReply = (reply: string | undefined) => {
+      const joined = joinOwnerParts([approvalNote, ...stashed], reply);
+      return (principal.kind === "owner" ? tidyOwnerReply(joined) : joined) || undefined;
+    };
+    // Texts that waited for this turn are shown to the owner above the reply, so the model must
+    // know them too, or it answers "nothing new" right under the news it is relaying.
+    const seen = [approvalNote, ...stashed].filter((t): t is string => Boolean(t));
+    const gap = principal.kind === "owner" ? this.gapNote(conv.key) : undefined;
+    const notes = [seen.length > 0 && principal.kind === "owner" ? shownToOwnerNote(seen) : undefined, gap].filter((t): t is string => Boolean(t));
+    const prompt = notes.length > 0 ? `${notes.join("\n\n")}\n\n${userText}` : userText;
 
     if (conv.busy) {
       conv.steer(prompt);
-      return { ...base, acked: true, reply: joinReply(undefined) };
+      // The owner asking "status?" during a long job used to get "taking a moment" for minutes.
+      // Say what is happening now; the answer to this message comes with the job's result.
+      const status = principal.kind === "owner" ? busyStatus(conv, this.now()) : undefined;
+      if (status && msg.channel !== "chat" && DELIVERABLE.has(msg.channel)) {
+        void this.safeSend({ channel: msg.channel as OutboundChannel, conversationKey: msg.conversationKey, text: status }, principal, msg.conversationKey).catch(() => undefined);
+        return { ...base, acked: true, reply: joinReply(undefined) };
+      }
+      return { ...base, acked: true, reply: joinReply(status) };
     }
 
     // Typing is a courtesy, never a cost: it runs alongside the model and is dropped when slow.
@@ -573,15 +868,58 @@ export class AgentRuntime {
       (reply) => ({ ok: true as const, reply }),
       (error: unknown) => ({ ok: false as const, error }),
     );
-    const outcome = await run;
+    let outcome = await run;
+    // "Sent" with nothing sent: testing had an agent report a note it never sent, then wait on a reply
+    // for five turns. Ask the model once to send it or say plainly it did not.
+    if (outcome.ok && principal.kind === "owner" && !conv.sentThisRun && claimsSend(outcome.reply)) {
+      this.deps.audit.append({ kind: "policy", conversationKey: conv.key, principal: principal.id, detail: { outcome: "corrected", reason: "reply claimed a send with no send tool call" } });
+      outcome = await conv.run("[Check: your reply says something was sent, but no message went out in this turn (no ask_instinct, send_message or reply_instinct succeeded). Either send it now and confirm, or tell the owner plainly that it was not sent and why. Reply to the owner only.]").then(
+        (r) => ({ ok: true as const, reply: r }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+    }
+    // A note for the owner ("running 10 minutes late", "what are you working on?") was answered and closed
+    // without the owner ever hearing it in rounds 1 and 2 (5 of 16 reached them). Pass it on when the run didn't.
+    const peerAgent = principal.kind === "agent" || (principal.kind === "stranger" && Boolean(principal.agentHandle));
+    // A reply to an ask the owner started (a yes, a counter-offer, a decline) is the owner's news too.
+    const answersOwner = Boolean(msg.replyRef?.taskId && this.a2aStore.delegation(msg.replyRef.taskId)?.principal.kind === "owner");
+    if (outcome.ok && peerAgent && msg.channel === "a2a" && !conv.relayedThisRun && (answersOwner || OWNER_NOTE.test(msg.text ?? ""))) {
+      const raw = (principal.onBehalfOf?.displayName ?? principal.displayName).replace(/\s*\(@[^)]*\)/g, "").replace(/[\u2019']s (?:agent|instinct)$/i, "").trim();
+      const who = /^@?[a-z0-9]+(?:-[a-z0-9]+)+$/.test(raw)
+        ? raw.replace(/^@/, "").split("-").filter((x, i, a) => !(i === a.length - 1 && a.length > 1 && /^[a-z0-9]{4,6}$/.test(x) && /\d/.test(x))).map((x) => x.charAt(0).toUpperCase() + x.slice(1)).join(" ")
+        : raw;
+      const said = (msg.text ?? "").replace(/\s+/g, " ").trim();
+      await this.sendToOwner(`From ${who}: ${said.length > 280 ? `${said.slice(0, 277)}…` : said}`, this.ownerPrincipal(), conv.key).catch(() => undefined);
+    }
     // The "on it" lands before the answer or not at all.
     await ack.stop();
-    const reply = this.replyText(outcome, principal);
+    let reply = this.replyText(outcome, principal);
     if (!outcome.ok) this.auditError(conv.key, principal, outcome.error);
+    if (outcome.ok && principal.kind === "owner") reply = scrubUnverifiedLinks(reply, conv.recentToolText(), conv.knownText());
+    // Models often send only the caption ("Your notes") and drop the block that attaches the file.
+    if (outcome.ok && principal.kind === "owner") reply = tidyOwnerReply(withFileFences(reply, conv.fileFences));
     if (DELIVERABLE.has(msg.channel) && reply) {
       await this.deliver(conv, reply, { keepPrompt: approvals.promptedToken() !== promptedBefore, arrivedSeq: arrival.arrivedSeq, failure: !outcome.ok });
     }
+    // The dashboard chat answers in the HTTP response, not through deliver(), so it clears the
+    // approval context here: a bare "yes" to this reply must not settle an approval asked earlier.
+    else if (msg.channel === "chat" && principal.kind === "owner" && reply && approvals.promptedToken() === promptedBefore) approvals.clearPrompted();
     return { ...base, acked: true, reply: joinReply(reply) };
+  }
+
+  /**
+   * After hours of silence (the owner was busy, or the agent was down and messages were lost),
+   * the model read the thread as continuous and revived a call request from that morning. Mark
+   * a long gap so the new message is answered on its own.
+   */
+  private gapNote(key: string): string | undefined {
+    const all = this.deps.state.readJson<Record<string, string>>(LAST_OWNER_TURN_FILE, {});
+    const prev = Date.parse(all[key] ?? "");
+    all[key] = this.now().toISOString();
+    this.deps.state.writeJson(LAST_OWNER_TURN_FILE, all);
+    const gap = this.now().getTime() - prev;
+    if (!Number.isFinite(gap) || gap < GAP_NOTE_MS) return undefined;
+    return gapNoteText(gap);
   }
 
   /** Scheduled jobs run as the owner in their own conversation; results go to the owner's phone. */
@@ -591,8 +929,9 @@ export class AgentRuntime {
     const conv = this.conversation(key, principal);
     this.deps.audit.append({ kind: "schedule", conversationKey: key, principal: principal.id, detail: { id: entry.id, name: entry.name, fired: true } });
     let text = "";
+    const framed = `Scheduled job "${entry.name ?? entry.id}" is firing now. The text below is the job's own instruction, written earlier, not a new request from the owner: carry it out now. If it is a reminder, send the owner the reminder itself in one line; never create another schedule for it.\n\n${entry.prompt}`;
     try {
-      text = await conv.run(entry.prompt);
+      text = await conv.run(framed);
     } catch (error) {
       this.auditError(key, principal, error);
       return;
@@ -732,6 +1071,7 @@ export class AgentRuntime {
         return { block: true, reason: "This A2A task is no longer active. Stop without taking any action." };
       }
     }
+    conv.activity = toolName;
     const { registry, policy, audit, approvals, config } = this.deps;
     const meta = registry.meta(toolName);
     if (!meta) return undefined;
@@ -802,9 +1142,14 @@ export class AgentRuntime {
     const detail: Record<string, unknown> = { tool: toolName, isError, summary: safeDescribe(meta, args) };
     const preview = contentPreview(content);
     if (preview) detail.result = preview;
+    for (const link of extractLinks(content)) conv.links.add(link);
     audit.append({ kind: "tool_call", conversationKey: conv.key, principal: conv.principal.id, detail });
     if (toolName === REPLY_TOOL && !isError) conv.repliedViaTool = true;
-    if (isError || meta?.recordsOwnSpend) return;
+    if (isError) return;
+    if (SEND_TOOLS.has(toolName)) conv.sentThisRun = true;
+    if (toolName === "notify_owner" || toolName === "ask_owner") conv.relayedThisRun = true;
+    for (const fence of fileFencesIn(content)) if (!conv.fileFences.includes(fence)) conv.fileFences.push(fence);
+    if (meta?.recordsOwnSpend) return;
     const amountUsd = meta?.amountUsd?.(args);
     const spends = meta?.capabilities.some((c) => SPEND_CAPABILITIES.has(c)) ?? false;
     if ((amountUsd !== undefined && amountUsd > 0) || spends) {
@@ -831,11 +1176,18 @@ export class AgentRuntime {
     const verb = match.approved ? "approved" : "denied";
     audit.append({ kind: "approval", conversationKey: resolved.conversationKey, principal: principal.id, detail: { token: resolved.token, status: resolved.status, summary: resolved.summary } });
 
-    const note = `${match.approved ? "Approved" : "Denied"}: ${resolved.summary}`;
+    const what = humanApprovalSummary(resolved.summary);
+    const note = match.approved ? `Got it, that's a yes${what ? `: ${what}` : ""}.` : `Got it, that's a no${what ? `: ${what}` : ""}.`;
+    // The thread that asked is woken next and reports in its own words ("Sent to Sam's agent..."),
+    // so a system-sounding line first would be noise. Only when that thread is gone does the owner
+    // get one short human line here.
+    const origin = resolved.conversationKey;
+    const willReport = origin === msg.conversationKey || this.conversations.has(origin) || this.recallRecord(origin) !== undefined;
     await this.afterApproval(resolved, match.approved);
 
-    if (DELIVERABLE.has(msg.channel)) {
-      await this.safeSend({ channel: msg.channel as OutboundChannel, conversationKey: msg.conversationKey, text: note, replyRef: msg.replyRef }, principal, msg.conversationKey);
+    if (DELIVERABLE.has(msg.channel) && !willReport) {
+      const text = match.approved ? `Done. ${resolved.summary}.` : `Okay, I won't. ${resolved.summary}.`;
+      await this.safeSend({ channel: msg.channel as OutboundChannel, conversationKey: msg.conversationKey, text, replyRef: msg.replyRef }, principal, msg.conversationKey);
     }
     return note;
   }
@@ -848,7 +1200,21 @@ export class AgentRuntime {
    */
   async afterApproval(approval: Approval, approved: boolean): Promise<void> {
     if (approved && approval.capability !== "owner.relay") this.rememberApproved(approval);
-    await this.resumeConversation(approval.conversationKey, `Owner ${approved ? "approved" : "denied"}: ${approval.summary}`);
+    // An agent that wrote first is a stranger with no contact, so after the owner's yes the reply had
+    // nowhere to go ("Grace isn't in your contacts", "send me Grace's handle"). The owner's yes makes it
+    // a contact the agent can reach by name.
+    const stranger = /^stranger:a2a:@?(.+)$/.exec(approval.requestedBy ?? "");
+    if (approved && stranger) {
+      try {
+        this.deps.contacts.upsert({ name: nameFromAgentHandle(stranger[1]!), agentHandle: `@${stranger[1]!.replace(/^@/, "")}`, tier: "contact" });
+      } catch {
+        // A reserved or malformed handle stays a stranger.
+      }
+    }
+    // testing: an approved yes stalled with "I'm not in the A2A reply context" when the other agent's task had ended.
+    const fromAgent = /^(?:agent|stranger:a2a):/.test(approval.requestedBy ?? "");
+    const how = fromAgent ? " Tell the other agent now with reply_instinct, then tell the owner in one line. If the reply cannot be sent, tell the owner plainly that it did not go out; never say they are in or set before the other side has the answer." : "";
+    await this.resumeConversation(approval.conversationKey, `Owner ${approved ? "approved" : "denied"}: ${approval.summary}.${how}`);
   }
 
   /** Wake the conversation that was waiting on the owner. Busy: queue. Idle: run and deliver. */
@@ -882,6 +1248,9 @@ export class AgentRuntime {
   private async deliver(conv: Conversation, text: string, opts: { keepPrompt?: boolean; arrivedSeq?: number; failure?: boolean } = {}): Promise<void> {
     const channel = conv.channel;
     if (channel === "scheduled" || channel === "system") return;
+    // A run that said everything through tools (send_file with a caption, notify_owner) may end with nothing to add.
+    if (!text.trim() && channel !== "a2a") return;
+    if (conv.principal.kind === "owner" && channel !== "a2a") text = scrubUnverifiedLinks(text, conv.recentToolText(), conv.knownText());
     if (!DELIVERABLE.has(channel)) {
       this.stash(conv.key, text);
       return;
@@ -890,6 +1259,10 @@ export class AgentRuntime {
     if (channel === "a2a") {
       if (conv.repliedViaTool) return;
       if (!this.a2aStore.active(conv.replyRef.taskId ?? "", conv.replyRef.messageId)) return;
+      if (!mayShareOwnerContact(conv.principal.tier) && ownerContactIn(text, this.deps.config.owner).length > 0) {
+        this.deps.audit.append({ kind: "policy", conversationKey: conv.key, principal: conv.principal.id, detail: { outcome: "deny", tool: "a2a_reply", reason: "owner contact details to a non-partner agent" } });
+        out.text = `${this.deps.config.owner.name} doesn't share contact details through agents. I can pass a message along.`;
+      }
       try { await this.assertA2AActive(conv); } catch (error) { if (error instanceof A2AInactiveError) return; throw error; }
       const taskId = conv.replyRef.taskId;
       if (!taskId) {
@@ -951,14 +1324,18 @@ export class AgentRuntime {
   }
 
   /**
-   * For the server's own owner-facing texts (a finished phone call, for example): the same
-   * route as the runtime's messages. False when there is no way to reach the owner.
+   * For tools that talk to the owner (ask_owner, notify_owner): the same route, merge window
+   * and chat fallback as the runtime's own messages. False when there is no way to reach them.
    */
-  async relayToOwner(text: string, originKey: string, opts: { approvalToken?: string } = {}): Promise<boolean> {
+  async relayToOwner(text: string, originKey: string, opts: { approvalToken?: string; principal?: Principal } = {}): Promise<boolean> {
     const last = this.ownerLast;
-    const reachable = Boolean(this.deps.config.owner.phones[0]) || Boolean(last && DELIVERABLE.has(last.channel) && last.channel !== "a2a");
+    const reachable = Boolean(this.deps.config.owner.phones[0]) || Boolean(last && (last.channel === "chat" || (DELIVERABLE.has(last.channel) && last.channel !== "a2a")));
     if (!reachable) return false;
-    await this.sendToOwner(text, this.ownerPrincipal(), originKey, opts);
+    const origin = this.conversations.get(originKey);
+    const clean = origin ? scrubUnverifiedLinks(text, origin.recentToolText(), origin.knownText()) : text;
+    // Sent on behalf of whoever caused it (a stranger's agent asking, say), so the outbox and the audit log see the real sender.
+    const { principal, ...rest } = opts;
+    await this.sendToOwner(clean, principal ?? this.ownerPrincipal(), originKey, rest);
     return true;
   }
 
@@ -967,6 +1344,42 @@ export class AgentRuntime {
    * iMessage, else to their last email thread. Group threads are never used for this.
    */
   private async sendToOwner(text: string, principal: Principal, originKey: string, opts: { approvalToken?: string } = {}): Promise<void> {
+    const mergeMs = this.deps.ownerMergeMs ?? 0;
+    if (mergeMs <= 0) return this.sendToOwnerNow(text, principal, originKey, opts);
+    // Several agents answering within seconds, or one run narrating its progress, must not become a
+    // run of bubbles: collect what arrives inside the window and send it as one text.
+    if (this.ownerQueue) {
+      const q = this.ownerQueue;
+      q.texts.push(text);
+      q.principal = principal;
+      q.originKey = originKey;
+      if (opts.approvalToken) q.approvalToken = opts.approvalToken;
+      return q.done;
+    }
+    const q: OwnerQueue = { texts: [text], principal, originKey, done: Promise.resolve(), ...(opts.approvalToken ? { approvalToken: opts.approvalToken } : {}) };
+    q.done = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.ownerQueue = undefined;
+        const merged = mergeOwnerTexts(q.texts);
+        this.sendToOwnerNow(merged, q.principal, q.originKey, q.approvalToken ? { approvalToken: q.approvalToken } : {})
+          .catch(() => undefined)
+          .finally(resolve);
+      }, mergeMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    this.ownerQueue = q;
+    return q.done;
+  }
+
+  private async sendToOwnerNow(text: string, principal: Principal, originKey: string, opts: { approvalToken?: string; fromHold?: boolean } = {}): Promise<void> {
+    // At night a text from another agent waits for the morning unless the owner is up and texting.
+    if (!opts.fromHold && this.inQuietHours() && !this.ownerAwake()) {
+      const held = this.deps.state.readJson<Array<{ text: string; at: string; approvalToken?: string }>>(QUIET_HOLD_FILE, []);
+      held.push({ text, at: this.now().toISOString(), ...(opts.approvalToken ? { approvalToken: opts.approvalToken } : {}) });
+      this.deps.state.writeJson(QUIET_HOLD_FILE, held);
+      this.deps.audit.append({ kind: "outbound", conversationKey: originKey, principal: principal.id, detail: { held: "quiet-hours", chars: text.length } });
+      return;
+    }
     const last = this.ownerLast;
     const phone = this.deps.config.owner.phones[0];
     let out: OutboundMessage;
@@ -976,6 +1389,16 @@ export class AgentRuntime {
       out = { channel: "imessage", to: phone, text };
     } else if (last && DELIVERABLE.has(last.channel) && last.channel !== "a2a") {
       out = { channel: last.channel as OutboundChannel, conversationKey: last.conversationKey, text };
+    } else if (last && last.channel === "chat") {
+      // An owner who only has the dashboard chat (no phone yet) still gets the question: it waits
+      // in the chat buffer and comes back as `pending` on their next message.
+      this.stash(last.conversationKey, text);
+      this.deps.audit.append({ kind: "outbound", conversationKey: originKey, principal: principal.id, detail: { channel: "chat", conversationKey: last.conversationKey, chars: text.length, stashed: true } });
+      // Queued is not seen: the owner's next message was typed before this text reached them,
+      // so a bare "yes" in it answers something else. Once shown, the model sees it in its
+      // prompt and settles the owner's answer with approval_settle.
+      if (!opts.approvalToken) this.deps.approvals.clearPrompted();
+      return;
     } else {
       this.deps.audit.append({ kind: "error", conversationKey: originKey, principal: principal.id, detail: { message: "No way to reach the owner: no phone and no prior conversation" } });
       return;
@@ -1003,7 +1426,13 @@ export class AgentRuntime {
     if (value.ok) return value.reply;
     // The full detail is in the audit log (auditError); the owner gets a short human reason, never a JSON body.
     if (principal.kind === "owner") {
-      const reason = shortReason(errorMessage(value.error));
+      const raw = errorMessage(value.error);
+      // A spent model budget (account credits, or this agent's monthly spend limit on Maritime) stops every
+      // turn until someone raises it or the month resets; "try again in a minute" would be untrue.
+      if (BUDGET_EXHAUSTED_PATTERN.test(raw)) {
+        return budgetExhaustedReply(this.deps.config.features.budgetContact);
+      }
+      const reason = shortReason(raw);
       return `Hit a snag on my end${reason ? ` (${reason})` : ""}. Give me a minute and try that again.`;
     }
     return "Sorry, I hit a problem. Please try again later.";
@@ -1026,7 +1455,10 @@ export class AgentRuntime {
       for (const c of meta.capabilities) if (policy.canEver(principal, c)) capabilities.add(c);
     }
     const pending = approvals.pending().filter((a) => (principal.kind === "owner" && principal.tier === "owner") || a.conversationKey === conv.key);
-    const extra = this.deps.promptExtra?.(principal, conv.channel) ?? [];
+    const extra = [...(this.deps.promptExtra?.(principal, conv.channel) ?? [])];
+    const upcoming = this.deps.meetings?.upcoming() ?? [];
+    const meetingText = principal.kind === "owner" ? meetingsSection(upcoming, config.owner.timezone) : principal.kind === "agent" ? busySection(upcoming, config.owner.timezone) : undefined;
+    if (meetingText) extra.push(meetingText);
     return buildSystemPrompt({
       config,
       principal,
@@ -1079,7 +1511,12 @@ export class AgentRuntime {
       now: this.now,
     };
     const visible = (t: RegisteredTool) => t.spec.meta.capabilities.every((c) => policy.canEver(conv.principal, c));
-    return registry.bind(ctx, visible);
+    const bound = registry.bind(ctx, visible);
+    if (bound.length <= MAX_MODEL_TOOLS) return bound;
+    // Proxies refuse a request with more tools than this and the whole agent goes dark; the
+    // registry lists core, messaging and network tools before app tools, so the tail is cut.
+    this.deps.audit.append({ kind: "error", conversationKey: conv.key, principal: conv.principal.id, detail: { message: `${bound.length} tools bound; keeping the first ${MAX_MODEL_TOOLS}` } });
+    return bound.slice(0, MAX_MODEL_TOOLS);
   }
 
   /**
@@ -1185,6 +1622,109 @@ export class AgentRuntime {
     this.deps.state.writeJson(PENDING_REPLIES_FILE, all);
     return texts;
   }
+
+  /** Local hour in the owner's time zone. */
+  private ownerLocalHour(): number {
+    const parts = new Intl.DateTimeFormat("en-US", { hour: "numeric", hour12: false, timeZone: this.deps.config.owner.timezone }).formatToParts(this.now());
+    return Number(parts.find((p) => p.type === "hour")?.value ?? "12") % 24;
+  }
+
+  private inQuietHours(): boolean {
+    const configured = this.deps.config.features.quietHours;
+    if (configured === false) return false;
+    const h = this.ownerLocalHour();
+    const { start, end } = configured ?? QUIET_HOURS;
+    return start > end ? h >= start || h < end : h >= start && h < end;
+  }
+
+  /** True when the owner texted any thread within OWNER_AWAKE_MS. */
+  private ownerAwake(): boolean {
+    const all = this.deps.state.readJson<Record<string, string>>(LAST_OWNER_TURN_FILE, {});
+    const latest = Math.max(0, ...Object.values(all).map((t) => Date.parse(t) || 0));
+    return this.now().getTime() - latest < OWNER_AWAKE_MS;
+  }
+
+  /** Texts held overnight, taken out of the hold. */
+  takeQuietHold(): Array<{ text: string; approvalToken?: string }> {
+    const held = this.deps.state.readJson<Array<{ text: string; at: string; approvalToken?: string }>>(QUIET_HOLD_FILE, []);
+    if (held.length === 0) return [];
+    this.deps.state.writeJson(QUIET_HOLD_FILE, []);
+    return held;
+  }
+
+  /**
+   * Every few minutes: once the owner's morning starts, deliver what waited overnight as one
+   * text; and nudge any peer agent that has sat on the owner's ask for hours.
+   */
+  async housekeeping(): Promise<void> {
+    if (!this.inQuietHours() || this.ownerAwake()) {
+      const held = this.takeQuietHold();
+      if (held.length > 0) {
+        const text = held.length === 1 ? held[0]!.text : `While you were asleep:\n\n${held.map((h) => h.text).join("\n\n")}`;
+        const token = held.map((h) => h.approvalToken).filter((t): t is string => Boolean(t)).at(-1);
+        await this.sendToOwnerNow(text, this.ownerPrincipal(), "system:quiet-hours", { fromHold: true, ...(token ? { approvalToken: token } : {}) });
+      }
+    }
+    await this.nudgeStaleAsks();
+  }
+
+  /** Owner-initiated asks that no peer answered within STALE_ASK_MS, each nudged once. */
+  staleAsks(): A2ADelegation[] {
+    const all = this.deps.state.readJson<Record<string, A2ADelegation>>("a2a-delegations.json", {});
+    const nudged = this.deps.state.readJson<Record<string, string>>(NUDGED_FILE, {});
+    const now = this.now().getTime();
+    return Object.values(all).filter((d) => {
+      if (d.principal.kind !== "owner" || !d.at || nudged[d.messageId]) return false;
+      if (now - Date.parse(d.at) < STALE_ASK_MS) return false;
+      const task = d.taskId ? this.a2aStore.task(d.taskId) : undefined;
+      return !task || !a2aTerminal(task.state);
+    });
+  }
+
+  private async nudgeStaleAsks(): Promise<void> {
+    if (this.inQuietHours() && !this.ownerAwake()) return;
+    const nudged = this.deps.state.readJson<Record<string, string>>(NUDGED_FILE, {});
+    for (const d of this.staleAsks().slice(0, 3)) {
+      nudged[d.messageId] = this.now().toISOString();
+      this.deps.state.writeJson(NUDGED_FILE, nudged);
+      const hours = Math.max(1, Math.round((this.now().getTime() - Date.parse(d.at!)) / 3_600_000));
+      const about = d.summary ? ` about "${d.summary}"` : "";
+      const task = d.taskId ? ` (taskId ${d.taskId})` : "";
+      await this.runSystemTask({
+        id: `nudge-${d.messageId}`,
+        name: "nudge a silent agent",
+        quiet: true,
+        prompt: `Your ask to ${d.peer}${about}, sent ${hours} hours ago, has had no answer. Send that agent one short nudge with ask_instinct${task}: say you are still hoping to hear back and repeat the one concrete time and place you proposed. Then tell the owner in one line that there is no word yet from that person's agent and you nudged it. Do not ask the owner anything.`,
+      }).catch(() => undefined);
+    }
+  }
+
+  private readonly peerArrivals = new Map<string, number[]>();
+  /** True once a peer has sent more than A2A_PEER_HOURLY_LIMIT messages in the last hour. */
+  private peerOverLimit(peer: string, now: number): boolean {
+    const recent = (this.peerArrivals.get(peer) ?? []).filter((t) => now - t < 3_600_000);
+    // A dropped message does not count: otherwise a busy pair stays locked out for the whole hour.
+    if (recent.length >= A2A_PEER_HOURLY_LIMIT) {
+      this.peerArrivals.set(peer, recent);
+      return true;
+    }
+    recent.push(now);
+    this.peerArrivals.set(peer, recent);
+    return false;
+  }
+
+  /**
+   * The ceiling is for agents that flood; it dropped real negotiations in testing (3-way invites
+   * and 13 of 18 cancel notices between partners). Replies to the owner's own asks, and any peer
+   * the owner asked something, are never limited.
+   */
+  private peerExempt(msg: InboundMessage, principal: Principal): boolean {
+    const taskId = msg.replyRef?.taskId;
+    if (taskId && this.a2aStore.delegation(taskId)) return true;
+    const handle = principal.agentHandle ?? msg.from;
+    return Boolean(handle && this.a2aStore.ownerAsksTo(handle).length > 0);
+  }
+
 
   /** Replies waiting for the next turn on a key, without taking them. */
   pendingReplies(key: string): string[] {
@@ -1376,6 +1916,24 @@ function summarizeMessages(older: AgentMessage[]): string {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** "Approve intro with Sam" reads as "intro with Sam" after "that's a yes". */
+export function humanApprovalSummary(summary: string): string {
+  return summary.trim().replace(/^approved?\s+/i, "").replace(/\.$/, "");
+}
+
+const LINK_RE = /https?:\/\/[^\s)<>"'\]]+/g;
+
+/** Links in a tool result's text blocks. */
+export function extractLinks(content: unknown): string[] {
+  const out: string[] = [];
+  const blocks = Array.isArray(content) ? content : [content];
+  for (const b of blocks) {
+    const text = typeof b === "string" ? b : b && typeof b === "object" && (b as { type?: string }).type === "text" ? String((b as { text?: unknown }).text ?? "") : "";
+    for (const m of text.match(LINK_RE) ?? []) out.push(m.replace(/[.,;:!?]+$/, ""));
+  }
+  return out;
+}
+
 function userMessage(text: string, now: Date): AgentMessage {
   return { role: "user", content: [{ type: "text", text }], timestamp: now.getTime() };
 }
@@ -1453,6 +2011,8 @@ export function stableJson(value: unknown): string {
 
 /** The part of an error a person can use: no JSON bodies, no status-code prefixes, one short line. */
 export function shortReason(message: string): string {
+  // A proxy or gateway error page is noise to the owner ("Hit a snag (<!DOCTYPE html>)").
+  if (/<!doctype|<html|<head|<body/i.test(message)) return "";
   let m = message.split(/[{\n]/)[0] ?? "";
   m = m.replace(/^\s*\d{3}:?\s*/, "").replace(/[:\s]+$/, "").trim();
   if (m.length > 80) m = `${m.slice(0, 77).trim()}...`;
@@ -1464,13 +2024,39 @@ export function hashArgs(args: unknown): string {
 }
 
 function approvalText(approval: Approval, requester: Principal, config: InstinctConfig): string {
-  const who = requester.kind === "owner" ? "" : ` (asked by ${requester.displayName})`;
   const amount = approval.amountUsd !== undefined ? ` ($${approval.amountUsd.toFixed(2)})` : "";
+  const who = requester.kind === "owner" ? "" : ` (asked by ${requester.displayName})`;
   // A plain question, no token and no protocol words: a bare yes or no settles it, anything else the model settles.
   // Policy prompts may already end with the question; strip it so it is asked exactly once.
   void config;
   const base = approval.summary.replace(/[\s.?!]*want me to go ahead\?\s*$/i, "").replace(/[\s.?!]+$/, "");
   return `${base}${amount}${who}. Want me to go ahead?`;
+}
+
+/** Lower-cased words only, so "Here you go." and "here you go" count as the same text. */
+function normalizedText(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean).join(" ");
+}
+
+/**
+ * One text out of several queued for the owner: exact and near repeats go, and an earlier text whose
+ * words a later one mostly contains ("Sam's in." before "Sam's in. Pick a time...") goes with them.
+ */
+export function mergeOwnerTexts(texts: string[]): string {
+  const words = (t: string) => new Set(normalizedText(t).split(" ").filter(Boolean));
+  const keep: string[] = [];
+  texts.forEach((t, i) => {
+    const mine = words(t);
+    if (mine.size === 0) return;
+    const superseded = texts.slice(i + 1).some((later) => {
+      const theirs = words(later);
+      let hit = 0;
+      for (const w of mine) if (theirs.has(w)) hit++;
+      return hit / mine.size >= 0.7;
+    });
+    if (!superseded) keep.push(t.trim());
+  });
+  return keep.join("\n\n");
 }
 
 function untrustedLabel(msg: InboundMessage, principal: Principal): string {
@@ -1512,6 +2098,116 @@ function withData(text: string, msg: InboundMessage, describe: RuntimeDeps["desc
   }
   parts.push(`Structured data part (OIP):\n${clip(json, DATA_PART_CAP)}`);
   return `${text}\n\n${parts.join("\n")}`.trim();
+}
+
+const FILE_FENCE = /```maritime-file\n[^\n]*\n```/g;
+
+function fileFencesIn(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  const out: string[] = [];
+  for (const c of content as Array<{ type?: string; text?: string }>) if (c?.type === "text" && typeof c.text === "string") out.push(...(c.text.match(FILE_FENCE) ?? []));
+  return out;
+}
+
+const SNAG = /^Hit a snag on my end\b[^\n]*Give me a minute and try that again\.?$/;
+
+/**
+ * Last pass over what the owner reads: an error notice next to a real answer, a repeated
+ * paragraph (status lines stashed twice), and "Nothing new" sitting on top of the news.
+ */
+export function tidyOwnerReply(text: string): string {
+  // The model sometimes drops a stray Armenian word into an English reply ("What's your email հասցե?").
+  if (/[\u0530-\u058F]/.test(text) && (text.match(/[A-Za-z]/g)?.length ?? 0) > (text.match(/[\u0530-\u058F]/g)?.length ?? 0)) {
+    text = text.replace(/[ \t]*[\u0530-\u058F]+[\u0530-\u058F'’-]*/g, "").replace(/ +([?.!,])/g, "$1");
+  }
+  let parts = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  if (parts.length > 1 && parts.some((p) => !SNAG.test(p))) parts = parts.filter((p) => !SNAG.test(p));
+  parts = parts.filter((p, i) => parts.indexOf(p) === i);
+  // A link lead-in whose link never came ("Here's my LinkedIn:") reads as broken.
+  const body = parts.join("\n\n").replace(/^[ \t]*(?:here'?s|here is|find|connect with)?[ \t]*(?:me|my)?[ \t]*(?:on[ \t]+)?linkedin[ \t]*[:：]?[ \t]*(?:\n|$)/gim, "").replace(/\n{3,}/g, "\n\n").trim();
+  const lead = /^(?:nothing (?:else )?new(?: yet| since[^\n]*)?|no news yet)[.!]?[ \t]*(?:\n+|$)/i.exec(body);
+  if (lead && body.slice(lead[0].length).trim()) return body.slice(lead[0].length).trim();
+  return body;
+}
+
+/** Add back any file block a tool produced this turn that the reply left out. */
+export function withFileFences(reply: string, fences: string[]): string {
+  // The model may paste the block reformatted; the file's path is what identifies it.
+  const pathOf = (f: string) => /"path":"([^"]+)"/.exec(f)?.[1];
+  const missing = fences.filter((f) => !reply.includes(f) && !(pathOf(f) && reply.includes(pathOf(f)!)));
+  return missing.length === 0 ? reply : [reply.trim(), ...missing].filter(Boolean).join("\n\n");
+}
+
+/**
+ * An answer that missed its reply window shows up under a later message; without a label the owner
+ * reads it as the answer to whatever they just asked.
+ */
+export function gapNoteText(gapMs: number): string {
+  const hours = Math.round(gapMs / 3_600_000);
+  return `[This message arrives about ${hours} hour${hours === 1 ? "" : "s"} after the previous one in this thread. Answer it on its own: do not bring back requests, confirmations or offers from before the gap unless this message asks about them. Old asks you never answered may be stale; if one still matters, mention it once in a line, not as a question that needs a yes.]`;
+}
+
+/** "grace-liu-wxd83" is "Grace Liu": the trailing random suffix is dropped. */
+export function nameFromAgentHandle(handle: string): string {
+  const parts = handle.replace(/^@/, "").split("-").filter(Boolean);
+  if (parts.length > 1 && /^[a-z0-9]{4,6}$/.test(parts[parts.length - 1]!) && /\d/.test(parts[parts.length - 1]!)) parts.pop();
+  return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ") || handle;
+}
+
+/**
+ * Texts that waited for this turn, then the reply. A late answer was relayed by the run (notify_owner) and
+ * stashed again, so the owner got it twice under an "About ..." label; a text the reply or an earlier one
+ * already says is dropped.
+ */
+export function joinOwnerParts(waiting: Array<string | undefined>, reply: string | undefined): string {
+  const body = (t: string) => t.replace(/^About "[^\n]*":\n/, "").replace(/\s+/g, " ").trim();
+  const replyBody = reply ? body(reply) : "";
+  const parts: string[] = [];
+  for (const t of waiting) {
+    if (!t) continue;
+    const b = body(t);
+    if (!b || (replyBody && replyBody.includes(b)) || parts.some((p) => body(p).includes(b))) continue;
+    parts.push(t);
+  }
+  if (reply) parts.push(reply);
+  return parts.join("\n\n");
+}
+
+/** A reply that opens by saying a message just went out ("Sent to Victor", "Told Nadia you're late", "I asked her agent"). */
+export function claimsSend(reply: string): boolean {
+  const first = reply.trim().split(/\n/)[0] ?? "";
+  return /^(?:done[,.!:—\s-]+)?(?:i(?:'ve| have)? )?(?:sent|told|asked|messaged|pinged|passed (?:it|that|this) (?:on|along)|forwarded)\b(?![^.\n]{0,40}\b(?:earlier|before|already|this morning|yesterday)\b)/i.test(first);
+}
+
+export function lateAnswer(question: string | undefined, reply: string): string {
+  const q = (question ?? "").replace(/\s+/g, " ").trim();
+  // "About \"yes\":" labels nothing; only a real question is worth naming.
+  if (!q || /^(yes|yeah|yep|no|nope|ok|okay|sure|thanks|thank you|y|n|k)[.!]?$/i.test(q)) return reply;
+  const short = q.length > 60 ? `${q.slice(0, 57).trimEnd()}…` : q;
+  return `About "${short}":\n${reply}`;
+}
+
+/** What a busy owner thread is doing, in words: "Still on your earlier request (about 6 min in, searching the web)." */
+export function busyStatus(conv: { busySince: number | undefined; activity: string | undefined }, now: Date): string | undefined {
+  if (conv.busySince === undefined) return undefined;
+  const mins = Math.floor((now.getTime() - conv.busySince) / 60_000);
+  const doing = activityPhrase(conv.activity);
+  const parts = [mins >= 1 ? `about ${mins} min in` : undefined, doing].filter(Boolean).join(", ");
+  return `Still on your earlier request${parts ? ` (${parts})` : ""}. Got this one too; I'll answer it right after.`;
+}
+
+function activityPhrase(tool: string | undefined): string | undefined {
+  if (!tool) return undefined;
+  if (/search/.test(tool)) return "searching the web";
+  if (/fetch|browse/.test(tool)) return "reading a page";
+  if (/computer|screenshot|click/.test(tool)) return "working in the browser";
+  if (/pdf|image|file|write|edit/.test(tool)) return "putting the file together";
+  if (/instinct|a2a/.test(tool)) return "waiting on another agent";
+  if (/schedule/.test(tool)) return "setting reminders";
+  if (/memory/.test(tool)) return "checking my notes";
+  if (/bash|python|exec|run/.test(tool)) return "crunching it";
+  if (/app_|composio|apps_/.test(tool)) return "working in your connected app";
+  return undefined;
 }
 
 function ackText(channel: Channel): string {
@@ -1569,4 +2265,15 @@ function withinBudget<T>(promise: Promise<T>, budgetMs: number): Promise<BudgetO
       resolve({ state: "done", value });
     });
   });
+}
+
+/** Context for the model: what the owner just saw above its reply (approval results, relayed news, questions). */
+export function shownToOwnerNote(texts: string[]): string {
+  return `[Shown to the owner just before this message, already delivered; build on it and do not contradict it:]\n${texts.map((t) => `- ${t.replace(/\s+/g, " ").trim()}`).join("\n")}`;
+}
+
+/** Trusted context for a request from an agent the owner had already asked this agent to reach. */
+export function mutualAskNote(owner: string, peer: string, ask: { at?: string; summary?: string }): string {
+  const what = ask.summary ? `: "${ask.summary.replace(/\s+/g, " ").trim()}"` : "";
+  return `[From your own records, not from the sender: ${owner} already asked you to reach ${peer}${ask.at ? ` (${ask.at})` : ""}${what}. That request is ${owner}'s yes to meeting them and to a time within what ${owner} asked for. Accept with reply_instinct (intent complete, oipIntent accept, one concrete time and place) without asking ${owner} again, then tell ${owner} in one line who, when and where. Ask ${owner} only if the time clashes with something they told you.]`;
 }

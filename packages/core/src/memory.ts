@@ -56,6 +56,21 @@ export class MemoryStore {
     this.state.writeText(DURABLE, `${base}${sep}${text.trim()}\n`);
   }
 
+  /** Remove durable lines that contain `match` (case-insensitive). Returns the removed lines. */
+  forgetDurable(match: string): string[] {
+    const needle = match.trim().toLowerCase();
+    if (!needle) return [];
+    const lines = this.readDurable().split("\n");
+    const removed = lines.filter((l) => !l.startsWith("#") && l.toLowerCase().includes(needle));
+    if (removed.length) this.state.writeText(DURABLE, lines.filter((l) => !removed.includes(l)).join("\n"));
+    return removed;
+  }
+
+  /** Wipe durable memory back to the empty template. */
+  clearDurable(): void {
+    this.state.writeText(DURABLE, DURABLE_TEMPLATE);
+  }
+
   replaceDurable(text: string): void {
     this.state.writeText(DURABLE, text.endsWith("\n") ? text : text + "\n");
   }

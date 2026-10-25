@@ -47,6 +47,9 @@ async function main(): Promise<void> {
     INSTINCT_OWNER_PHONE: OWNER_PHONE,
     INSTINCT_OWNER_EMAIL: "owner@example.com",
     INSTINCT_OWNER_TIMEZONE: "America/New_York",
+    // Deterministic at any hour: no night hold, and owner texts go out at once instead of after the merge window.
+    INSTINCT_QUIET_HOURS: "off",
+    INSTINCT_OWNER_MERGE_MS: "0",
     INSTINCT_AGENT_NAME: "Smoke",
     INSTINCT_MODEL: "faux/faux-1",
     INSTINCT_COMPUTER: "none",
@@ -189,7 +192,7 @@ async function main(): Promise<void> {
     const notice = toOwner[0];
     check(notice !== undefined && /calendar/i.test(notice.msg.text) && /declined/i.test(notice.msg.text), "the notification names the calendar ask and the refusal");
     check(notice?.principal.kind === "stranger" && notice.principal.agentHandle === STRANGER_AGENT, `the notification was sent on behalf of the stranger agent (got ${notice?.principal.id})`);
-    check(notice !== undefined && notice.msg.text.startsWith(`${STRANGER_AGENT} via Smoke:`), "the notification is prefixed with who asked");
+    check(notice !== undefined && notice.msg.text.startsWith("From Unknown Agent:"), "the notification is prefixed with who asked");
     const replies = a2aSends.filter((s) => s.msg.channel === "a2a" && s.conversationKey === `a2a:${A2A_CONTEXT}`);
     check(replies.length === 1, `exactly one A2A reply went back on the task (got ${replies.length})`);
     const reply = replies[0]?.msg;
@@ -231,6 +234,20 @@ async function main(): Promise<void> {
     check(created !== undefined && created.isError === false && /Wrote .*smoke\.pdf .*1 page/.test(created.result ?? ""), `create_pdf wrote the file and reported one page (got ${JSON.stringify(created?.result)})`);
     check(sent !== undefined && sent.isError === false && (sent.result ?? "").includes(pdfAbsolute), `send_file answered with the file's path (got ${JSON.stringify(sent?.result)})`);
     check(typeof pdfChat.json.response === "string" && (pdfChat.json.response.includes("```maritime-file") || pdfChat.json.response.includes(pdfAbsolute)), "the reply carries the maritime-file block or the path");
+
+    console.log("6. owner grants a contact access, and the grant is saved to policy.json");
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("contacts_upsert", { name: "Sam Lee", tier: "friend" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("trust_grant", { to: "Sam Lee", capabilities: ["calendar.freebusy"], purpose: "plan Saturday", expiresAt: "2099-12-31T00:00:00Z" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Done, Sam can see your free/busy through December."),
+    ]);
+    const grantChat = await post("/chat", { message: "Sam can see my free/busy through December", source: "cli" });
+    check(grantChat.status === 200, "grant chat is 200");
+    const grantCalls = new AuditLog(app.state).read({ kinds: ["tool_call"] }).map((e) => e.detail as { tool?: string; isError?: boolean; result?: string }).filter((c) => c.tool === "trust_grant" || c.tool === "contacts_upsert");
+    check(grantCalls.length === 2 && grantCalls.every((c) => c.isError === false), `contacts_upsert and trust_grant ran (got ${JSON.stringify(grantCalls)})`);
+    const policyFile = join(dataDir, "policy.json");
+    const savedPolicy = existsSync(policyFile) ? JSON.parse(readFileSync(policyFile, "utf8")) : {};
+    check(Array.isArray(savedPolicy.grants) && savedPolicy.grants.some((g: { capabilities?: string[] }) => g.capabilities?.includes("calendar.freebusy")), "policy.json holds the grant (got " + JSON.stringify(savedPolicy.grants ?? null) + ")");
 
     console.log("status");
     const status = await get("/");

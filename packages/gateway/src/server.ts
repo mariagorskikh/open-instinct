@@ -61,6 +61,13 @@ export interface GatewayOptions {
    * is not awaited.
    */
   onInbound?: (user: UserRecord, event: Record<string, unknown>) => void | Promise<void>;
+  /**
+   * Called when Maritime refuses an inbound event because the agent's AI budget is spent
+   * (the account's credits, or the agent's own monthly limit). The event stays queued and
+   * is retried, so it reaches the agent once the budget is raised; this is the front door's
+   * chance to text the owner that the agent is paused. A throw is logged, not fatal.
+   */
+  onBudgetExhausted?: (user: UserRecord, event: Record<string, unknown>, reason: string) => Promise<void> | void;
   /** Ask Maritime for the agent's state before every relay (true), never (false), or only for agents under 15 minutes old (default). */
   checkAgentStatus?: boolean;
 }
@@ -162,7 +169,15 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       }
       if (!user.maritimeAgentId) throw new Error("Agent is not ready");
       const result = await relayVerifiedEvent(user, event, relayDeps);
-      if (result.status === "rejected") throw new Error(result.reason ?? "Forwarding failed");
+      if (result.status !== "rejected") return;
+      if (result.cause === "budget" && opts.onBudgetExhausted) {
+        try {
+          await opts.onBudgetExhausted(user, event, result.reason ?? "budget exhausted");
+        } catch (err) {
+          log.warn("budget_notice.failed", { userId: user.id, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      throw new Error(result.reason ?? "Forwarding failed");
     },
     onError: (id, status) => log.warn("relay.pending", { id, status }),
   });

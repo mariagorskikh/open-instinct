@@ -22,6 +22,8 @@ export function testConfig(overrides: Partial<InstinctConfig["owner"]> = {}): In
     ...overrides,
   };
   cfg.agent = { name: "Instinct", handle: "maria-instinct" };
+  // Tests run at any hour; the quiet-hours hold is exercised explicitly where it matters.
+  cfg.features.quietHours = false;
   return cfg;
 }
 

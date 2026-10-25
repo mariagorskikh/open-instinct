@@ -68,7 +68,7 @@ describe("networkGuidance", () => {
   it("tells the owner how to use the network tools", () => {
     const text = networkGuidance(owner);
     expect(text).toContain("ask_instinct");
-    expect(text).toContain("at most 3 options");
+    expect(text).toContain("one option at a time");
     expect(text).toContain("confirm with the owner");
   });
 
@@ -80,7 +80,7 @@ describe("networkGuidance", () => {
     expect(text).toContain("acting for Sam Lee");
     expect(text).toContain("say who you act for");
     expect(text).toContain("reply_instinct");
-    expect(text).toContain("at most 3 options");
+    expect(text).toContain("one option at a time");
     expect(text).toContain("declined with fail and reported to the owner");
   });
 

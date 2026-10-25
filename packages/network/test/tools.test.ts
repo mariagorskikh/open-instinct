@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { networkTools } from "../src/tools.js";
 import { agentPrincipal, config, contactPrincipal, ctx, fakeA2a, fakeAudit, fakeContacts, fakeOutbox, fakePolicy, fakeProvisioner, owner, run, stranger } from "./fakes.js";
 
-function setup(opts: { a2a?: boolean; provisioner?: boolean; handle?: boolean; a2aStore?: A2AStore } = {}) {
+function setup(opts: { a2a?: boolean; provisioner?: boolean; handle?: boolean; a2aStore?: A2AStore; reservedNames?: string[]; meetingWith?: (name: string) => string | undefined; meetingStartWith?: (name: string) => string | undefined; clashWith?: (text: string, peer: string) => string | undefined } = {}) {
   const contacts = fakeContacts([
     { name: "Sam Lee", tier: "partner", phones: ["(617) 555-0101"], emails: ["sam@example.com"], agentHandle: "sam-instinct" },
     { name: "Alex Kim", tier: "friend", phones: ["+16175550102"] },
@@ -31,6 +31,10 @@ function setup(opts: { a2a?: boolean; provisioner?: boolean; handle?: boolean; a
     ...(opts.a2aStore ? { a2aStore: opts.a2aStore } : {}),
     provisioner: opts.provisioner ? provisioner : undefined,
     onPolicyChange: (p) => changes.push(p),
+    ...(opts.reservedNames ? { reservedNames: opts.reservedNames } : {}),
+    ...(opts.meetingWith ? { meetingWith: opts.meetingWith } : {}),
+    ...(opts.meetingStartWith ? { meetingStartWith: opts.meetingStartWith } : {}),
+    ...(opts.clashWith ? { clashWith: opts.clashWith } : {}),
   });
   const sam = contacts.get("sam-lee") as Contact;
   const alex = contacts.get("alex-kim") as Contact;
@@ -161,8 +165,9 @@ describe("trust_grant / trust_revoke / trust_list", () => {
     const g = policy.grants[0]!;
     expect(g.to).toBe("contact:sam-lee");
     expect(g.capabilities).toEqual(["calendar.write", "plans.commit"]);
-    expect(g.scope).toEqual({ purpose: "dinner", window: { from: "2026-10-06", to: "2026-10-12" }, maxUsd: 150 });
-    expect(g.expiresAt).toBe("2026-10-12T23:59:59");
+    // Plain days are the owner's days (America/New_York in the test config), not UTC ones.
+    expect(g.scope).toEqual({ purpose: "dinner", window: { from: "2026-10-06T00:00:00-04:00", to: "2026-10-12T23:59:59-04:00" }, maxUsd: 150 });
+    expect(g.expiresAt).toBe("2026-10-12T23:59:59-04:00");
     expect(changes).toHaveLength(1);
     expect(audit.entries.some((e) => e.detail.action === "grant" && e.detail.grantId === g.id)).toBe(true);
     expect(r.details).toEqual({ grantId: g.id });
@@ -212,6 +217,93 @@ describe("ask_instinct", () => {
     expect(result.isError).toBe(true);
     expect(result.text).toContain("ask_caller");
     expect(a2a.calls).toHaveLength(0);
+  });
+
+  it("sends nothing for a meeting already set unless asked to move it", async () => {
+    const { tools, a2a } = setup({ meetingWith: (n) => (n === "Sam Lee" ? "Sat, Oct 17, 12:30 PM, lobby cafe" : undefined) });
+    const held = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Meet up?" }, ctx(owner));
+    expect(held.isError).toBe(true);
+    expect(held.text).toContain("already meeting Sam Lee: Sat, Oct 17, 12:30 PM, lobby cafe");
+    expect(a2a.calls).toHaveLength(0);
+    // A question about something else still goes through.
+    const other = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Could Sam send the slides from the talk?" }, ctx(owner));
+    expect(other.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(1);
+    const moved = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Move to 4?", move: true }, ctx(owner));
+    expect(moved.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(2);
+    // A note about the meeting is not a new booking.
+    const late = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Running 10 minutes late to our meetup" }, ctx(owner));
+    expect(late.isError).toBe(false);
+    const q = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Before we meet: what is Sam working on these days?" }, ctx(owner));
+    expect(q.isError).toBe(false);
+    // An "email" with no address in it is not sent.
+    const placeholder = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Here's my email for after the meetup" }, ctx(owner));
+    expect(placeholder.isError).toBe(true);
+    // A 3-way plan is a new meeting, even with someone already met one-to-one.
+    const group = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "3-way coffee with Grace at 4:00 PM outside the lobby cafe?" }, ctx(owner));
+    expect(group.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(5);
+  });
+
+  it("won't send a yes or a proposal for a time the owner already gave someone else", async () => {
+    const clashWith = (text: string, peer: string) => (/1:30/.test(text) && peer !== "Leo Martins" ? "Leo Martins at Sat, Oct 17, 1:30 PM" : undefined);
+    const { tools, a2a } = setup({ clashWith });
+    const yes = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Yes, Saturday at 1:30 PM in the lobby cafe works" }, ctx(owner));
+    expect(yes.isError).toBe(true);
+    expect(yes.text).toContain("already meets Leo Martins");
+    const counter = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "1:30 PM is taken; could we meet at 2:00 PM instead?" }, ctx(owner));
+    expect(counter.isError).toBe(false);
+    const group = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "3-way coffee with Leo at 1:30 PM in the Foyer?" }, ctx(owner));
+    expect(group.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(2);
+  });
+
+  it("insists a new meeting ask names one concrete time, and creates a contact from a bare handle", async () => {
+    const { tools, a2a, contacts } = setup();
+    const vague = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Meet up on Saturday?" }, ctx(owner));
+    expect(vague.isError).toBe(true);
+    expect(vague.text).toContain("one concrete time and place");
+    expect(a2a.calls).toHaveLength(0);
+    const concrete = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Meet Saturday October 17 at 12:30 PM, lunch in the lobby cafe?" }, ctx(owner));
+    expect(concrete.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(1);
+    const byHandle = await run(tools, "ask_instinct", { contact: "@priya-natarajan-wjzg2", intent: "ask", text: "Could Priya send the slides?" }, ctx(owner));
+    expect(byHandle.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(2);
+    expect(contacts.all().find((c) => c.agentHandle === "@priya-natarajan-wjzg2")?.name).toBe("Priya Natarajan");
+    const { nameFromHandle } = await import("../src/tools.js");
+    expect(nameFromHandle("@tom-okafor-9x2kq")).toBe("Tom Okafor");
+    expect(nameFromHandle("ida-55f6v")).toBe("Ida");
+    expect(nameFromHandle("maria-instinct")).toBe("Maria Instinct");
+  });
+
+  it("refuses a move to the time already held", async () => {
+    const { tools, a2a } = setup({ meetingWith: () => "Sat, Oct 17, 4:00 PM", meetingStartWith: () => "2026-10-17T23:00:00.000Z" });
+    const same = await run(tools, "ask_instinct", { contact: "sam", intent: "propose_times", text: "Move to 4?", move: true, payload: { slots: [{ start: "2026-10-17T16:00:00-07:00" }] } }, ctx(owner));
+    expect(same.isError).toBe(true);
+    expect(same.text).toContain("already at that time");
+    const other = await run(tools, "ask_instinct", { contact: "sam", intent: "propose_times", text: "Move to 12:30?", move: true, payload: { slots: [{ start: "2026-10-17T12:30:00-07:00" }] } }, ctx(owner));
+    expect(other.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(1);
+  });
+
+  it("refuses a contact saved under another name that carries a staff handle", async () => {
+    const { tools, a2a } = setup({ reservedNames: ["Sam Instinct"] });
+    const refused = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Hi" }, ctx(owner));
+    expect(refused.isError).toBe(true);
+    expect(a2a.calls).toHaveLength(0);
+  });
+
+  it("refuses a reserved contact unless the owner named them", async () => {
+    const { tools, a2a } = setup({ reservedNames: ["Sam Lee"] });
+    const refused = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Quick hello?" }, ctx(owner));
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("on the reserved list");
+    expect(a2a.calls).toHaveLength(0);
+    const sent = await run(tools, "ask_instinct", { contact: "sam", intent: "ask", text: "Quick hello?", owner_named: true }, ctx(owner));
+    expect(sent.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(1);
   });
 
   it("sends text plus an OIP data part over A2A when the contact has an Instinct", async () => {
@@ -399,6 +491,31 @@ describe("reply_instinct", () => {
     await expect(run(tools, "reply_instinct", { intent: "complete", text: "answer" }, ctx(stranger, { channel: "a2a", replyRef: { taskId: "t" }, assertA2AActive: async () => { throw new Error("task canceled"); } }))).rejects.toThrow("task canceled");
     expect(a2a.calls).toHaveLength(0);
   });
+  it("never sends the owner's phone or email to an agent below partner", async () => {
+    const { tools, a2a, sam } = setup();
+    const a2aCtx = ctx({ ...agentPrincipal(sam), tier: "friend" }, { channel: "a2a", replyRef: { taskId: "t1" }, assertA2AActive: async () => {} });
+    const leak = await run(tools, "reply_instinct", { intent: "complete", text: "Sure, her cell is (617) 555-0100." }, a2aCtx);
+    expect(leak.isError).toBe(true);
+    const email = await run(tools, "reply_instinct", { intent: "complete", text: "Email her at Maria@Example.com" }, a2aCtx);
+    expect(email.isError).toBe(true);
+    expect(a2a.calls).toHaveLength(0);
+    // A partner may have them.
+    const partner = ctx({ ...agentPrincipal(sam), tier: "partner" }, { channel: "a2a", replyRef: { taskId: "t1" }, assertA2AActive: async () => {} });
+    expect((await run(tools, "reply_instinct", { intent: "complete", text: "Her cell is +1 617 555 0100." }, partner)).isError).toBe(false);
+  });
+
+  it("won't confirm a time the owner already gave someone else, but still sends a counter-offer", async () => {
+    const clashWith = (text: string, peer: string) => (/1:30/.test(text) && peer !== "Leo Martins" ? "Leo Martins at Sat, Oct 17, 1:30 PM" : undefined);
+    const { tools, a2a, sam } = setup({ clashWith });
+    const a2aCtx = ctx(agentPrincipal(sam), { channel: "a2a", replyRef: { taskId: "t1" }, assertA2AActive: async () => {} });
+    const yes = await run(tools, "reply_instinct", { intent: "complete", text: "Yes, Saturday at 1:30 PM in the lobby cafe works" }, a2aCtx);
+    expect(yes.isError).toBe(true);
+    expect(JSON.stringify(yes)).toContain("already meets Leo Martins");
+    const counter = await run(tools, "reply_instinct", { intent: "complete", text: "1:30 PM is taken; how about 2:00 PM instead?" }, a2aCtx);
+    expect(counter.isError).toBe(false);
+    expect(a2a.calls).toHaveLength(1);
+  });
+
   it("only works inside an A2A conversation", async () => {
     const { tools, a2a, sam } = setup();
     const r = await run(tools, "reply_instinct", { taskId: "t1", intent: "complete", text: "ok" }, ctx(agentPrincipal(sam)));

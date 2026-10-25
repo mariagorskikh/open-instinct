@@ -108,7 +108,7 @@ export type InstructionsSync = "created" | "updated" | "kept" | "none";
  * edited it) and the seed changed: overwrite. Owner-edited file: leave it alone. Nothing
  * to seed: leave everything alone.
  */
-export function syncInstructions(state: StateDir, seed?: string): InstructionsSync {
+export function syncInstructions(state: StateDir, seed?: string, opts: { adoptUnmarked?: boolean } = {}): InstructionsSync {
   const text = seed?.trim();
   if (!text) return "none";
   const body = text + "\n";
@@ -122,6 +122,14 @@ export function syncInstructions(state: StateDir, seed?: string): InstructionsSy
   if (current === body) {
     if (last !== body) state.writeText(AGENTS_SEED_FILE, body);
     return "kept";
+  }
+  // A file from before the marker existed cannot prove it was never edited. A deployer that knows
+  // its owners never edit AGENTS.md (they only text) can adopt such files once; after that the
+  // marker exists and the normal rule applies.
+  if (!last && opts.adoptUnmarked) {
+    state.writeText(AGENTS_FILE, body);
+    state.writeText(AGENTS_SEED_FILE, body);
+    return "updated";
   }
   if (last && current.trim() === last.trim()) {
     state.writeText(AGENTS_FILE, body);

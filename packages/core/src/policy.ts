@@ -374,7 +374,41 @@ export class PolicyEngine {
     return this.grantsFor(principal, this.now()).some((g) => g.capabilities.includes(capability));
   }
 
+  /** Adds a grant, or returns the identical one that already exists (same person, capabilities, scope and expiry). */
   addGrant(g: Omit<Grant, "id" | "createdAt">): Grant {
+    // Agents re-grant the same thing with new wording ("Saturday free/busy" four times over): a grant
+    // to the same person for the same capabilities whose window overlaps an existing one widens it.
+    const caps = (x: { capabilities: Capability[] }) => [...x.capabilities].sort().join(",");
+    const span = (x: Omit<Grant, "id" | "createdAt">): [number, number] => {
+      const w = x.scope?.window;
+      if (!w) return [-Infinity, Infinity];
+      const from = Date.parse(w.from);
+      const end = Date.parse(w.to);
+      return [Number.isNaN(from) ? -Infinity : from, Number.isNaN(end) ? Infinity : /^\d{4}-\d{2}-\d{2}$/.test(w.to) ? end + 86_400_000 : end];
+    };
+    const [gFrom, gTo] = span(g);
+    const existing = this.policy.grants.find((x) => {
+      if (x.to !== g.to || caps(x) !== caps(g) || (x.scope?.maxUsd ?? null) !== (g.scope?.maxUsd ?? null)) return false;
+      const [xFrom, xTo] = span(x);
+      return xFrom <= gTo && gFrom <= xTo;
+    });
+    if (existing) {
+      const w1 = existing.scope?.window;
+      const w2 = g.scope?.window;
+      if (w1 && w2) {
+        const from = Date.parse(w2.from) < Date.parse(w1.from) ? w2.from : w1.from;
+        const to = span(g)[1] > span(existing)[1] ? w2.to : w1.to;
+        existing.scope = { ...existing.scope, window: { from, to } };
+      } else if (!w2 && existing.scope?.window) {
+        const { window: _w, ...rest } = existing.scope;
+        existing.scope = rest;
+      }
+      if (existing.expiresAt && (!g.expiresAt || Date.parse(g.expiresAt) > Date.parse(existing.expiresAt))) {
+        if (g.expiresAt) existing.expiresAt = g.expiresAt;
+        else delete existing.expiresAt;
+      }
+      return clone(existing);
+    }
     const grant: Grant = { ...clone(g), id: newId(), createdAt: this.now().toISOString() };
     this.policy.grants.push(grant);
     return clone(grant);
@@ -386,9 +420,18 @@ export class PolicyEngine {
     return this.policy.grants.length !== before;
   }
 
+  /** Grants that are in effect or still to come (a window that starts later is listed, not hidden); ended ones are left out. */
   listGrants(to?: string): Grant[] {
     const at = this.now();
-    return this.policy.grants.filter((g) => (to === undefined || g.to === to) && this.isActive(g, at)).map(clone);
+    return this.policy.grants.filter((g) => (to === undefined || g.to === to) && !this.hasEnded(g, at)).map(clone);
+  }
+
+  private hasEnded(g: Grant, at: Date): boolean {
+    if (g.expiresAt && Date.parse(g.expiresAt) <= at.getTime()) return true;
+    const end = g.scope?.window?.to;
+    if (!end) return false;
+    const t = Date.parse(end);
+    return (/^\d{4}-\d{2}-\d{2}$/.test(end) ? t + 24 * 60 * 60 * 1000 : t) <= at.getTime();
   }
 
   setTierOverride(tier: Tier, capability: Capability, permission: Permission): void {

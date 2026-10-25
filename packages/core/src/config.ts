@@ -1,7 +1,9 @@
 /**
  * config.json: who the owner is, which model to use, feature flags. The file wins
- * over the environment after first boot; env only seeds it. The one exception is
- * INSTINCT_MODEL, which operators use to swap models without editing state.
+ * over the environment after first boot; env only seeds it. The exceptions are
+ * INSTINCT_MODEL (operators swap models without editing state) and
+ * INSTINCT_BUDGET_CONTACT (who to name when the budget is spent): the environment
+ * sets those on every boot, so a fleet-wide change needs no edit of each config.json.
  */
 import { normalizeEmail, normalizeHandle, normalizePhone } from "./principal.js";
 import type { StateDir } from "./state.js";
@@ -58,6 +60,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv): InstinctConfig {
   const timezone = env.INSTINCT_OWNER_TIMEZONE?.trim() || env.INSTINCT_TIMEZONE?.trim();
   if (timezone) cfg.owner.timezone = timezone;
   if (/^(1|true|yes)$/i.test((env.INSTINCT_ACK_SLOW_REPLIES ?? "").trim())) cfg.features.ackSlowReplies = true;
+  if (env.INSTINCT_BUDGET_CONTACT?.trim()) cfg.features.budgetContact = env.INSTINCT_BUDGET_CONTACT.trim();
+  // INSTINCT_QUIET_HOURS="22-8" (owner-local hours, start inclusive, end exclusive) or "off".
+  const quiet = (env.INSTINCT_QUIET_HOURS ?? "").trim();
+  if (/^(off|0|false|no)$/i.test(quiet)) cfg.features.quietHours = false;
+  else if (/^\d{1,2}-\d{1,2}$/.test(quiet)) {
+    const [a, b] = quiet.split("-").map(Number) as [number, number];
+    if (a >= 0 && a <= 23 && b >= 0 && b <= 23) cfg.features.quietHours = { start: a, end: b };
+  }
   if (env.INSTINCT_MODEL?.trim()) cfg.model.primary = env.INSTINCT_MODEL.trim();
   if (env.INSTINCT_AGENT_NAME?.trim()) cfg.agent.name = env.INSTINCT_AGENT_NAME.trim();
   if (env.INKBOX_AGENT_HANDLE?.trim()) cfg.agent.handle = normalizeHandle(env.INKBOX_AGENT_HANDLE);
@@ -98,6 +108,7 @@ export function loadConfig(state: StateDir, env: NodeJS.ProcessEnv): InstinctCon
   }
   const cfg = withDefaults(state.readJson<Partial<InstinctConfig>>(FILE, {}));
   if (env.INSTINCT_MODEL?.trim()) cfg.model.primary = env.INSTINCT_MODEL.trim();
+  if (env.INSTINCT_BUDGET_CONTACT?.trim()) cfg.features.budgetContact = env.INSTINCT_BUDGET_CONTACT.trim();
   return cfg;
 }
 

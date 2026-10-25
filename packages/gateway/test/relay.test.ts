@@ -84,6 +84,30 @@ describe("relayEvent", () => {
     expect(await relayEvent(user, ok, signHeaders(ok, user.signingKey), d.deps)).toEqual({ status: "forwarded" });
   });
 
+  it("marks a spent budget as the cause and does not retry it", async () => {
+    const user = readyUser();
+    const raw = Buffer.from(JSON.stringify(imessageEvent("evt_budget")));
+    for (const response of [
+      "This agent can't be woken right now: This agent reached its monthly AI spend limit ($10.03 of $10.00). The limit resets on 2026-11-01 (UTC).",
+      "This agent couldn't be woken: LLM credits exhausted ($1081.68 of $1080.00 used).",
+    ]) {
+      const d = deps();
+      d.mar.queue.push({ body: { response } });
+      const r = await relayEvent(user, raw, signHeaders(raw, user.signingKey), d.deps);
+      expect(r.status).toBe("rejected");
+      expect(r.cause).toBe("budget");
+      expect(r.reason).toContain("maritime:");
+      expect(d.mar.calls).toHaveLength(1);
+    }
+    // Other platform replies keep their retries and carry no cause.
+    const d = deps();
+    d.mar.queue.push({ body: { response: "This agent couldn't be woken: VM not found" } }, { body: { response: "This agent couldn't be woken: VM not found" } }, { body: { response: "This agent couldn't be woken: VM not found" } });
+    const r = await relayEvent(user, raw, signHeaders(raw, user.signingKey), d.deps);
+    expect(r.status).toBe("rejected");
+    expect(r.cause).toBeUndefined();
+    expect(d.mar.calls).toHaveLength(3);
+  });
+
   it("retries on 503, 429 and network errors, then succeeds", async () => {
     const d = deps();
     d.mar.queue.push(503, new Error("ECONNRESET"));
@@ -185,5 +209,17 @@ describe("agent readiness", () => {
     expect(await relayEvent(user, raw, signHeaders(raw, user.signingKey), d.deps)).toEqual({ status: "forwarded" });
     expect(d.mar.queue).toHaveLength(0);
   });
-});
 
+  it("treats Maritime's own 'couldn't be woken' reply as not delivered, so the inbox retries it", async () => {
+    const d = deps();
+    const user = readyUser();
+    const raw = Buffer.from(JSON.stringify(imessageEvent("evt_wake", "conv_1")));
+    const woken = { body: { response: "Your agent couldn't be woken right now. Please try again in a moment." } };
+    d.mar.queue.push(woken, woken, woken);
+    const r = await relayEvent(user, raw, signHeaders(raw, user.signingKey), d.deps);
+    expect(r.status).toBe("rejected");
+    expect(r.reason).toContain("couldn't be woken");
+    d.mar.queue.push({ body: { response: "" } });
+    expect(await relayEvent(user, raw, signHeaders(raw, user.signingKey), d.deps)).toEqual({ status: "forwarded" });
+  });
+});

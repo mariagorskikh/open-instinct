@@ -232,6 +232,7 @@ function parseA2ATask(payload: Dict, data: Dict, eventType: string, direction: A
     conversationKey: `a2a:${contextId}`,
     from: handle,
     text,
+    ...(firstData ? { data: firstData } : {}),
     replyRef: { taskId, contextId, messageId },
     receivedAt: receivedAt(payload),
     source: "webhook",

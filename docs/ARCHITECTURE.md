@@ -308,6 +308,12 @@ Server:
 | `INSTINCT_PUBLIC_URL` | this agent's public URL, used to build the Link callback |
 | `INSTINCT_ACK_SLOW_REPLIES` | `1` texts the owner one "on it" in their 1:1 iMessage/SMS thread when a turn is still running after `INSTINCT_REPLY_BUDGET_MS` (`config.features.ackSlowReplies`); never for a queued text, a group or a non-owner |
 | `INSTINCT_REPLY_BUDGET_MS` | how long `/chat` waits before acknowledging, and the delay before the optional slow-reply text (default 20000) |
+| `INSTINCT_QUIET_HOURS` | owner-local hours when texts the owner did not ask for wait until morning, as `22-8` (the default) or `off`; an owner who texted in the last 15 minutes is treated as awake |
+| `INSTINCT_OWNER_MERGE_MS` | texts to the owner that arrive within this window go out as one message, repeats dropped (default 6000; `0` turns it off) |
+| `INSTINCT_BUDGET_CONTACT` | who the owner should ask when the agent's AI budget is spent (usually an email address); named in the "I'm paused" reply instead of a generic error |
+| `INSTINCT_INSTRUCTIONS_ADOPT` | `1` lets `INSTINCT_INSTRUCTIONS` replace an `AGENTS.md` written before the seed marker existed, once; only for deployers whose owners never edit the file |
+| `INSTINCT_RESERVED_CONTACTS` | comma-separated names or handles the agent may message only when the owner asks for that person by name (organizers, a busy colleague) |
+| `INSTINCT_STRANGER_CONVERSATIONS_PER_DAY` | raises the daily cap on new conversations with agents and people the owner has not added, for an agent that meets many new agents |
 | `INSTINCT_SKILLS_DIR` | SKILL.md folder (default `<repo>/skills`); the owner's `<data>/skills` is read after it, every 30 s. Built-ins win a name clash, and an owner skill is private to the owner unless its frontmatter says `visibility: public` |
 | `INSTINCT_COMPUTER` | `auto` (desktopd if present, else hosted if `MARITIME_API_KEY`, else none), `desktopd`, `maritime`, `none` |
 | `MARITIME_API_KEY`, `MARITIME_COMPUTERS_MCP_URL` | hosted computer fallback |

@@ -162,6 +162,12 @@ export class ApprovalStore {
     return { ...approval };
   }
 
+  /** True when the owner said yes to a request in this conversation within the last `withinMs`. */
+  approvedIn(conversationKey: string, withinMs = 6 * 60 * 60_000): boolean {
+    const t = this.now().getTime();
+    return this.load().some((a) => a.status === "approved" && a.conversationKey === conversationKey && t - Date.parse(a.createdAt) < withinMs);
+  }
+
   get(token: string): Approval | undefined {
     const found = this.sweep(this.load()).find((a) => a.token === token.toUpperCase());
     return found ? { ...found } : undefined;
@@ -247,6 +253,9 @@ export class ApprovalStore {
   private bareAllowed(a: Approval, text: string): boolean {
     if (hasExplicitVerb(text)) return true;
     if (this.promptedToken() === a.token) return true;
-    return a.requestedBy === "owner" && !(a.amountUsd !== undefined && a.amountUsd > 0);
+    // An owner's own request may take a bare "yes" only while it is fresh: testing had a "yes" meant for
+    // a new question settle an hours-old one ("Got it, that's a yes: Need the Google person's name").
+    const fresh = this.now().getTime() - Date.parse(a.createdAt) < 10 * 60_000;
+    return a.requestedBy === "owner" && fresh && !(a.amountUsd !== undefined && a.amountUsd > 0);
   }
 }
