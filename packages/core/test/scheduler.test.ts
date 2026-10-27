@@ -26,6 +26,41 @@ describe("parseCron", () => {
     expect(parseCron("0 0 * * sun,sat").dow).toEqual(set(0, 6));
   });
 
+  it("accepts exact abbreviations and full names regardless of case", () => {
+    const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+    const weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    for (const [index, name] of months.entries()) {
+      for (const token of [name, name.toUpperCase(), name.slice(0, 3)]) {
+        expect(parseCron(`0 9 * ${token} *`).month).toEqual(set(index + 1));
+      }
+    }
+    for (const [index, name] of weekdays.entries()) {
+      for (const token of [name, name.toUpperCase(), name.slice(0, 3)]) {
+        expect(parseCron(`0 9 * * ${token}`).dow).toEqual(set(index));
+      }
+    }
+    expect(parseCron("0 9 * January,jul *").month).toEqual(set(1, 7));
+    expect(parseCron("0 9 * * Monday-Friday/2").dow).toEqual(set(1, 3, 5));
+  });
+
+  it.each([
+    "0 9 * * monkey",
+    "0 9 * * monsoon",
+    "0 9 * janitor *",
+    "0 9 * Januaryx *",
+    "0 9 * * mon2",
+    "0 9 * * mon,fridayx",
+    "0 9 * * monkey-fri",
+    "0 9 * janitor-mar *",
+    "0 9 * * monkey/2",
+    "0 9 * * tues",
+    "0 9 * sept *",
+    "0 9 * monday *",
+    "0 9 * * january",
+  ])("rejects malformed or misplaced names in %s", (expression) => {
+    expect(() => parseCron(expression)).toThrow(/bad value/);
+  });
+
   it("rejects malformed expressions with a readable message", () => {
     expect(() => parseCron("* * * *")).toThrow(/expected 5 fields/);
     expect(() => parseCron("60 * * * *")).toThrow(/out of range/);

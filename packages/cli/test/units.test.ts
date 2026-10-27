@@ -80,13 +80,16 @@ describe("trust parsing", () => {
 });
 
 describe("validateCron", () => {
-  it("accepts 5 fields with *, lists, ranges and steps", () => {
+  it("accepts numeric expressions and named days and months supported by core", () => {
     expect(() => validateCron("*/15 9-17 * * 1-5")).not.toThrow();
     expect(() => validateCron("0 8,20 1 * *")).not.toThrow();
+    expect(() => validateCron("0 9 * * mon-fri")).not.toThrow();
+    expect(() => validateCron("0 9 * jan *")).not.toThrow();
   });
-  it("rejects wrong arity and words", () => {
+  it("rejects malformed expressions", () => {
     expect(() => validateCron("0 8 * *")).toThrow(/5 fields/);
-    expect(() => validateCron("0 8 * * mon")).toThrow(/not understood/);
+    expect(() => validateCron("60 8 * * *")).toThrow(/out of range/);
+    expect(() => validateCron("0 8 * * nonsense")).toThrow(/bad value/);
   });
 });
 

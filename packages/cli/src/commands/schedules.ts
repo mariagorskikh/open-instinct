@@ -1,5 +1,5 @@
 /** `instinct schedules ...`: proactive jobs, edited on the local data dir through core's Scheduler. */
-import { Scheduler } from "@open-instinct/core";
+import { parseCron, Scheduler } from "@open-instinct/core";
 import { parse, str, type OptionSpec } from "../args.js";
 import { table } from "../ansi.js";
 import type { CliContext } from "../context.js";
@@ -12,11 +12,14 @@ export const schedulesOptions: OptionSpec = {
 };
 
 export function validateCron(cron: string): void {
-  const fields = cron.trim().split(/\s+/);
-  if (fields.length !== 5) throw new UsageError(`cron needs 5 fields (minute hour day month weekday), got "${cron}"`, "schedules");
-  const ok = /^[\d*,\-/]+$/;
-  const bad = fields.filter((f) => !ok.test(f));
-  if (bad.length) throw new UsageError(`cron field not understood: ${bad.join(" ")}`, "schedules");
+  try {
+    parseCron(cron);
+  } catch (error) {
+    throw new UsageError(
+      error instanceof Error ? error.message : String(error),
+      "schedules",
+    );
+  }
 }
 
 export async function runSchedules(ctx: CliContext, argv: string[]): Promise<number> {

@@ -29,11 +29,33 @@ export interface CronSpec {
 
 const MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 const DOW_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const FULL_NAME_ABBREVIATIONS = new Map([
+  ["january", "jan"],
+  ["february", "feb"],
+  ["march", "mar"],
+  ["april", "apr"],
+  ["may", "may"],
+  ["june", "jun"],
+  ["july", "jul"],
+  ["august", "aug"],
+  ["september", "sep"],
+  ["october", "oct"],
+  ["november", "nov"],
+  ["december", "dec"],
+  ["sunday", "sun"],
+  ["monday", "mon"],
+  ["tuesday", "tue"],
+  ["wednesday", "wed"],
+  ["thursday", "thu"],
+  ["friday", "fri"],
+  ["saturday", "sat"],
+]);
 
 function parseNumber(token: string, names: string[] | undefined, offset: number, field: string): number {
   if (names) {
-    const idx = names.indexOf(token.toLowerCase().slice(0, 3));
-    if (idx >= 0 && !/^\d+$/.test(token)) return idx + offset;
+    const normalized = token.toLowerCase();
+    const idx = names.indexOf(FULL_NAME_ABBREVIATIONS.get(normalized) ?? normalized);
+    if (idx >= 0) return idx + offset;
   }
   if (!/^\d+$/.test(token)) throw new Error(`cron: bad value "${token}" in ${field} field`);
   return Number(token);

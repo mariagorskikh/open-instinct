@@ -218,6 +218,19 @@ describe("trust", () => {
 });
 
 describe("schedules", () => {
+  it("adds a schedule with a named weekday range", async () => {
+    const dir = tmpDir();
+    const result = await run(
+      ["schedules", "add", "0 9 * * mon-fri", "Morning brief", "--tz", "UTC"],
+      { INSTINCT_DATA_DIR: dir },
+    );
+
+    expect(result.code, result.err).toBe(0);
+    const entries = new Scheduler(new StateDir(dir)).list();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.cron).toBe("0 9 * * mon-fri");
+  });
+
   it("adds a cron job, lists it and removes it", async () => {
     const dir = tmpDir();
     const env = { INSTINCT_DATA_DIR: dir };
@@ -246,6 +259,15 @@ describe("schedules", () => {
     const [entry] = new Scheduler(new StateDir(dir)).list();
     expect(entry?.cron).toBeUndefined();
     expect(entry?.nextRunAt).toBe("2030-01-01T09:00:00.000Z");
+  });
+
+  it.each(["0 9 * * monkey", "0 9 * janitor *"])("rejects malformed names without saving %s", async (cron) => {
+    const dir = tmpDir();
+    const result = await run(["schedules", "add", cron, "Morning brief", "--tz", "UTC"], { INSTINCT_DATA_DIR: dir });
+    expect(result.code).toBe(2);
+    expect(result.err).toContain("bad value");
+    expect(result.err).toContain("instinct schedules --help");
+    expect(new Scheduler(new StateDir(dir)).list()).toHaveLength(0);
   });
 
   it("rejects malformed cron", async () => {
