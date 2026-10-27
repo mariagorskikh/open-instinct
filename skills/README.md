@@ -27,6 +27,7 @@ skills/
   maritime-computer/SKILL.md
   maritime/SKILL.md
   web-apps/SKILL.md
+  nandaindex/SKILL.md
 ```
 
 One directory per skill, named like the skill. The file is always `SKILL.md`.
