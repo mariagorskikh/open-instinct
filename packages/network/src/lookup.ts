@@ -15,10 +15,10 @@ function looksLikePhone(s: string): boolean {
   return digits.length >= 7 && /^[+\d\s().-]+$/.test(s);
 }
 
-/** Same rule as core's normalizePhone: digits only, `+` prefix, US country code for 10 digits. */
+/** Same rule as core's normalizePhone: digits only, `+` prefix, US country code for 10 digits without a `+`. */
 export function phoneKey(s: string): string {
   const digits = s.replace(/\D/g, "");
-  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 10 && !s.trim().startsWith("+")) return `+1${digits}`;
   return `+${digits}`;
 }
 

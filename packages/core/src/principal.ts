@@ -18,11 +18,14 @@ import type { ContactStore } from "./contacts.js";
 import { TIER_ORDER } from "./types.js";
 import type { Contact, InboundMessage, InstinctConfig, Principal, Tier } from "./types.js";
 
-/** Digits only, E.164 with a leading `+`. Ten digits are assumed to be US numbers. */
+/**
+ * Digits only, E.164 with a leading `+`. Ten digits without a `+` are assumed to be US numbers;
+ * a number written with `+` already has its country code (+47 91234567 is ten digits too).
+ */
 export function normalizePhone(s: string): string {
   const digits = (s ?? "").replace(/\D/g, "");
   if (!digits) return "";
-  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 10 && !(s ?? "").trim().startsWith("+")) return `+1${digits}`;
   return `+${digits}`;
 }
 

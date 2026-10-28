@@ -17,6 +17,8 @@ describe("validateSignup", () => {
   it("requires E.164 and the handle charset", () => {
     expect(normalizePhone("+44 20 7946 0958")).toBe("+442079460958");
     expect(normalizePhone("1 415 555 0123")).toBe("+14155550123");
+    expect(normalizePhone("415 555 0123")).toBe("+14155550123");
+    expect(normalizePhone("+47 91 23 45 67")).toBe("+4791234567");
     expect(normalizePhone("")).toBe("");
     expect(normalizeHandle("  @@Sam_Lee ")).toBe("sam_lee");
     expect(validateSignup({ name: "S", phone: "+14155550123", handle: "sam_lee" }).ok).toBe(false);

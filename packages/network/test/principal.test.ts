@@ -61,6 +61,7 @@ describe("lookupContact", () => {
     expect(slugify("  Priya  Patel-O'Neil ")).toBe("priya-patel-o-neil");
     expect(phoneKey("(617) 555-0101")).toBe("+16175550101");
     expect(phoneKey("+44 20 7946 0958")).toBe("+442079460958");
+    expect(phoneKey("+47 91 23 45 67")).toBe("+4791234567");
   });
 });
 
