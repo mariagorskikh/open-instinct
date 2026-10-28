@@ -15,10 +15,10 @@ export type SignupValidation =
   | { ok: true; value: SignupValue }
   | { ok: false; errors: Record<string, string> };
 
-/** Digits only; a bare 10-digit number is read as US, an 11-digit number starting with 1 gets a plus. */
+/** Digits only; a bare 10-digit number (no `+`) is read as US, an 11-digit number starting with 1 gets a plus. */
 export function normalizePhone(raw: string): string {
   const digits = raw.replace(/[^\d]/g, "");
-  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 10 && !raw.trim().startsWith("+")) return `+1${digits}`;
   if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
   return digits ? `+${digits}` : "";
 }

@@ -14,6 +14,13 @@ describe("normalizePhone", () => {
     expect(normalizePhone("")).toBe("");
     expect(normalizePhone("abc")).toBe("");
   });
+
+  it("never adds +1 to a number that already has a country code", () => {
+    // Ten digits including the country code: Norway, Denmark and Singapore mobiles.
+    expect(normalizePhone("+47 91 23 45 67")).toBe("+4791234567");
+    expect(normalizePhone("+45 21 23 45 67")).toBe("+4521234567");
+    expect(normalizePhone(" +65 9123 4567")).toBe("+6591234567");
+  });
 });
 
 describe("normalizeHandle", () => {
@@ -33,6 +40,12 @@ describe("resolvePrincipal", () => {
     store.upsert({ name: "Alex Kim", tier: "friend", emails: ["alex@example.com"] });
     return store;
   }
+
+  it("does not take a ten-digit international sender for the US owner with the same digits", () => {
+    // The owner is +1 617 555 0100; +61 755 50100 has the same ten digits after its own country code.
+    const p = resolvePrincipal(inbound({ channel: "sms", from: "+6175550100" }), config, contacts());
+    expect(p.kind).not.toBe("owner");
+  });
 
   it("recognises the owner by phone in any formatting and on local channels", () => {
     const c = contacts();
