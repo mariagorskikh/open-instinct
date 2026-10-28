@@ -102,6 +102,49 @@ describe("relayEvent", () => {
     expect(d2.deps.dedupe.size).toBe(0);
   });
 
+  it("waits for a short Retry-After before retrying Maritime", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const d = deps();
+    const relayDeps = {
+      ...d.deps,
+      fetchImpl: (async () => {
+        calls++;
+        return calls === 1
+          ? new Response("{}", { status: 429, headers: { "Retry-After": "2" } })
+          : new Response(JSON.stringify({ response: "ok" }));
+      }) as typeof fetch,
+      retry: { sleep: async (ms: number) => { waits.push(ms); } },
+    };
+    const user = readyUser();
+    const raw = Buffer.from(JSON.stringify(imessageEvent("evt_short_retry")));
+    expect(await relayEvent(user, raw, signHeaders(raw, user.signingKey), relayDeps)).toEqual({ status: "forwarded" });
+    expect(calls).toBe(2);
+    expect(waits).toEqual([2000]);
+  });
+
+  it("returns a long Retry-After for the durable inbox without making another request", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const d = deps();
+    const relayDeps = {
+      ...d.deps,
+      fetchImpl: (async () => {
+        calls++;
+        return new Response("{}", { status: 503, headers: { "Retry-After": "30" } });
+      }) as typeof fetch,
+      retry: { sleep: async (ms: number) => { waits.push(ms); } },
+    };
+    const user = readyUser();
+    const raw = Buffer.from(JSON.stringify(imessageEvent("evt_long_retry")));
+    expect(await relayEvent(user, raw, signHeaders(raw, user.signingKey), relayDeps)).toEqual({
+      status: "rejected", reason: "maritime 503", retryAfterMs: 30_000,
+    });
+    expect(calls).toBe(1);
+    expect(waits).toEqual([]);
+    expect(d.deps.dedupe.size).toBe(0);
+  });
+
   it("treats a Maritime delivery error body as transient", async () => {
     const d = deps();
     d.mar.queue.push({ body: { response: null, error: "agent not reachable" } });

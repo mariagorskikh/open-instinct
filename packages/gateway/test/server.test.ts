@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { decodeEvent } from "@open-instinct/core";
 import { silentLogger } from "../src/logger.js";
@@ -22,6 +24,7 @@ interface BootOpts {
   notifyExisting?: GatewayOptions["notifyExisting"];
   seed?: UserRecord[];
   now?: () => number;
+  fetchImpl?: typeof fetch;
 }
 
 async function boot(opts: BootOpts = {}) {
@@ -36,7 +39,7 @@ async function boot(opts: BootOpts = {}) {
     maritime: { apiKey: "mk_test", baseUrl: "https://maritime.test", agentImage: "img:1" },
     signupSecret: opts.signupSecret,
     logger: silentLogger,
-    fetchImpl: mar.fetch,
+    fetchImpl: opts.fetchImpl ?? mar.fetch,
     routerInfoFor: opts.routerInfoFor,
     signupLimits: opts.signupLimits,
     trustProxy: opts.trustProxy,
@@ -430,6 +433,50 @@ describe("gateway http", () => {
     const early = await fetch(`${base}/oauth/link/callback/usr_new?code=ac&state=st`);
     expect(early.status).toBe(502);
     expect(await early.text()).toContain("Not connected");
+  });
+
+  it("persists a long Retry-After for a Link OAuth callback before showing the done page", async () => {
+    let calls = 0;
+    const now = 1_700_000_000_000;
+    const fetchImpl = (async () => {
+      calls++;
+      return new Response("{}", { status: 429, headers: { "Retry-After": "30" } });
+    }) as typeof fetch;
+    const { base, store, server } = await boot({ now: () => now, fetchImpl });
+    store.save(readyUser({ id: "usr_link_delayed" }));
+
+    const res = await fetch(`${base}/oauth/link/callback/usr_link_delayed?code=ac_delayed&state=st_delayed`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Go back to your messages");
+    const receipt = JSON.parse(readFileSync(join(store.dir, "webhook-inbox.json"), "utf8")).receipts[0];
+    expect(receipt).toMatchObject({ status: "queued", attempts: 0, nextAttemptAt: now + 30_000 });
+    expect(receipt.payload).toMatchObject({
+      kind: "gateway", userId: "usr_link_delayed", conversationId: "link:usr_link_delayed",
+      event: { type: "link.oauth_callback", code: "ac_delayed", state: "st_delayed" },
+    });
+    expect(calls).toBe(1);
+
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const replayed: Array<{ message: string; conversation_id: string }> = [];
+    const restarted = createGateway({
+      store, publicUrl: "https://gw.example.com", logger: silentLogger,
+      maritime: { apiKey: "mk_test", baseUrl: "https://maritime.test", agentImage: "img:1" },
+      now: () => now + 30_000,
+      fetchImpl: (async (_input, init) => {
+        replayed.push(JSON.parse(String(init?.body)) as { message: string; conversation_id: string });
+        return new Response(JSON.stringify({ response: "ok" }));
+      }) as typeof fetch,
+    });
+    servers.push(restarted);
+    await new Promise<void>((resolve) => restarted.listen(0, "127.0.0.1", () => resolve()));
+    const savedReceipt = () => JSON.parse(readFileSync(join(store.dir, "webhook-inbox.json"), "utf8")).receipts[0];
+    await waitFor(() => savedReceipt().status === "done");
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0]?.conversation_id).toBe("link:usr_link_delayed");
+    expect(decodeEvent(replayed[0]!.message)).toMatchObject({ type: "link.oauth_callback", code: "ac_delayed" });
+    const completed = savedReceipt();
+    expect(completed.status).toBe("done");
+    expect(completed.payload).toBeUndefined();
   });
 
   it("returns json 404 for unknown routes and html 404 for unknown connect ids", async () => {

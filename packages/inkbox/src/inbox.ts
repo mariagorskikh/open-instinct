@@ -22,6 +22,14 @@ export interface DurableInboxOptions<T> {
   onError?(id: string, status: "queued" | "uncertain"): void;
 }
 
+/** Ask the durable inbox to wait at least this long before trying the receipt again. */
+export class RetryAfterError extends Error {
+  constructor(message: string, readonly retryAfterMs: number) {
+    super(message);
+    this.name = "RetryAfterError";
+  }
+}
+
 /** Single-process receipt store. Admission reaches disk before the caller acknowledges. */
 export class DurableInbox<T> {
   private readonly rows: Map<string, Receipt<T>>;
@@ -42,19 +50,23 @@ export class DurableInbox<T> {
     }));
   }
 
-  enqueue(id: string, payload: T): boolean {
+  enqueue(id: string, payload: T, delayMs = 0): boolean {
     if (this.closed) throw new Error("Webhook inbox is closed");
     if (this.rows.has(id)) return false;
     if (!id) throw new Error("Webhook event id is required");
+    if (!Number.isFinite(delayMs) || delayMs < 0) throw new Error("Webhook retry delay must be non-negative and finite");
     const pending = [...this.rows.values()].filter((row) => row.status !== "done").length;
     if (pending >= (this.opts.maxPending ?? 5000)) throw new Error("Webhook inbox is full");
-    this.rows.set(id, { id, payload: structuredClone(payload), status: "queued", attempts: 0, nextAttemptAt: this.now() });
+    this.rows.set(id, { id, payload: structuredClone(payload), status: "queued", attempts: 0, nextAttemptAt: this.now() + delayMs });
     try {
       this.persist();
     } catch (err) {
       this.rows.delete(id);
       throw err;
     }
+    // A new receipt may be due before the timer for an older, delayed receipt.
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
     this.schedule();
     return true;
   }
@@ -135,7 +147,10 @@ export class DurableInbox<T> {
       // An interrupted model turn or an unrecorded outcome is not safe to execute again.
       row.status = executed || (err instanceof Error && err.name === "InboundUncertainError") ? "uncertain" : "queued";
       row.payload = payload;
-      row.nextAttemptAt = this.now() + Math.min(300_000, (this.opts.retryMs ?? 5000) * 2 ** Math.min(row.attempts - 1, 6));
+      const backoff = Math.min(300_000, (this.opts.retryMs ?? 5000) * 2 ** Math.min(row.attempts - 1, 6));
+      const requested = err instanceof RetryAfterError && Number.isFinite(err.retryAfterMs) && err.retryAfterMs >= 0
+        ? err.retryAfterMs : 0;
+      row.nextAttemptAt = this.now() + Math.max(backoff, requested);
       try { this.persist(); } catch { /* Leave the last durable admission for restart recovery. */ }
       this.opts.onError?.(row.id, row.status);
     }

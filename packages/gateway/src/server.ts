@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import type { InkboxProvisioner } from "@open-instinct/inkbox";
-import { DurableInbox } from "@open-instinct/inkbox";
+import { DurableInbox, RetryAfterError } from "@open-instinct/inkbox";
 import { join } from "node:path";
 import { type SignupLimits, SlidingWindowLimiter, clientAddress, pendingCount, signupLimits } from "./limits.js";
 import { type Logger, consoleLogger } from "./logger.js";
@@ -114,6 +115,9 @@ function send(res: ServerResponse, status: number, type: string, body: string | 
 const json = (res: ServerResponse, status: number, value: unknown) => send(res, status, JSON_TYPE, JSON.stringify(value));
 const html = (res: ServerResponse, status: number, page: string) => send(res, status, HTML_TYPE, page);
 
+type InboxPayload = { userId: string; identityId: string; event: Record<string, unknown> } &
+  ({ kind?: "webhook" } | { kind: "gateway"; conversationId: string });
+
 function parseBody(raw: Buffer, contentType: string | undefined): Record<string, unknown> {
   const text = raw.toString("utf8");
   if (!text.trim()) return {};
@@ -150,19 +154,26 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     dedupe,
     ...(opts.checkAgentStatus !== undefined ? { checkAgentStatus: opts.checkAgentStatus } : {}),
   };
-  const inbox = new DurableInbox<{ userId: string; identityId: string; event: Record<string, unknown> }>({
+  const inbox = new DurableInbox<InboxPayload>({
     file: join(opts.store.dir, "webhook-inbox.json"),
+    now,
     replayRunning: true,
-    handle: async ({ userId, identityId, event }) => {
-      const user = opts.store.get(userId);
-      if (!user || user.identityId !== identityId) {
+    handle: async (payload) => {
+      const user = opts.store.get(payload.userId);
+      if (!user || user.identityId !== payload.identityId) {
         const error = new Error("Webhook identity is no longer assigned to this user");
         error.name = "InboundUncertainError";
         throw error;
       }
       if (!user.maritimeAgentId) throw new Error("Agent is not ready");
-      const result = await relayVerifiedEvent(user, event, relayDeps);
-      if (result.status === "rejected") throw new Error(result.reason ?? "Forwarding failed");
+      const result = payload.kind === "gateway"
+        ? await relayGatewayEvent(user, payload.event, payload.conversationId, relayDeps)
+        : await relayVerifiedEvent(user, payload.event, relayDeps);
+      if (result.status === "rejected") {
+        const reason = result.reason ?? "Forwarding failed";
+        if (result.retryAfterMs !== undefined) throw new RetryAfterError(reason, result.retryAfterMs);
+        throw new Error(reason);
+      }
     },
     onError: (id, status) => log.warn("relay.pending", { id, status }),
   });
@@ -376,6 +387,14 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     const event: Record<string, unknown> = { type: "link.oauth_callback", code, state, receivedAt: new Date(now()).toISOString() };
     if (error) event["error"] = error;
     const result = await relayGatewayEvent(user, event, `link:${user.id}`, relayDeps);
+    if (result.retryAfterMs !== undefined) {
+      const digest = createHash("sha256").update(JSON.stringify([user.id, code, state, error])).digest("hex");
+      inbox.enqueue(`link:${user.id}:${digest}`, {
+        kind: "gateway", userId: user.id, identityId: user.identityId, event, conversationId: `link:${user.id}`,
+      }, result.retryAfterMs);
+      log.info("link.callback", { userId: user.id, status: "queued", reason: result.reason });
+      return html(res, 200, linkDone(true));
+    }
     log.info("link.callback", { userId: user.id, status: result.status, reason: result.reason });
     return html(res, result.status === "forwarded" ? 200 : 502, linkDone(result.status === "forwarded"));
   }
@@ -433,7 +452,7 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     route(req, res).catch((err: unknown) => {
       const status = err instanceof HttpError ? err.status : 500;
       const message = err instanceof HttpError ? err.message : "internal error";
-      if (status >= 500) log.error("request.failed", { path: req.url, error: err instanceof Error ? err.message : String(err) });
+      if (status >= 500) log.error("request.failed", { path: req.url?.split("?")[0], error: err instanceof Error ? err.message : String(err) });
       if (res.headersSent) return res.end();
       json(res, status, { error: message });
     });

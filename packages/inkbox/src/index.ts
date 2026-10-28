@@ -16,5 +16,5 @@ export { messagingTools, sendFileTool, phoneCallTool, resolveTarget, resolveFile
 export type { MessagingDeps, SendFileDeps, PhoneCallDeps, ResolvedTarget, ResolvedFile } from "./tools.js";
 export { InkboxHttpError, createRest, parseRetryAfter, isHttpStatus, INKBOX_BASE_URL } from "./http.js";
 export type { RestClient, RestOptions } from "./http.js";
-export { DurableInbox } from "./inbox.js";
+export { DurableInbox, RetryAfterError } from "./inbox.js";
 export type { DurableInboxOptions } from "./inbox.js";

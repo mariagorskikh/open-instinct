@@ -9,8 +9,8 @@ import { fakeMaritime, imessageEvent, readyUser, signHeaders, tempDir } from "./
 
 const servers: ReturnType<typeof createGateway>[] = [];
 afterEach(async () => { await Promise.all(servers.splice(0).map((s) => new Promise<void>((r) => s.close(() => r())))); });
-async function serve(store: UserStore, fetchImpl: typeof fetch) {
-  const server = createGateway({ store, fetchImpl, logger: silentLogger, publicUrl: "https://gateway.example.com", maritime: { apiKey: "test", agentImage: "test" } });
+async function serve(store: UserStore, fetchImpl: typeof fetch, now?: () => number) {
+  const server = createGateway({ store, fetchImpl, now, logger: silentLogger, publicUrl: "https://gateway.example.com", maritime: { apiKey: "test", agentImage: "test" } });
   servers.push(server);
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -30,6 +30,27 @@ describe("webhook recovery", () => {
     await vi.waitFor(() => expect(calls).toBe(3), { timeout: 4000 });
     await vi.waitFor(() => expect(receipts()[0].status).toBe("queued"));
     expect(receipts()[0].payload.event.id).toBe("evt_1");
+  });
+
+  it("saves Maritime's long Retry-After on the webhook receipt", async () => {
+    const store = new UserStore(tempDir());
+    const user = store.save(readyUser());
+    let calls = 0;
+    const sentAt = 1_700_000_000_000;
+    const base = await serve(store, async () => {
+      calls++;
+      return new Response("{}", { status: 429, headers: { "Retry-After": "30" } });
+    }, () => sentAt);
+    const raw = JSON.stringify(imessageEvent("evt_rate_limited"));
+    const res = await fetch(`${base}/webhooks/inkbox/${user.id}`, {
+      method: "POST", body: raw, headers: signHeaders(raw, user.signingKey),
+    });
+    expect(res.status).toBe(204);
+    const receipt = () => JSON.parse(readFileSync(join(store.dir, "webhook-inbox.json"), "utf8")).receipts[0];
+    await vi.waitFor(() => expect(receipt()).toMatchObject({ status: "queued", attempts: 1 }));
+    expect(receipt().payload.event.id).toBe("evt_rate_limited");
+    expect(receipt().nextAttemptAt).toBe(sentAt + 30_000);
+    expect(calls).toBe(1);
   });
 
   it("replays stored admission after restart without rechecking expired request headers", async () => {

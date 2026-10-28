@@ -1,5 +1,5 @@
 import { encodeEvent } from "@open-instinct/core";
-import { verifyInkboxSignature } from "@open-instinct/inkbox";
+import { parseRetryAfter, verifyInkboxSignature } from "@open-instinct/inkbox";
 import { type Logger, silentLogger } from "./logger.js";
 import { DEFAULT_MARITIME_BASE_URL } from "./provision.js";
 import type { UserRecord } from "./store.js";
@@ -9,6 +9,7 @@ export type HeaderMap = Record<string, string | string[] | undefined>;
 export interface RelayResult {
   status: "forwarded" | "ignored" | "rejected";
   reason?: string;
+  retryAfterMs?: number;
 }
 
 export interface RelayDeps {
@@ -102,6 +103,7 @@ export function conversationIdOf(payload: Json): string {
 }
 
 const RETRY_STATUSES = new Set([429, 502, 503, 504]);
+const MAX_INLINE_RETRY_AFTER_MS = 5000;
 
 export async function relayEvent(user: UserRecord, rawBody: Buffer, headers: HeaderMap, deps: RelayDeps): Promise<RelayResult> {
   const log = deps.logger ?? silentLogger;
@@ -212,6 +214,7 @@ async function postChat(agentId: string, body: { message: string; conversation_i
   let lastReason = "unknown";
 
   for (let i = 0; i < attempts; i++) {
+    let retryAfterMs = 0;
     try {
       const res = await f(url, {
         method: "POST",
@@ -231,13 +234,23 @@ async function postChat(agentId: string, body: { message: string; conversation_i
         lastReason = err ? `maritime: ${err}` : "maritime: accepted without a response (agent not running?)";
       } else if (RETRY_STATUSES.has(res.status)) {
         lastReason = `maritime ${res.status}`;
+        const retryAfterSeconds = parseRetryAfter(res.headers.get("Retry-After"));
+        if (retryAfterSeconds !== null && Number.isFinite(retryAfterSeconds)) {
+          const requestedMs = retryAfterSeconds * 1000;
+          if (Number.isFinite(requestedMs)) {
+            retryAfterMs = requestedMs;
+            if (retryAfterMs > MAX_INLINE_RETRY_AFTER_MS) {
+              return { status: "rejected", reason: lastReason, retryAfterMs };
+            }
+          }
+        }
       } else {
         return { status: "rejected", reason: `maritime ${res.status}` };
       }
     } catch (err) {
       lastReason = `network: ${err instanceof Error ? err.message : String(err)}`;
     }
-    if (i < attempts - 1) await sleep(backoff[Math.min(i, backoff.length - 1)] ?? 500);
+    if (i < attempts - 1) await sleep(Math.max(backoff[Math.min(i, backoff.length - 1)] ?? 500, retryAfterMs));
   }
   return { status: "rejected", reason: `${lastReason} after ${attempts} attempts` };
 }

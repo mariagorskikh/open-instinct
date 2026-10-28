@@ -180,6 +180,8 @@ the receiving agent deduplicates it. On the agent, failures before model admissi
 retryable; an interrupted admitted turn with an uncertain outcome is recorded as
 `uncertain`, not blindly replayed. Back up the receipt file with the rest of the agent
 state. It is a single-process store, not a shared queue for multiple replicas.
+If a handler throws `new RetryAfterError(message, delayMs)`, the inbox persists a next
+attempt time at least `delayMs` away while still applying its normal backoff.
 
 ## Sending
 
