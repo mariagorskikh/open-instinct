@@ -24,7 +24,9 @@ assumption in the brief.
    calendar data, memory or secrets in the task.
 2. Otherwise, `web_search` with 2 or 3 differently worded queries. Prefer primary sources:
    the company's own page, the paper, the filing, the official docs.
+   `keenable_search` is also available when it is turned on.
 3. Use `web_fetch` for a source that still needs closer reading.
+   `keenable_fetch` is also available when it is turned on.
 4. Use the desktop (skill `maritime-computer`) only when fetch fails: heavy
    JavaScript, maps, PDFs that need a viewer, interactive comparisons. Do not
    log in to anything for research; if a source needs a login, say so.

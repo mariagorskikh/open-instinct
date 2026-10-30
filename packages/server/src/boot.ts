@@ -37,6 +37,7 @@ import { ComposioApps, DEFAULT_TOOLKITS, OPENAI_COMPLETIONS_TOOL_LIMIT, appsGuid
 import { ampleTools, type AmpleCredentials } from "@open-instinct/ample";
 import { AtomicMailBackend, atomicMailGuidance } from "@open-instinct/atomicmail";
 import { contextTools } from "@open-instinct/context";
+import { keenableTools } from "@open-instinct/keenable";
 import { networkTools } from "@open-instinct/network";
 import { ChatAwareOutbox, ConsoleOutbox, type ChatReplyBuffer } from "./console-outbox.js";
 import { fileTools, resolveInsideWorkspace } from "./file-tools.js";
@@ -190,6 +191,17 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     registry.registerMany(
       contextTools({
         apiKey: env.CONTEXT_DEV_API_KEY,
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      }),
+    );
+  }
+
+  // Keenable works without a key, so it needs its own switch; a key also turns it on.
+  // The switch takes what the gateway takes (1, true, yes): `instinct deploy` forwards it as written.
+  if (/^(1|true|yes)$/i.test(env.KEENABLE_SEARCH?.trim() ?? "") || env.KEENABLE_API_KEY) {
+    registry.registerMany(
+      keenableTools({
+        ...(env.KEENABLE_API_KEY ? { apiKey: env.KEENABLE_API_KEY } : {}),
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       }),
     );

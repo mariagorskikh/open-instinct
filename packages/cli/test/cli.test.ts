@@ -353,6 +353,8 @@ describe("deploy", () => {
       INSTINCT_DATA_DIR: dir,
       ANTHROPIC_API_KEY: "sk-ant-x",
       CONTEXT_DEV_API_KEY: "ctxt_secret_test",
+      KEENABLE_SEARCH: "1",
+      KEENABLE_API_KEY: "keenable_test",
       AMPLE_CLIENT_ID: "agent_test",
       AMPLE_CLIENT_SECRET: "ample_agent_secret_test",
       COMPOSIO_MODE: "router",
@@ -373,6 +375,8 @@ describe("deploy", () => {
     expect(vars.INKBOX_API_KEY).toEqual({ key: "INKBOX_API_KEY", value: "<redacted>", isSecret: true });
     expect(vars.ANTHROPIC_API_KEY.value).toBe("<redacted>");
     expect(vars.CONTEXT_DEV_API_KEY.value).toBe("<redacted>");
+    expect(vars.KEENABLE_SEARCH).toEqual({ key: "KEENABLE_SEARCH", value: "1", isSecret: false });
+    expect(vars.KEENABLE_API_KEY.value).toBe("<redacted>");
     expect(vars.AMPLE_CLIENT_ID).toEqual({ key: "AMPLE_CLIENT_ID", value: "agent_test", isSecret: false });
     expect(vars.AMPLE_CLIENT_SECRET.value).toBe("<redacted>");
     expect(vars.AMPLE_TOKEN).toBeUndefined();

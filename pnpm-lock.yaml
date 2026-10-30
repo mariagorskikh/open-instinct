@@ -245,6 +245,25 @@ importers:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@22.20.5)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0)
 
+  packages/keenable:
+    dependencies:
+      '@open-instinct/core':
+        specifier: workspace:*
+        version: link:../core
+      typebox:
+        specifier: 1.3.27
+        version: 1.3.27
+    devDependencies:
+      '@types/node':
+        specifier: ^22.15.0
+        version: 22.20.5
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@22.20.5)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0)
+
   packages/network:
     dependencies:
       '@open-instinct/core':
@@ -324,6 +343,9 @@ importers:
       '@open-instinct/inkbox':
         specifier: workspace:*
         version: link:../inkbox
+      '@open-instinct/keenable':
+        specifier: workspace:*
+        version: link:../keenable
       '@open-instinct/network':
         specifier: workspace:*
         version: link:../network

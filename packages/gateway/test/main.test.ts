@@ -57,8 +57,16 @@ describe("Ample for every agent", () => {
     expect(agentExtraEnv(cfg)).toEqual({ COMPOSIO_MODE: "router" });
   });
 
+  it("forwards the Keenable switch and key so every agent can use keenable_search", () => {
+    const cfg = readEnv({ MARITIME_API_KEY: "mk", KEENABLE_SEARCH: "true", KEENABLE_API_KEY: "keenable_test" });
+    expect(cfg.keenableSearch).toBe(true);
+    expect(agentExtraEnv(cfg)).toEqual({ KEENABLE_SEARCH: "1", KEENABLE_API_KEY: "keenable_test" });
+    expect(agentExtraEnv(readEnv({ MARITIME_API_KEY: "mk", KEENABLE_SEARCH: "1" }))).toEqual({ KEENABLE_SEARCH: "1" });
+  });
+
   it("sends nothing extra when neither Context.dev nor Ample is on", () => {
     const cfg = readEnv({ MARITIME_API_KEY: "mk" });
+    expect(cfg.keenableSearch).toBe(false);
     expect(cfg.ampleSignup).toBe(false);
     expect(cfg.ampleSharedCredential).toBe(false);
     expect(agentExtraEnv(cfg)).toBeUndefined();

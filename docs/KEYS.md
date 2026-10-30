@@ -123,6 +123,7 @@ the screen at checkout instead of paying.
 |---|---|---|
 | `BRAVE_SEARCH_API_KEY` | Better web search than the DuckDuckGo fallback | [brave.com/search/api](https://brave.com/search/api/) |
 | `CONTEXT_DEV_API_KEY` | Sourced answers and public page research through `context_answers` | [context.dev](https://context.dev) |
+| `KEENABLE_SEARCH=1`, or `KEENABLE_API_KEY` | Web search with page text and pages as markdown through `keenable_search` and `keenable_fetch`. `KEENABLE_SEARCH=1` needs no key; a key lifts the rate limits ([KEENABLE.md](KEENABLE.md)) | [app.keenable.ai](https://app.keenable.ai/console) |
 | `AMPLE_SIGNUP=1`, or `AMPLE_CLIENT_ID` and `AMPLE_CLIENT_SECRET` | Web apps the agent builds, deployed to public URLs through `ample_deploy`. `AMPLE_SIGNUP=1` needs no key: each agent signs up for its own account ([AMPLE.md](AMPLE.md)) | [ample.computer](https://ample.computer), `ample auth signup` |
 | `INKBOX_VOICE` | The Voice AI voice `phone_call` speaks with (a voice id from the Inkbox console's voice list). Unset: the organization's default voice ([INKBOX.md](INKBOX.md#phone-calls)) | Inkbox console |
 | `INKBOX_CALL_ORIGINATION` | Which line `phone_call` dials from: `dedicated_number`, `shared_imessage_number` or `dedicated_imessage_number`. Unset: the identity's iMessage line | you choose it |

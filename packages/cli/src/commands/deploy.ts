@@ -95,6 +95,8 @@ export function buildCreateBody(input: DeployInput): CreateAgentBody {
   pushVar(vars, "COMPOSIO_MODE", env.COMPOSIO_MODE, false);
   pushVar(vars, "BRAVE_SEARCH_API_KEY", env.BRAVE_SEARCH_API_KEY, true);
   pushVar(vars, "CONTEXT_DEV_API_KEY", env.CONTEXT_DEV_API_KEY, true);
+  pushVar(vars, "KEENABLE_SEARCH", env.KEENABLE_SEARCH, false);
+  pushVar(vars, "KEENABLE_API_KEY", env.KEENABLE_API_KEY, true);
   pushVar(vars, "AMPLE_CLIENT_ID", env.AMPLE_CLIENT_ID, false);
   pushVar(vars, "AMPLE_CLIENT_SECRET", env.AMPLE_CLIENT_SECRET, true);
   pushVar(vars, "AMPLE_TOKEN", env.AMPLE_TOKEN, true);
