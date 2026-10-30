@@ -31,7 +31,7 @@ export const promptOptions: OptionSpec = {
   "no-skills": { type: "boolean" },
 };
 
-const CHANNELS: ReadonlySet<string> = new Set(["imessage", "sms", "email", "a2a", "chat", "scheduled", "system"]);
+const CHANNELS: ReadonlySet<string> = new Set(["imessage", "sms", "whatsapp", "email", "a2a", "chat", "scheduled", "system"]);
 
 /** Tool groups every owner conversation has; messaging, computer and apps depend on keys. */
 export const SAMPLE_OWNER_TOOL_GROUPS = ["owner", "memory", "schedule", "web", "files", "contacts", "network"];

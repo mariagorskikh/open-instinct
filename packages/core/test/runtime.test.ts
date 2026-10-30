@@ -1655,6 +1655,16 @@ describe("runScheduled", () => {
     expect(h.sent.at(-1)?.msg.to).toBeUndefined();
   });
 
+  it("follows the owner to WhatsApp: replies there as the owner, and later notices go there after a restart", async () => {
+    const h = harness();
+    h.faux.setResponses([textTurn("Hi Maria"), textTurn("Scheduled update.")]);
+    await h.runtime.handleInbound(inbound({ channel: "whatsapp", from: OWNER_PHONE, conversationKey: "whatsapp:16175550100@s.whatsapp.net", text: "hey" }));
+    expect(h.sent.at(-1)?.msg).toMatchObject({ channel: "whatsapp", conversationKey: "whatsapp:16175550100@s.whatsapp.net", text: "Hi Maria" });
+    expect(h.sent.at(-1)?.ctx.principal.kind).toBe("owner");
+    await new AgentRuntime(h.deps).runScheduled({ id: "wa-route", enabled: true, prompt: "update", createdAt: new Date().toISOString() });
+    expect(h.sent.at(-1)?.msg).toMatchObject({ channel: "whatsapp", conversationKey: "whatsapp:16175550100@s.whatsapp.net", text: "Scheduled update." });
+  });
+
   it("runs as the owner and texts the result to the owner's phone", async () => {
     const h = harness();
     const entry = h.deps.scheduler.create({ name: "briefing", prompt: "Summarise today", enabled: true, nextRunAt: new Date(Date.now() + 60_000).toISOString() });

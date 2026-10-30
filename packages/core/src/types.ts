@@ -131,7 +131,7 @@ export interface Contact {
 // Channels and events
 // ---------------------------------------------------------------------------
 
-export type Channel = "imessage" | "sms" | "email" | "a2a" | "chat" | "scheduled" | "system";
+export type Channel = "imessage" | "sms" | "whatsapp" | "email" | "a2a" | "chat" | "scheduled" | "system";
 
 /** A normalized inbound event, whatever the source. */
 export interface InboundMessage {

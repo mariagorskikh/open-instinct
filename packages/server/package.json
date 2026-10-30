@@ -41,7 +41,8 @@
     "@open-instinct/inkbox": "workspace:*",
     "@open-instinct/keenable": "workspace:*",
     "@open-instinct/network": "workspace:*",
-    "@open-instinct/payments": "workspace:*"
+    "@open-instinct/payments": "workspace:*",
+    "@open-instinct/whatsapp": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
