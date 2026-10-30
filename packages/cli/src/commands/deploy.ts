@@ -94,6 +94,8 @@ export function buildCreateBody(input: DeployInput): CreateAgentBody {
   pushVar(vars, "COMPOSIO_TOOLKITS", env.COMPOSIO_TOOLKITS ?? (config.apps.toolkits.length ? config.apps.toolkits.join(",") : undefined), false);
   pushVar(vars, "COMPOSIO_MODE", env.COMPOSIO_MODE, false);
   pushVar(vars, "BRAVE_SEARCH_API_KEY", env.BRAVE_SEARCH_API_KEY, true);
+  pushVar(vars, "YDC_API_KEY", env.YDC_API_KEY, true);
+  pushVar(vars, "YOU_SEARCH", env.YOU_SEARCH, false);
   pushVar(vars, "CONTEXT_DEV_API_KEY", env.CONTEXT_DEV_API_KEY, true);
   pushVar(vars, "KEENABLE_SEARCH", env.KEENABLE_SEARCH, false);
   pushVar(vars, "KEENABLE_API_KEY", env.KEENABLE_API_KEY, true);

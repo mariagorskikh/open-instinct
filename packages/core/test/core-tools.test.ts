@@ -24,7 +24,7 @@ const stubLookup = async (host: string): Promise<string[]> => {
   return ["93.184.216.34"];
 };
 
-function setup(opts: { fetchImpl?: typeof fetch; searchApiKey?: string; lookup?: (host: string) => Promise<string[]>; onApprovalSettled?: CoreToolDeps["onApprovalSettled"]; images?: CoreToolDeps["images"]; workspaceDir?: string } = {}) {
+function setup(opts: { fetchImpl?: typeof fetch; searchApiKey?: string; youSearch?: CoreToolDeps["youSearch"]; lookup?: (host: string) => Promise<string[]>; onApprovalSettled?: CoreToolDeps["onApprovalSettled"]; images?: CoreToolDeps["images"]; workspaceDir?: string } = {}) {
   const state = tempState();
   const sent: Array<{ msg: OutboundMessage; principal: Principal }> = [];
   const outbox: Outbox = { send: async (msg, ctx) => void sent.push({ msg, principal: ctx.principal }) };
@@ -375,6 +375,96 @@ describe("web tools", () => {
     expect(out).not.toContain("9. R8");
     expect(out).toContain("desc 0");
     expect(out).not.toContain("<b>");
+  });
+
+  it("web_search uses the keyless You.com endpoint when opted in without a key", async () => {
+    const web = Array.from({ length: 10 }, (_, i) => ({ title: `Y${i}`, url: `https://y${i}.test/`, description: i === 0 ? "" : `<b>d</b> ${i}`, snippets: ["first snippet"] }));
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), ...(init ? { init } : {}) });
+      return new Response(JSON.stringify({ results: { web } }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const { run, text } = setup({ fetchImpl, searchApiKey: "brave-key", youSearch: {} });
+    const out = text(await run("web_search", { query: "open instinct" }));
+    expect(calls).toHaveLength(1);
+    const url = new URL(calls[0]!.url);
+    expect(`${url.origin}${url.pathname}`).toBe("https://api.you.com/v1/agents/search");
+    expect(url.searchParams.get("query")).toBe("open instinct");
+    expect(calls[0]!.init?.method).toBeUndefined();
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers["user-agent"]).toBe("youdotcom-integration/mariagorskikh-open-instinct");
+    expect(headers["x-api-key"]).toBeUndefined();
+    expect(out).toContain("1. Y0\n   https://y0.test/\n   first snippet");
+    expect(out).toContain("8. Y7");
+    expect(out).not.toContain("9. Y8");
+    expect(out).not.toContain("<b>");
+  });
+
+  it("web_search POSTs to the keyed You.com API with X-API-Key", async () => {
+    let seen: { url: string; init?: RequestInit } | undefined;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      seen = { url: String(input), ...(init ? { init } : {}) };
+      return new Response(JSON.stringify({ results: { web: [{ title: "K", url: "https://k.test/", description: "keyed" }] } }), { status: 200 });
+    }) as typeof fetch;
+    const { run, text } = setup({ fetchImpl, youSearch: { apiKey: "ydc-key" } });
+    const out = text(await run("web_search", { query: "q" }));
+    expect(seen?.url).toBe("https://ydc-index.io/v1/search");
+    expect(seen?.init?.method).toBe("POST");
+    expect((seen?.init?.headers as Record<string, string>)["x-api-key"]).toBe("ydc-key");
+    expect(JSON.parse(String(seen?.init?.body))).toEqual({ query: "q", count: 8 });
+    expect(out).toContain("1. K");
+  });
+
+  it("web_search explains You.com auth, quota and rate limit errors", async () => {
+    for (const [status, message] of [
+      [401, "YDC_API_KEY"],
+      [403, "YDC_API_KEY"],
+      [402, "100 searches a day per IP"],
+      [429, "retry after 3600s"],
+    ] as const) {
+      let n = 0;
+      const fetchImpl = (async () => {
+        n++;
+        return new Response("", { status, headers: { "retry-after": "3600" } });
+      }) as typeof fetch;
+      const { run } = setup({ fetchImpl, youSearch: {} });
+      await expect(run("web_search", { query: "q" })).rejects.toThrow(message);
+      expect(n).toBe(1);
+    }
+  });
+
+  it("web_search retries You.com once when Retry-After is short", async () => {
+    let n = 0;
+    const fetchImpl = (async () => {
+      n++;
+      if (n === 1) return new Response("", { status: 429, headers: { "retry-after": "0" } });
+      return new Response(JSON.stringify({ results: { web: [{ title: "Ok", url: "https://ok.test/" }] } }), { status: 200 });
+    }) as typeof fetch;
+    const { run, text } = setup({ fetchImpl, youSearch: {} });
+    expect(text(await run("web_search", { query: "q" }))).toContain("1. Ok");
+    expect(n).toBe(2);
+  });
+
+  it("web_search keeps the second Retry-After when the You.com retry is also rate limited", async () => {
+    let n = 0;
+    const fetchImpl = (async () => {
+      n++;
+      return new Response("", { status: 429, headers: { "retry-after": n === 1 ? "0" : "120" } });
+    }) as typeof fetch;
+    const { run } = setup({ fetchImpl, youSearch: {} });
+    await expect(run("web_search", { query: "q" })).rejects.toThrow("retry after 120s");
+    expect(n).toBe(2);
+  });
+
+  it("web_search gives a keyed You.com 402 its own message", async () => {
+    const fetchImpl = (async () => new Response("", { status: 402 })) as typeof fetch;
+    const { run } = setup({ fetchImpl, youSearch: { apiKey: "ydc-key" } });
+    const err = await run("web_search", { query: "q" }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err?.message).toContain("this API key");
+    expect(err?.message).not.toContain("set YDC_API_KEY");
   });
 
   it("reports no results instead of failing", async () => {

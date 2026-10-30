@@ -28,6 +28,8 @@ export interface CoreToolDeps {
   /** DNS lookup used to vet web_fetch targets; tests inject a stub. */
   lookup?: Lookup;
   searchApiKey?: string;
+  /** Opt-in You.com web search. With apiKey it calls the keyed API; without it, the keyless free tier (100 searches a day per IP). */
+  youSearch?: { apiKey?: string };
   /** The owner's workspace directory. create_pdf writes under it; without it the tool refuses. */
   workspaceDir?: string;
   /** Called after approval_settle resolves an approval, so the runtime can wake the conversation that was waiting. */
@@ -415,7 +417,7 @@ interface SearchHit {
   snippet: string;
 }
 
-function webSearchTool({ fetchImpl, searchApiKey }: CoreToolDeps): RegisteredTool {
+function webSearchTool({ fetchImpl, searchApiKey, youSearch }: CoreToolDeps): RegisteredTool {
   const doFetch = fetchImpl ?? fetch;
   return defineTool({
     name: "web_search",
@@ -424,7 +426,11 @@ function webSearchTool({ fetchImpl, searchApiKey }: CoreToolDeps): RegisteredToo
     parameters: Type.Object({ query: Type.String() }),
     meta: { capabilities: ["web.read"], group: "web", describe: (a) => `search ${argText(a, "query")}` },
     execute: async ({ query }, _ctx, signal) => {
-      const hits = searchApiKey ? await braveSearch(doFetch, searchApiKey, query, signal) : await duckDuckGoSearch(doFetch, query, signal);
+      const hits = youSearch
+        ? await youComSearch(doFetch, youSearch.apiKey, query, signal)
+        : searchApiKey
+          ? await braveSearch(doFetch, searchApiKey, query, signal)
+          : await duckDuckGoSearch(doFetch, query, signal);
       if (hits.length === 0) return textResult(`No results for "${query}".`);
       const lines = hits.map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}${h.snippet ? `\n   ${h.snippet}` : ""}`);
       return textResult(wrapUntrusted(lines.join("\n"), `web search results for ${query}`));
@@ -446,6 +452,57 @@ async function braveSearch(doFetch: typeof fetch, key: string, query: string, si
     .filter((r) => r.url)
     .slice(0, SEARCH_RESULTS)
     .map((r) => ({ title: r.title ?? r.url!, url: r.url!, snippet: htmlToText(r.description ?? "") }));
+}
+
+export const YOU_KEYED_URL = "https://ydc-index.io/v1/search";
+export const YOU_KEYLESS_URL = "https://api.you.com/v1/agents/search";
+const YOU_USER_AGENT = "youdotcom-integration/mariagorskikh-open-instinct";
+/** Longest Retry-After we wait out inside one tool call; anything longer fails with the wait in the message. */
+const YOU_MAX_RETRY_AFTER_S = 10;
+
+/** 429 error that keeps the server's Retry-After wait, when it sent one. */
+function youRateLimitError(res: Response): Error {
+  const wait = Number(res.headers.get("retry-after"));
+  return new Error(`You.com search is rate limited (HTTP 429)${Number.isFinite(wait) && wait > 0 ? `; retry after ${wait}s` : ""}`);
+}
+
+/** You.com search: POST with X-API-Key when keyed, GET on the keyless endpoint otherwise. Retries a 429 once if Retry-After is short. */
+async function youComSearch(doFetch: typeof fetch, key: string | undefined, query: string, signal?: AbortSignal): Promise<SearchHit[]> {
+  const send = (): Promise<Response> => {
+    const headers: Record<string, string> = { accept: "application/json", "user-agent": YOU_USER_AGENT };
+    const init: RequestInit = { signal: signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS), headers };
+    if (key) {
+      headers["x-api-key"] = key;
+      headers["content-type"] = "application/json";
+      return doFetch(YOU_KEYED_URL, { ...init, method: "POST", body: JSON.stringify({ query, count: SEARCH_RESULTS }) });
+    }
+    const url = new URL(YOU_KEYLESS_URL);
+    url.searchParams.set("query", query);
+    url.searchParams.set("count", String(SEARCH_RESULTS));
+    return doFetch(url.toString(), init);
+  };
+  let res = await send();
+  if (res.status === 429) {
+    const wait = Number(res.headers.get("retry-after"));
+    if (!Number.isFinite(wait) || wait < 0 || wait > YOU_MAX_RETRY_AFTER_S) throw youRateLimitError(res);
+    await new Promise((r) => setTimeout(r, wait * 1000));
+    res = await send();
+  }
+  if (res.status === 401 || res.status === 403) throw new Error(`You.com search rejected the API key (HTTP ${res.status}); check YDC_API_KEY`);
+  if (res.status === 402) {
+    throw new Error(
+      key
+        ? "You.com search quota is used up for this API key (HTTP 402); check the plan or credits for YDC_API_KEY"
+        : "You.com search quota is used up (HTTP 402). The keyless tier allows 100 searches a day per IP; set YDC_API_KEY for more",
+    );
+  }
+  if (res.status === 429) throw youRateLimitError(res);
+  if (!res.ok) throw new Error(`You.com search failed: HTTP ${res.status}`);
+  const data = (await res.json()) as { results?: { web?: Array<{ title?: string; url?: string; description?: string; snippets?: string[] }> } };
+  return (data.results?.web ?? [])
+    .filter((r) => r.url)
+    .slice(0, SEARCH_RESULTS)
+    .map((r) => ({ title: r.title ?? r.url!, url: r.url!, snippet: htmlToText(r.description || r.snippets?.[0] || "") }));
 }
 
 async function duckDuckGoSearch(doFetch: typeof fetch, query: string, signal?: AbortSignal): Promise<SearchHit[]> {

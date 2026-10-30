@@ -184,6 +184,8 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
         : {}),
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       ...(env.BRAVE_SEARCH_API_KEY ? { searchApiKey: env.BRAVE_SEARCH_API_KEY } : {}),
+      // Opt-in: YDC_API_KEY, or YOU_SEARCH=1 for the keyless tier. Unset keeps Brave or DuckDuckGo.
+      ...(env.YDC_API_KEY || env.YOU_SEARCH === "1" ? { youSearch: env.YDC_API_KEY ? { apiKey: env.YDC_API_KEY } : {} } : {}),
     }),
   );
 

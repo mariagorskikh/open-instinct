@@ -168,7 +168,7 @@ It depends on which services you turn on.
 | Maritime | The whole VM if you host there, including `/data` |
 | Composio | OAuth tokens for your apps and every app call the agent makes |
 | Stripe Link | Payment requests and approvals |
-| Web search | The query goes to Brave if `BRAVE_SEARCH_API_KEY` is set, else to DuckDuckGo |
+| Web search | The query goes to You.com if `YOU_SEARCH=1` or `YDC_API_KEY` is set, else to Brave if `BRAVE_SEARCH_API_KEY` is set, else to DuckDuckGo |
 
 With a local model, no Inkbox, no Maritime and no apps, nothing leaves the machine except
 web requests the agent makes on purpose.
