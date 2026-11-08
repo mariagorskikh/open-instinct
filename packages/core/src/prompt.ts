@@ -26,6 +26,8 @@ export interface PromptInput {
   pendingApprovals?: Approval[];
   /** "What is set up right now": channels, desktop, apps, payments, as the server knows them. */
   setup?: string;
+  /** Names of the tools this conversation has, so the prompt only offers hand-offs that exist. */
+  toolNames?: string[];
   extra?: string[];
 }
 
@@ -242,7 +244,7 @@ function channelSection(channel: Channel): string {
  * file and hand-off travels through the thread they are already in. Spelled out
  * because a model that does not know this invents a "settings page".
  */
-function reachSection({ principal, config, channel }: PromptInput): string {
+function reachSection({ principal, config, channel, toolNames }: PromptInput): string {
   if (channel === "system") return "";
   if (principal.kind !== "owner") {
     return [
@@ -257,7 +259,11 @@ function reachSection({ principal, config, channel }: PromptInput): string {
     `${owner} talks to you here and nowhere else. There is no app, no settings page and no account screen to send them to.`,
     "- To connect an app (Gmail, Calendar, Notion, anything): call apps_connect with the toolkit name and send the link it returns in this chat. Never tell them to \"open settings\" or \"go to the app\".",
     "- To deliver a file or a PDF: call send_file; it arrives as an iMessage or email attachment. A file path on its own is not an answer.",
-    "- When a login, 2FA, CAPTCHA or payment screen comes up on the desktop: call request_takeover and send the link it returns, with one line saying what to do there.",
+    // Only a desktop backend has request_takeover. Without it, a model told to send a takeover
+    // link promises one, then finds there is no such tool.
+    toolNames === undefined || toolNames.includes("request_takeover")
+      ? "- When a login, 2FA, CAPTCHA or payment screen comes up on the desktop: call request_takeover and send the link it returns, with one line saying what to do there."
+      : `- There is no takeover on this agent: you cannot hand a login, 2FA, CAPTCHA or payment screen to ${owner}, and you must not offer a takeover link. When one blocks a task, stop before it, say in one line which step needs ${owner} and that they do it themselves, and give them everything you prepared (the list, the basket, the exact link). Skills that mention request_takeover mean this here.`,
     "- To connect the wallet: call payment_connect and send the link.",
     "- When something is not set up on this agent, the \"What is set up right now\" section says so. Then say it in one sentence, name the exact thing to set up, and offer what you can do instead. Never guess at a screen or a setting that does not exist.",
     "- Never describe your own machinery (containers, servers, processes, tunnels). Talk about results.",
