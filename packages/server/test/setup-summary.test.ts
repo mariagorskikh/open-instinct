@@ -28,4 +28,11 @@ describe("setup summary", () => {
     expect(text).toContain("gmail");
     expect(text).not.toMatch(/settings page/i);
   });
+  it("tells a browser-only agent it cannot get past logins or take payments", () => {
+    const text = setupSummaryFor({ computerKind: "browser" });
+    expect(text).toContain("headless web browser of your own");
+    expect(text).toContain("nobody can take it over");
+    expect(text).toContain("You cannot pay for anything");
+    expect(text).not.toContain("desktop takeover");
+  });
 });

@@ -23,6 +23,8 @@ export function setupSummaryFor(input: SetupInput): string {
     lines.push("- Computer: yes, this agent's own Linux desktop (Chromium, LibreOffice). Logins, 2FA and payments on it go to the owner through request_takeover, which gives you a link to send.");
   } else if (input.computerKind === "maritime") {
     lines.push("- Computer: yes, a hosted desktop through Maritime Computers. request_takeover gives you a link to send when a human must step in.");
+  } else if (input.computerKind === "browser") {
+    lines.push("- Computer: a headless web browser of your own (browser_* tools). It keeps cookies between tasks, but it has no screen and nobody can take it over, so you cannot get past a login, 2FA, CAPTCHA or payment page. Many shops also block it. Use it for public pages and forms that need no account.");
   } else {
     lines.push("- Computer: none. You cannot browse websites that need a login, book on the web, or hand over a screen. Research still works through web_search and web_fetch. To enable: run this agent on Maritime with a desktop, or set MARITIME_API_KEY.");
   }
@@ -38,7 +40,10 @@ export function setupSummaryFor(input: SetupInput): string {
       ? "- Payments: Stripe Link wallet connected. payment_request asks the owner to approve a one-time card for an exact amount."
       : "- Payments: Stripe Link is configured but the owner has not connected their wallet. payment_connect returns the link to send.");
   } else {
-    lines.push("- Payments: not set up (no Link client). Purchases end with a desktop takeover so the owner pays themselves, or with you stopping at checkout.");
+    const desktop = input.computerKind === "desktopd" || input.computerKind === "maritime";
+    lines.push(desktop
+      ? "- Payments: not set up (no Link client). Purchases end with a desktop takeover so the owner pays themselves, or with you stopping at checkout."
+      : "- Payments: not set up (no Link client). You cannot pay for anything: prepare the order and send the owner the link to pay themselves.");
   }
   lines.push("- PDFs and files: yes. create_pdf writes a PDF in the workspace; send_file delivers any workspace file.");
   return lines.join("\n");

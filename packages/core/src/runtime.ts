@@ -1036,6 +1036,7 @@ export class AgentRuntime {
       now: this.now(),
       capabilities: [...capabilities],
       toolGroups: [...groups],
+      toolNames: tools.map((t) => t.name),
       memoryDigest: this.memoryDigestFor(principal),
       // Read fresh each time so `instinct persona set` applies on the next message.
       persona: readPersona(state),

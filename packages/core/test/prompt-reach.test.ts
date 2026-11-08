@@ -15,6 +15,14 @@ describe("everything happens in this chat", () => {
     expect(text).toContain("request_takeover");
     expect(text).toContain("Never describe your own machinery");
   });
+  it("offers a takeover link only when the request_takeover tool exists", () => {
+    const desktop = buildSystemPrompt({ ...base, principal: owner, channel: "imessage", toolNames: ["request_takeover", "send_file"] });
+    expect(desktop).toContain("call request_takeover and send the link");
+    const browserOnly = buildSystemPrompt({ ...base, principal: owner, channel: "imessage", toolNames: ["browser_navigate", "send_file"] });
+    expect(browserOnly).not.toContain("call request_takeover and send the link");
+    expect(browserOnly).toContain("There is no takeover on this agent");
+    expect(browserOnly).toContain("you must not offer a takeover link");
+  });
   it("gives non-owners the short version without connect or takeover links", () => {
     const text = buildSystemPrompt({ ...base, principal: sam, channel: "imessage" });
     expect(text).toContain("# Everything happens in this thread");
