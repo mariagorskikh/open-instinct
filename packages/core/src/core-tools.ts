@@ -30,6 +30,8 @@ export interface CoreToolDeps {
   searchApiKey?: string;
   /** Opt-in You.com web search. With apiKey it calls the keyed API; without it, the keyless free tier (100 searches a day per IP). */
   youSearch?: { apiKey?: string };
+  /** Opt-in Keirolabs web search with the owner's key. Used over Brave and DuckDuckGo; You.com, when also set, wins. */
+  keirolabsApiKey?: string;
   /** The owner's workspace directory. create_pdf writes under it; without it the tool refuses. */
   workspaceDir?: string;
   /** Called after approval_settle resolves an approval, so the runtime can wake the conversation that was waiting. */
@@ -417,7 +419,7 @@ interface SearchHit {
   snippet: string;
 }
 
-function webSearchTool({ fetchImpl, searchApiKey, youSearch }: CoreToolDeps): RegisteredTool {
+function webSearchTool({ fetchImpl, searchApiKey, youSearch, keirolabsApiKey }: CoreToolDeps): RegisteredTool {
   const doFetch = fetchImpl ?? fetch;
   return defineTool({
     name: "web_search",
@@ -428,9 +430,11 @@ function webSearchTool({ fetchImpl, searchApiKey, youSearch }: CoreToolDeps): Re
     execute: async ({ query }, _ctx, signal) => {
       const hits = youSearch
         ? await youComSearch(doFetch, youSearch.apiKey, query, signal)
-        : searchApiKey
-          ? await braveSearch(doFetch, searchApiKey, query, signal)
-          : await duckDuckGoSearch(doFetch, query, signal);
+        : keirolabsApiKey
+          ? await keirolabsSearch(doFetch, keirolabsApiKey, query, signal)
+          : searchApiKey
+            ? await braveSearch(doFetch, searchApiKey, query, signal)
+            : await duckDuckGoSearch(doFetch, query, signal);
       if (hits.length === 0) return textResult(`No results for "${query}".`);
       const lines = hits.map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}${h.snippet ? `\n   ${h.snippet}` : ""}`);
       return textResult(wrapUntrusted(lines.join("\n"), `web search results for ${query}`));
@@ -503,6 +507,27 @@ async function youComSearch(doFetch: typeof fetch, key: string | undefined, quer
     .filter((r) => r.url)
     .slice(0, SEARCH_RESULTS)
     .map((r) => ({ title: r.title ?? r.url!, url: r.url!, snippet: htmlToText(r.description || r.snippets?.[0] || "") }));
+}
+
+/** Keirolabs' lite search: titles, links and snippets, billed per request whatever the count. */
+export const KEIROLABS_SEARCH_URL = "https://api.keirolabs.cloud/api/v2/search/lite";
+
+async function keirolabsSearch(doFetch: typeof fetch, key: string, query: string, signal?: AbortSignal): Promise<SearchHit[]> {
+  const res = await doFetch(KEIROLABS_SEARCH_URL, {
+    method: "POST",
+    signal: signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${key}` },
+    body: JSON.stringify({ query, maxResults: SEARCH_RESULTS }),
+  });
+  if (res.status === 401 || res.status === 403) throw new Error(`Keirolabs search rejected the API key (HTTP ${res.status}); check KEIROLABS_API_KEY`);
+  if (res.status === 402) throw new Error("Keirolabs search is out of credits for this API key (HTTP 402); check the plan for KEIROLABS_API_KEY");
+  if (res.status === 429) throw new Error("Keirolabs search is rate limited (HTTP 429)");
+  if (!res.ok) throw new Error(`Keirolabs search failed: HTTP ${res.status}`);
+  const data = (await res.json()) as { results?: Array<{ title?: string | null; url?: string | null; snippet?: string | null }> };
+  return (data.results ?? [])
+    .filter((r) => r.url)
+    .slice(0, SEARCH_RESULTS)
+    .map((r) => ({ title: r.title || r.url!, url: r.url!, snippet: htmlToText(r.snippet ?? "") }));
 }
 
 async function duckDuckGoSearch(doFetch: typeof fetch, query: string, signal?: AbortSignal): Promise<SearchHit[]> {

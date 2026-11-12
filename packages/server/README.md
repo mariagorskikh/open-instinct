@@ -108,6 +108,7 @@ Only `server`, `gateway` and `cli` read `process.env`. Full list with comments:
 | `LINK_REDIRECT_URI` | where Link sends the owner back; default `INSTINCT_PUBLIC_URL` + `/oauth/link/callback`, else `http://127.0.0.1:$PORT/oauth/link/callback` |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, ... | provider keys, looked up from the env the server was given (`apiKeyFor`), never from `process.env` behind its back |
 | `BRAVE_SEARCH_API_KEY` | better `web_search`; DuckDuckGo otherwise |
+| `KEIROLABS_API_KEY` | `web_search` through Keirolabs, used over Brave and DuckDuckGo (You.com, when set, still wins) |
 | `INSTINCT_SKILLS_DIR` | SKILL.md folder; default `<repo>/skills` |
 | `MARITIME_AGENT_ID`, `MARITIME_BACKEND_URL`, `MARITIME_INTERNAL_TOKEN` | injected by Maritime; schedules are pushed to the platform on boot and when they change |
 | `PORT` | listen port, default 8080 (Maritime injects 18789; the image sets none) |
