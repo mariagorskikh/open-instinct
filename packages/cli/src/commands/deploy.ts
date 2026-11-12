@@ -96,6 +96,7 @@ export function buildCreateBody(input: DeployInput): CreateAgentBody {
   pushVar(vars, "BRAVE_SEARCH_API_KEY", env.BRAVE_SEARCH_API_KEY, true);
   pushVar(vars, "YDC_API_KEY", env.YDC_API_KEY, true);
   pushVar(vars, "YOU_SEARCH", env.YOU_SEARCH, false);
+  pushVar(vars, "KEIROLABS_API_KEY", env.KEIROLABS_API_KEY, true);
   pushVar(vars, "CONTEXT_DEV_API_KEY", env.CONTEXT_DEV_API_KEY, true);
   pushVar(vars, "KEENABLE_SEARCH", env.KEENABLE_SEARCH, false);
   pushVar(vars, "KEENABLE_API_KEY", env.KEENABLE_API_KEY, true);
