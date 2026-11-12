@@ -421,14 +421,15 @@ describe("web tools", () => {
       { title: "No link", url: "", snippet: "dropped" },
       ...Array.from({ length: 12 }, (_, i) => ({ title: `K${i}`, url: `https://k${i}.test/`, snippet: `<b>s</b> ${i}` })),
     ];
-    let seen: { url: string; init?: RequestInit } | undefined;
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
-      seen = { url: String(input), ...(init ? { init } : {}) };
+      calls.push({ url: String(input), ...(init ? { init } : {}) });
       return new Response(JSON.stringify({ results, count: results.length }), { status: 200 });
     }) as typeof fetch;
     const { run, text } = setup({ fetchImpl, searchApiKey: "brave-key", keirolabsApiKey: "keiro-key" });
     const out = text(await run("web_search", { query: "q" }));
-    expect(seen?.url).toBe("https://api.keirolabs.cloud/api/v2/search/lite");
+    expect(calls.map((c) => c.url)).toEqual(["https://api.keirolabs.cloud/api/v2/search/lite"]);
+    const seen = calls[0];
     expect(seen?.init?.method).toBe("POST");
     expect((seen?.init?.headers as Record<string, string>).authorization).toBe("Bearer keiro-key");
     expect(JSON.parse(String(seen?.init?.body))).toEqual({ query: "q", maxResults: 8 });
@@ -436,6 +437,7 @@ describe("web tools", () => {
     expect(out).not.toContain("No link");
     expect(out).toContain("8. K6");
     expect(out).not.toContain("9. K7");
+    expect(out).toContain("2. K0\n   https://k0.test/\n   s 0");
     expect(out).not.toContain("<b>");
   });
 
@@ -445,14 +447,14 @@ describe("web tools", () => {
       const { run } = setup({ fetchImpl, keirolabsApiKey: "keiro-key" });
       await expect(run("web_search", { query: "q" })).rejects.toThrow(message);
     }
-    let url = "";
+    const urls: string[] = [];
     const fetchImpl = (async (input: string | URL | Request) => {
-      url = String(input);
+      urls.push(String(input));
       return new Response(JSON.stringify({ results: { web: [] } }), { status: 200 });
     }) as typeof fetch;
     const { run } = setup({ fetchImpl, youSearch: { apiKey: "ydc-key" }, keirolabsApiKey: "keiro-key" });
     await run("web_search", { query: "q" });
-    expect(url).toBe("https://ydc-index.io/v1/search");
+    expect(urls).toEqual(["https://ydc-index.io/v1/search"]);
   });
 
   it("web_search explains You.com auth, quota and rate limit errors", async () => {

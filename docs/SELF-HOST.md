@@ -344,6 +344,7 @@ Every variable below is read by the server or the CLI. `deploy/.env.example` lis
 | `COMPOSIO_API_KEY`, `COMPOSIO_TOOLKITS` | server, CLI | Gmail, Calendar and other apps. The key alone turns apps on |
 | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `LINK_REDIRECT_URI` | server, CLI | Stripe Link agent wallet. All of the first three are needed for payment tools |
 | `BRAVE_SEARCH_API_KEY` | server, CLI | better web search. DuckDuckGo otherwise |
+| `KEIROLABS_API_KEY` | server, CLI | web search through Keirolabs, used over Brave and DuckDuckGo. You.com, when set, still wins |
 | `INSTINCT_SKILLS_DIR` | server | SKILL.md folder. Default `<repo>/skills` |
 | `INSTINCT_REPLY_BUDGET_MS` | server | how long `/chat` waits before acknowledging and finishing in the background. Default 20000 |
 | `PORT` | server | listen port. Default 8080 |
