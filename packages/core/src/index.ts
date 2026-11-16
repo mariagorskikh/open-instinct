@@ -5,6 +5,7 @@ export * from "./owner-claim.js";
 export * from "./policy.js";
 export * from "./approvals.js";
 export * from "./audit.js";
+export * from "./audit-webhook.js";
 export * from "./scheduler.js";
 export * from "./contacts.js";
 export * from "./principal.js";

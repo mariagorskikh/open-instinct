@@ -129,6 +129,7 @@ the screen at checkout instead of paying.
 | `INKBOX_VOICE` | The Voice AI voice `phone_call` speaks with (a voice id from the Inkbox console's voice list). Unset: the organization's default voice ([INKBOX.md](INKBOX.md#phone-calls)) | Inkbox console |
 | `INKBOX_CALL_ORIGINATION` | Which line `phone_call` dials from: `dedicated_number`, `shared_imessage_number` or `dedicated_imessage_number`. Unset: the identity's iMessage line | you choose it |
 | `ATOMIC_MAIL_API_KEY` | A second inbox the agent can read and send from, through Atomic Mail's hosted MCP. Needs a key from an active inbox ([ATOMICMAIL.md](ATOMICMAIL.md)) | [dashboard.atomicmail.ai](https://dashboard.atomicmail.ai) |
+| `INSTINCT_AUDIT_WEBHOOK_URL` and `INSTINCT_AUDIT_WEBHOOK_SECRET` | A signed copy of each audit entry to a URL you choose, such as a monitoring service or an insurer. The owner can also connect one in chat ([AUDIT-WEBHOOK.md](AUDIT-WEBHOOK.md)) | the receiving service |
 | `INSTINCT_CHAT_TOKEN` | A bearer token on the owner's HTTP surface; set it whenever the port is reachable beyond your machine | you choose it |
 | `GATEWAY_SIGNUP_SECRET` | The invite code the gateway's signup form requires | you choose it |
 

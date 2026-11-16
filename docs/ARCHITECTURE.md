@@ -137,7 +137,9 @@ One agent process serves one person (the **owner**). Inside it:
   (what happened), `contacts.json` (people and tiers). `memory_write` appends; the prompt builder
   injects a digest. Older turns are folded into a summary to keep sessions small.
 - **Audit.** Every tool call, policy decision, outbound message and spend lands in
-  `audit.jsonl`. The owner can ask "what did you do today" (`audit_read`).
+  `audit.jsonl`. The owner can ask "what did you do today" (`audit_read`). The owner can also
+  connect an audit webhook (`audit_webhook`): a signed, facts-only copy of each entry goes to one
+  URL they chose ([AUDIT-WEBHOOK.md](AUDIT-WEBHOOK.md)).
 
 ## Message flow
 
@@ -178,6 +180,7 @@ sessions/                Pi JSONL sessions, one per conversation key
 schedules.json           scheduled jobs (served on GET /schedules, pushed to Maritime)
 approvals.json           pending owner approvals (token, action, expiry); approvals-context.json, approved.json
 audit.jsonl              append-only audit log
+audit-webhook-outbox.jsonl  audit copies waiting for an unreachable webhook (capped at 1000)
 owner-notices.json       when the owner was last told about a refused request, per conversation
 conversations.json       which principal and reply address each conversation key belongs to
 seen-ids.json            webhook event ids already handled (replay protection)
@@ -185,7 +188,7 @@ strangers.json           stranger rate-limit counters
 pending-replies.json     chat replies finished after the HTTP response was sent
 apps.json                the Composio session id and toolkits
 payments.json            spend requests (ids, amounts, merchants, status); never card data
-secrets/                 mode 0600: webhook.json (signing key), inkbox.json (CLI), link-oauth.json, link-tokens.json
+secrets/                 mode 0600: webhook.json (signing key), inkbox.json (CLI), link-oauth.json, link-tokens.json, audit-webhook.json
 workspace/               files the agent creates for the owner (the file tools are scoped here)
 inbox/                   files the owner sent
 ```
@@ -198,7 +201,7 @@ policy engine checks. Groups:
 | Group | Tools | Source | Present when |
 |---|---|---|---|
 | messaging | `send_message` (reply on the current channel or to a contact: iMessage, SMS, email), `send_typing`, `react`, `send_file` (a workspace file as an attachment: iMessage and SMS up to 10 MB through the Inkbox media upload, email up to 25 MB; in the dashboard chat it returns a `maritime-file` block the dashboard renders as an attachment) | `@open-instinct/inkbox` | `INKBOX_API_KEY` and a handle are set; `send_file` is always present, chat-only without Inkbox |
-| owner | `ask_owner` (approval or question, with token), `notify_owner`, `audit_read` | `core` | always |
+| owner | `ask_owner` (approval or question, with token), `notify_owner`, `audit_read`, `audit_webhook` (signed copies of the audit log to one URL the owner chose) | `core` | always |
 | memory | `memory_read`, `memory_write`, `journal_append` | `core` | always |
 | schedule | `schedule_create`, `schedule_list`, `schedule_delete` | `core` | always |
 | web | `web_search`, `web_fetch` (public hosts only, no login) | `core` | always |

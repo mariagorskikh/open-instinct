@@ -20,8 +20,12 @@ export function localDate(d: Date, tz: string): string {
   return fmt.format(d);
 }
 
+/** Called after each entry is written, for sinks such as the audit webhook. */
+export type AuditListener = (entry: AuditEntry) => void;
+
 export class AuditLog {
   private readonly state: StateDir;
+  private readonly listeners = new Set<AuditListener>();
 
   constructor(state: StateDir) {
     this.state = state;
@@ -30,6 +34,19 @@ export class AuditLog {
   append(entry: Omit<AuditEntry, "at">): void {
     const full: AuditEntry = { at: new Date().toISOString(), ...entry };
     this.state.appendLine(FILE, JSON.stringify(full));
+    for (const listener of this.listeners) {
+      try {
+        listener(full);
+      } catch {
+        // A sink must never break the audit trail or the tool call that wrote it.
+      }
+    }
+  }
+
+  /** Hear every entry after it is written. Returns the unsubscribe function. */
+  subscribe(listener: AuditListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   /** Oldest first. `limit` keeps the most recent N after filtering. */
