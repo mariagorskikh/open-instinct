@@ -284,6 +284,7 @@ with a refusal, and nothing from `MEMORY.md` leaves the process.
 - "Invite Priya's Instinct" → `invite_to_network`
 - "Connect my wallet" → `payment_connect`
 - "What did you do today?" → `audit_read`
+- "Send a copy of my audit log to <url>" → `audit_webhook`
 
 The same from a terminal: `instinct trust list | set <contact> <tier> | grant ... | revoke <grantId>`
 and `instinct invite "Sam Lee" --tier partner --handle sam-instinct`.

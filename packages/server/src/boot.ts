@@ -13,6 +13,8 @@ import {
   A2AStore,
   ApprovalStore,
   AuditLog,
+  AuditWebhook,
+  auditWebhookTool,
   ContactStore,
   MemoryStore,
   PolicyEngine,
@@ -122,6 +124,22 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   const model = opts.model ?? resolveModel(config.model.primary, env);
   const modelSpec = `${model.provider}/${model.id}`;
 
+  // Audit webhook: a signed copy of each audit entry to one URL the owner chose. Off until the owner
+  // connects one in chat, or the deployer sets INSTINCT_AUDIT_WEBHOOK_URL and INSTINCT_AUDIT_WEBHOOK_SECRET.
+  const auditWebhook = new AuditWebhook({
+    state,
+    agent: config.agent.handle ?? config.agent.name,
+    model: modelSpec,
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    tierOf: (id) => (id.startsWith("contact:") ? contacts.get(id.slice("contact:".length))?.tier : undefined),
+    logger: log,
+  });
+  auditWebhook.attach(audit);
+  if (!auditWebhook.settings() && env.INSTINCT_AUDIT_WEBHOOK_URL && env.INSTINCT_AUDIT_WEBHOOK_SECRET) {
+    const connected = await auditWebhook.connect(env.INSTINCT_AUDIT_WEBHOOK_URL, env.INSTINCT_AUDIT_WEBHOOK_SECRET);
+    log(connected.ok ? `audit webhook: copies go to ${connected.host}` : `audit webhook: not connected (${connected.reason})`);
+  }
+
   const inkbox = inkboxSettings(env, config);
   const a2a = inkbox ? new InkboxA2A({
     apiKey: inkbox.apiKey,
@@ -204,6 +222,8 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       ...(env.YDC_API_KEY || env.YOU_SEARCH === "1" ? { youSearch: env.YDC_API_KEY ? { apiKey: env.YDC_API_KEY } : {} } : {}),
     }),
   );
+
+  registry.register(auditWebhookTool(auditWebhook, audit));
 
   if (env.CONTEXT_DEV_API_KEY) {
     registry.registerMany(
@@ -523,6 +543,7 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       await safely(log, "computer close", () => computer?.close());
       await safely(log, "apps close", () => apps?.close());
       await safely(log, "atomicmail close", () => mailbox?.close());
+      await safely(log, "audit webhook", () => auditWebhook.idle());
     },
   };
 }
